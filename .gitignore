@@ -28,7 +28,8 @@ htmlcov/
 .vscode/
 .idea/
 
-# Data — NOT gitignored: data/bakeoff_clip.mp4, data/bakeoff_clip_corners.json
+# Data — clips live on Google Drive (too large for git); local copies in data/ ignored
+data/bakeoff_clip.mp4
 data/games/
 data/labeled/
 data/bakeoff_outputs/

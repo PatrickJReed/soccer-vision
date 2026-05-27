@@ -37,9 +37,23 @@ import soccer_vision
 
 - `packages/soccer-vision/` — core Python package (uv workspace member)
 - `examples/` — Colab notebooks (bake-off, pipeline demo, season analysis)
-- `data/` — canonical bake-off clip + manual annotations
+- `data/` — small reference artifacts only (gitignored: any `.mp4` clips, full-game footage, model outputs)
 - `docs/superpowers/specs/` — design specifications
 - `docs/superpowers/plans/` — implementation plans
+
+## Bake-off setup
+
+The bake-off notebooks (`examples/bakeoff_*.ipynb`) need two one-time setup
+steps before they can run in Colab:
+
+1. **Google Drive folder.** Create `MyDrive/soccer-vision/` and upload
+   `bakeoff_clip.mp4` to it. The notebooks mount Drive and read the clip
+   from this path. Footage stays out of git history (the file exceeds
+   GitHub's 100 MB limit and contains a youth game).
+2. **Colab Secret `GITHUB_PAT`.** In Colab, open the 🔑 (Secrets) sidebar
+   and add a secret named `GITHUB_PAT` containing a GitHub Personal Access
+   Token with `repo` read scope. The notebooks use it to `pip install` the
+   private `soccer-vision` package.
 
 ## Design
 

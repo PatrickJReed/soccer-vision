@@ -2,8 +2,7 @@
 
 Team-level positional analytics for 9v9 youth soccer from Trace camera footage.
 
-**Status:** pre-implementation. Design spec approved 2026-05-27. Implementation
-plan and Phase 0 scaffolding pending.
+**Status:** Phase 0 complete (scaffolding). Phase 1 (structured bake-off) next.
 
 ## What this is
 
@@ -16,7 +15,32 @@ HTML report, video overlays, and season-level analyses.
 Scope is deliberately narrow: positional (no passing yet), team-level (no
 player-specific work), post-game (no realtime), notebook-driven (no web app).
 
+## Quickstart
+
+Local development:
+
+```bash
+git clone <repo-url>
+cd soccer-vision
+uv sync
+uv run pytest
+```
+
+Colab usage (per notebook):
+
+```python
+!pip install -q git+https://github.com/<owner>/soccer-vision.git
+import soccer_vision
+```
+
+## Layout
+
+- `packages/soccer-vision/` — core Python package (uv workspace member)
+- `examples/` — Colab notebooks (bake-off, pipeline demo, season analysis)
+- `data/` — canonical bake-off clip + manual annotations
+- `docs/superpowers/specs/` — design specifications
+- `docs/superpowers/plans/` — implementation plans
+
 ## Design
 
-See [`docs/superpowers/specs/2026-05-27-soccer-vision-design.md`](docs/superpowers/specs/2026-05-27-soccer-vision-design.md)
-for the full specification.
+See [`docs/superpowers/specs/2026-05-27-soccer-vision-design.md`](docs/superpowers/specs/2026-05-27-soccer-vision-design.md).

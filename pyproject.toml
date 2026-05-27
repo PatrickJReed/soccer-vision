@@ -7,8 +7,8 @@ requires-python = ">=3.11,<3.13"
 [tool.uv.workspace]
 members = ["packages/*"]
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
     "ruff>=0.6",
@@ -22,7 +22,7 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "RUF"]
-ignore = ["E501"]  # line length handled by formatter
+ignore = ["E501"]  # enforced via ruff format which respects [tool.ruff] line-length
 
 [tool.mypy]
 strict = true

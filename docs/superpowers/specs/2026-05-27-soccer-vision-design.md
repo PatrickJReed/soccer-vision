@@ -144,10 +144,10 @@ game_<id>/
 ### 3.1 Pitch-relative units (no absolute meters)
 
 Field dimensions vary game-to-game at 9v9 (different venues, different
-recommended ranges of 64–73 m × 41–50 m). Rather than measure each field, the
-homography maps visible pitch corners to a normalized `[0, 1] × [0, 1]` frame
-and all metrics are expressed in **pitch-units** (fractions of pitch length).
-1 pitch-unit = 1 × pitch length.
+recommended ranges of 64–73 m × 41–50 m). Rather than measure each field, every
+frame's homography maps visible pitch landmarks to a normalized `[0, 1] × [0, 1]`
+canonical pitch frame, and all metrics are expressed in **pitch-units**
+(fractions of pitch length). 1 pitch-unit = 1 × pitch length.
 
 This makes metrics directly comparable across games regardless of field size,
 and eliminates a brittle calibration step.
@@ -155,6 +155,24 @@ and eliminates a brittle calibration step.
 Optionally, a user can supply `pitch_length_m` per game in a one-line config
 and reports will display secondary axes in approximate meters. Default is
 pitch-units everywhere.
+
+### 3.1a Per-frame homography (Trace virtual-PTZ implication)
+
+Trace cameras synthesize a follow-the-ball pan from a wider physical capture,
+so no single frame contains all four pitch corners. The pitch keypoint
+detection runs **per frame**, producing a fresh homography `H_t` for each
+frame. Player positions transform through `H_t` into the canonical pitch frame.
+Over the clip, every player's full trajectory accumulates in canonical pitch
+coordinates even though no individual frame ever shows the whole pitch — we
+never construct a stitched panoramic image. Robustness measures applied to
+`H_t`:
+
+- **Temporal smoothing** — exponential moving average on the homography
+  matrix elements (or Kalman) to suppress per-frame detection jitter
+- **Insufficient-keypoint fallback** — when fewer than 4 well-distributed
+  landmarks are detected, `H_t` is interpolated from the nearest good frames
+- **Validity check** — reject `H_t` if it projects any tracked player more
+  than ~10% off-pitch; substitute the interpolated value
 
 ### 3.2 `PitchSpec` (dimensionless)
 
@@ -225,12 +243,13 @@ end-to-end candidates.
 - ~60 s build-up play (slow, structured, all players visible)
 - ~60 s transition + counterattack (fast motion, occlusion)
 
-Committed to repo. Same clip fed to all three candidates with a shared
-homography reference: the four visible pitch corners annotated once by hand in
-`data/bakeoff_clip_corners.json` (`{tl, tr, bl, br}` as pixel coords). This
-takes ~30 seconds and removes pitch-keypoint-detection differences as a
-confound during scoring — keypoint quality is judged separately by inspecting
-auto-detected corners against the manual reference.
+Committed to repo. Same clip fed to all three candidates. **No manual
+homography reference.** Trace's virtual-PTZ pan means no single frame contains
+all four pitch corners, so a one-shot manual annotation isn't viable. Each
+candidate's per-frame pitch keypoint detector is exercised on the clip and the
+resulting top-down radar view is judged by inspection. If a quantitative
+ground-truth metric becomes necessary later, sparse multi-frame keypoint
+annotation can be added as a v1+ enhancement.
 
 ### 4.4 Scoring rubric
 
@@ -243,7 +262,7 @@ Five axes scored 1–5 by inspection of side-by-side panels in
 | Ball detection rate | Ball detected >80% of frames, smooth trajectory | Ball detected <30%, jittery |
 | Track stability | IDs persist through occlusions | IDs flip frequently |
 | Team classification | All players cleanly assigned to one of two teams | Players flipping teams frame-to-frame |
-| Homography fidelity | Top-down radar matches source player spacing | Players warp, positions implausible |
+| Homography fidelity | Per-frame top-down radar maintains plausible player spacing through camera pans; few visible warp artefacts | Players warp, positions implausible, or homography unstable across frames |
 | **9v9 handling (new)** | Degrades gracefully on 9-per-team and youth pitch | Hard-coded 11v11 assumptions break |
 
 Plus a non-scored runtime / Colab GPU cost measurement.
@@ -563,7 +582,7 @@ Phase 4 to verify the swap-later promise of Approach C.
 | Risk | Mitigation |
 |---|---|
 | All three bake-off candidates fail badly on Trace's wide fixed camera | Phase 2 fine-tuning addresses the dominant failure; deeper failure triggers an unplanned Phase 1.5 (component recombination, sn-reid) |
-| 9v9 pitch keypoint detection unreliable on youth fields | Manual 4-corner annotation per game (30 s of work) as documented fallback |
+| 9v9 pitch keypoint detection unreliable on youth fields | Smooth across frames; interpolate from neighbors when keypoints sparse; sparse multi-frame manual keypoint annotation as a v1+ ground-truth reference if quantitative evaluation is needed |
 | Team color KMeans fails on similar kits | Per-game manual color seeding documented in the pipeline notebook |
 | Ball detection so bad that ball-relative metrics are useless | All ball-dependent metrics report NaN gracefully; PathCRF as a v1+ ball-free fallback if needed |
 | Literature-derived thresholds don't transfer to 9v9 | Pitch-relative units sidestep absolute scale; team rolling baseline replaces literature norms |

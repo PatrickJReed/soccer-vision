@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+.python-version-local
+*.egg-info/
+
+# uv
+.uv-cache/
+
+# Tests / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Data — NOT gitignored: data/bakeoff_clip.mp4, data/bakeoff_clip_corners.json
+data/games/
+data/labeled/
+data/bakeoff_outputs/
+data/_source/
+
+# Models (large binaries) — fetched via Colab
+packages/soccer-vision/src/soccer_vision/models/*.pt
+
+# OS extras
+*.swp

@@ -43,17 +43,12 @@ import soccer_vision
 
 ## Bake-off setup
 
-The bake-off notebooks (`examples/bakeoff_*.ipynb`) need two one-time setup
-steps before they can run in Colab:
-
-1. **Google Drive folder.** Create `MyDrive/soccer-vision/` and upload
-   `bakeoff_clip.mp4` to it. The notebooks mount Drive and read the clip
-   from this path. Footage stays out of git history (the file exceeds
-   GitHub's 100 MB limit and contains a youth game).
-2. **Colab Secret `GITHUB_PAT`.** In Colab, open the 🔑 (Secrets) sidebar
-   and add a secret named `GITHUB_PAT` containing a GitHub Personal Access
-   Token with `repo` read scope. The notebooks use it to `pip install` the
-   private `soccer-vision` package.
+The bake-off notebooks (`examples/bakeoff_*.ipynb`) need one Google Drive
+folder before they can run in Colab: create `MyDrive/soccer-vision/` and
+upload `bakeoff_clip.mp4` there. The notebooks mount Drive and read the
+clip from this path. Footage stays out of git history because the file
+exceeds GitHub's 100 MB limit (and there's no reason to cache it on
+GitHub's CDN).
 
 ### Run order
 

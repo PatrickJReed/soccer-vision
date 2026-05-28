@@ -54,6 +54,27 @@ uv pip install -e "packages/soccer-vision[roboflow]"
 Without the extras, the package imports fine and all other functionality works;
 only `RoboflowBackend.process()` will fail at call time with a clear ImportError.
 
+### Using a fine-tuned ball detector (Phase 2 output)
+
+If you have a fine-tuned ball-only model (see
+[`docs/superpowers/runbooks/ball-labeling.md`](docs/superpowers/runbooks/ball-labeling.md)),
+point `RoboflowBackend` at it via the `ball_weights_path` constructor arg:
+
+```python
+from pathlib import Path
+from soccer_vision.tracking.roboflow import RoboflowBackend
+
+backend = RoboflowBackend(
+    ball_weights_path=Path("data/labeled/ball_v1/best.pt"),
+)
+df = backend.process(Path("data/games/<game>.mp4"))
+```
+
+When `ball_weights_path=None` (default), the adapter downloads roboflow's
+original ball detector to `~/.cache/soccer_vision/weights/`. Override
+forces the local file — useful for Phase 2 evaluation and the production
+pipeline once acceptance is met.
+
 ## Bake-off setup
 
 The bake-off notebooks (`examples/bakeoff_*.ipynb`) need one Google Drive

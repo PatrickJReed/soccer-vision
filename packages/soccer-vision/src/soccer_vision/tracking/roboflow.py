@@ -93,6 +93,10 @@ class RoboflowBackend:
     weights_cache_dir:
         Directory where YOLO .pt weight files are cached after first download.
         Defaults to ~/.cache/soccer_vision/weights/.
+    ball_weights_path:
+        Optional path to a fine-tuned ball detector weights file (.pt).
+        When provided, this model is used instead of the default ball detector.
+        If the path does not exist, raises FileNotFoundError.
     """
 
     name: Final = "roboflow-sports"
@@ -102,9 +106,13 @@ class RoboflowBackend:
         self,
         device: str | None = None,
         weights_cache_dir: Path | None = None,
+        ball_weights_path: Path | None = None,
     ) -> None:
         self._device_override = device
         self._weights_dir = Path(weights_cache_dir) if weights_cache_dir else DEFAULT_CACHE_DIR
+        if ball_weights_path is not None and not ball_weights_path.exists():
+            raise FileNotFoundError(f"ball_weights_path does not exist: {ball_weights_path}")
+        self.ball_weights_path: Path | None = ball_weights_path
 
     # ------------------------------------------------------------------
     # Weight download helper (lazy gdown import)
@@ -174,7 +182,8 @@ class RoboflowBackend:
 
         # ---- load models -----------------------------------------------
         player_model = YOLO(str(weight_paths["player"]))
-        ball_model   = YOLO(str(weight_paths["ball"]))
+        ball_weights = self.ball_weights_path or weight_paths["ball"]
+        ball_model   = YOLO(str(ball_weights))
 
         # ---- video metadata --------------------------------------------
         cap = cv2.VideoCapture(str(video_path))

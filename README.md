@@ -55,6 +55,22 @@ steps before they can run in Colab:
    Token with `repo` read scope. The notebooks use it to `pip install` the
    private `soccer-vision` package.
 
+### Run order
+
+Open each notebook via its Colab badge (Colab will prompt for GitHub auth
+the first time on a private repo):
+
+| Step | Notebook | Runtime |
+|---|---|---|
+| 1 | [bakeoff_roboflow.ipynb](examples/bakeoff_roboflow.ipynb) | Colab Pro + GPU |
+| 2 | [bakeoff_atfa.ipynb](examples/bakeoff_atfa.ipynb) | Colab Pro + GPU |
+| 3 | [bakeoff_tz.ipynb](examples/bakeoff_tz.ipynb) | Colab Pro + GPU |
+| 4 | [colab_bakeoff.ipynb](examples/colab_bakeoff.ipynb) | Local (Jupyter) |
+
+For steps 1–3: download each notebook's two output files (`trajectories.parquet`
+and `annotated.mp4`) and place them at `data/bakeoff_outputs/{roboflow,atfa,tz}/`
+locally. Step 4 reads those files and produces the side-by-side scoring view.
+
 ## Design
 
 See [`docs/superpowers/specs/2026-05-27-soccer-vision-design.md`](docs/superpowers/specs/2026-05-27-soccer-vision-design.md).

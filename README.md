@@ -41,6 +41,19 @@ import soccer_vision
 - `docs/superpowers/specs/` — design specifications
 - `docs/superpowers/plans/` — implementation plans
 
+### Tracking backend extras
+
+The `RoboflowBackend` (chosen during Phase 1) requires upstream model code that
+isn't pulled in by default — it's a heavyweight install (Ultralytics, supervision,
+PyTorch, the sports package). Install with:
+
+```bash
+uv pip install -e "packages/soccer-vision[roboflow]"
+```
+
+Without the extras, the package imports fine and all other functionality works;
+only `RoboflowBackend.process()` will fail at call time with a clear ImportError.
+
 ## Bake-off setup
 
 The bake-off notebooks (`examples/bakeoff_*.ipynb`) need one Google Drive

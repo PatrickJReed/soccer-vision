@@ -28,10 +28,14 @@ if TYPE_CHECKING:
 WEIGHTS: Final[dict[str, tuple[str, str]]] = {
     "ball":   ("1isw4wx-MK9h9LMr36VvIWlJD6ppUvw7V", "football-ball-detection.pt"),
     "player": ("17PXFNlx-jI7VjVo_vQnB1sONjRyvoB-q", "football-player-detection.pt"),
-    "pitch":  ("1Ma5Kt86tgpdjCTKfum79YMgNnSjcoOyf",  "football-pitch-detection.pt"),
+    # pitch model deferred to Plan B Phase 3 (homography / field calibration)
 }
 
 DEFAULT_CACHE_DIR: Final[Path] = Path.home() / ".cache" / "soccer_vision" / "weights"
+
+# Synthetic ball track IDs use negative space to avoid collisions with ByteTrack IDs.
+# ByteTrack tracker_id values are always non-negative, so negative IDs are collision-proof.
+_BALL_TRACK_ID_BASE: Final = -1_000_000
 
 # ---------------------------------------------------------------------------
 # Schema-aware empty-DataFrame helper
@@ -171,8 +175,6 @@ class RoboflowBackend:
         # ---- load models -----------------------------------------------
         player_model = YOLO(str(weight_paths["player"]))
         ball_model   = YOLO(str(weight_paths["ball"]))
-        # pitch model loaded but not used for homography here (Plan B Phase 3)
-        _pitch_model = YOLO(str(weight_paths["pitch"]))
 
         # ---- video metadata --------------------------------------------
         cap = cv2.VideoCapture(str(video_path))
@@ -270,8 +272,8 @@ class RoboflowBackend:
                 y_px = (y1 + y2) / 2.0  # center for ball
 
                 conf_val = float(b_dets.confidence[j]) if b_dets.confidence is not None else 0.5
-                # Synthetic track ID: no tracker on the ball model
-                synthetic_id = 100_000 + frame_idx
+                # Synthetic track ID: negative space, collision-proof with ByteTrack IDs
+                synthetic_id = _BALL_TRACK_ID_BASE - frame_idx
 
                 rows.append({
                     "frame":    frame_idx,

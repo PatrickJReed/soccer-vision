@@ -56,3 +56,18 @@ def test_adapter_returns_schema_conformant_df(tiny_video: Path) -> None:
     backend = RoboflowBackend()
     df = backend.process(tiny_video)
     validate_trajectories(df)
+
+
+def test_default_detect_pitch_false() -> None:
+    backend = RoboflowBackend()
+    assert backend.detect_pitch is False
+
+
+@pytest.mark.skipif(not _HEAVY_AVAILABLE, reason="roboflow extras not installed")
+def test_adapter_with_pitch_returns_keypoints(tiny_video: Path) -> None:
+    """When detect_pitch=True, process_with_pitch() returns (df, keypoints_df)."""
+    from soccer_vision.io.schema import validate_trajectories
+    backend = RoboflowBackend(detect_pitch=True)
+    df, kp_df = backend.process_with_pitch(tiny_video)
+    validate_trajectories(df)
+    assert {"frame", "kp_idx", "x_px", "y_px", "conf"}.issubset(kp_df.columns)

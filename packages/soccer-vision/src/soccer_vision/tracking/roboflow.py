@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 WEIGHTS: Final[dict[str, tuple[str, str]]] = {
     "ball":   ("1isw4wx-MK9h9LMr36VvIWlJD6ppUvw7V", "football-ball-detection.pt"),
     "player": ("17PXFNlx-jI7VjVo_vQnB1sONjRyvoB-q", "football-player-detection.pt"),
-    # pitch model deferred to Plan B Phase 3 (homography / field calibration)
+    "pitch":  ("1Ma5Kt86tgpdjCTKfum79YMgNnSjcoOyf", "football-pitch-detection.pt"),
 }
 
 DEFAULT_CACHE_DIR: Final[Path] = Path.home() / ".cache" / "soccer_vision" / "weights"
@@ -97,6 +97,10 @@ class RoboflowBackend:
         Optional path to a fine-tuned ball detector weights file (.pt).
         When provided, this model is used instead of the default ball detector.
         If the path does not exist, raises FileNotFoundError.
+    detect_pitch:
+        When True, download and load the pitch keypoint detection model.
+        Required to call process_with_pitch(). Defaults to False to avoid
+        downloading the extra weights file unless pitch detection is needed.
     """
 
     name: Final = "roboflow-sports"
@@ -107,12 +111,14 @@ class RoboflowBackend:
         device: str | None = None,
         weights_cache_dir: Path | None = None,
         ball_weights_path: Path | None = None,
+        detect_pitch: bool = False,
     ) -> None:
         self._device_override = device
         self._weights_dir = Path(weights_cache_dir) if weights_cache_dir else DEFAULT_CACHE_DIR
         if ball_weights_path is not None and not ball_weights_path.exists():
             raise FileNotFoundError(f"ball_weights_path does not exist: {ball_weights_path}")
         self.ball_weights_path: Path | None = ball_weights_path
+        self.detect_pitch: bool = detect_pitch
 
     # ------------------------------------------------------------------
     # Weight download helper (lazy gdown import)
@@ -135,6 +141,8 @@ class RoboflowBackend:
         self._weights_dir.mkdir(parents=True, exist_ok=True)
         paths: dict[str, Path] = {}
         for role, (gdrive_id, filename) in WEIGHTS.items():
+            if role == "pitch" and not self.detect_pitch:
+                continue
             dest = self._weights_dir / filename
             if not dest.exists():
                 url = f"https://drive.google.com/uc?id={gdrive_id}"
@@ -143,15 +151,49 @@ class RoboflowBackend:
         return paths
 
     # ------------------------------------------------------------------
-    # Main processing entry-point
+    # Empty-keypoints-DataFrame helper
     # ------------------------------------------------------------------
 
-    def process(self, video_path: Path) -> pd.DataFrame:
-        """Run roboflow/sports detection + tracking on *video_path*.
+    @staticmethod
+    def _empty_kp_df() -> pd.DataFrame:
+        """Return a zero-row keypoints DataFrame with the canonical schema."""
+        return pd.DataFrame(
+            columns=["frame", "kp_idx", "x_px", "y_px", "conf"]
+        ).astype({
+            "frame":  "int64",
+            "kp_idx": "int64",
+            "x_px":   "float64",
+            "y_px":   "float64",
+            "conf":   "float64",
+        })
 
-        Returns a DataFrame validated against validate_trajectories().
-        An empty (but schema-conformant) DataFrame is returned when the
-        video contains no detections (e.g. a blank test clip).
+    # ------------------------------------------------------------------
+    # Core pipeline (shared by process() and process_with_pitch())
+    # ------------------------------------------------------------------
+
+    def _run_pipeline(
+        self,
+        video_path: Path,
+        emit_keypoints: bool,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Run detection + tracking on *video_path*.
+
+        Parameters
+        ----------
+        video_path:
+            Path to the input video file.
+        emit_keypoints:
+            When True, also run the pitch keypoint model per frame and
+            accumulate results into the returned keypoints DataFrame.
+            Requires self.detect_pitch=True (weights must be downloaded).
+
+        Returns
+        -------
+        (trajectories_df, keypoints_df)
+            trajectories_df is validated against validate_trajectories().
+            keypoints_df has columns: frame, kp_idx, x_px, y_px, conf.
+            When emit_keypoints is False, keypoints_df is empty but
+            schema-conformant.
         """
         # ---- lazy heavy imports ----------------------------------------
         try:
@@ -162,7 +204,7 @@ class RoboflowBackend:
             from ultralytics import YOLO  # type: ignore[import-not-found]
         except ImportError as exc:
             raise ImportError(
-                f"RoboflowBackend.process() requires the 'roboflow' optional extra. "
+                f"RoboflowBackend requires the 'roboflow' optional extra. "
                 f"Install with: uv pip install -e 'packages/soccer-vision[roboflow]'\n"
                 f"Missing: {exc}"
             ) from exc
@@ -184,6 +226,10 @@ class RoboflowBackend:
         player_model = YOLO(str(weight_paths["player"]))
         ball_weights = self.ball_weights_path or weight_paths["ball"]
         ball_model   = YOLO(str(ball_weights))
+
+        pitch_model = None
+        if emit_keypoints:
+            pitch_model = YOLO(str(weight_paths["pitch"])).to(device=device)
 
         # ---- video metadata --------------------------------------------
         cap = cv2.VideoCapture(str(video_path))
@@ -217,6 +263,7 @@ class RoboflowBackend:
         # ---- Pass 2: full detection, tracking, team prediction --------
         tracker = sv.ByteTrack()
         rows: list[dict[str, float | int | str]] = []
+        kp_records: list[dict[str, float | int]] = []
 
         for frame_idx, frame in enumerate(
             sv.get_video_frames_generator(source_path=str(video_path))
@@ -299,7 +346,29 @@ class RoboflowBackend:
                     "conf":     conf_val,
                 })
 
-        # ---- Build and validate DataFrame ------------------------------
+            # --- pitch keypoint detection (only when emit_keypoints=True) ---
+            if emit_keypoints and pitch_model is not None:
+                pk_result = pitch_model(frame, imgsz=1280, verbose=False)[0]
+                kp = sv.KeyPoints.from_ultralytics(pk_result)
+                # kp.xy is shape (N_instances, N_keypoints, 2)
+                # kp.confidence is (N_instances, N_keypoints) or None
+                for inst_idx in range(len(kp)):
+                    for kp_idx in range(kp.xy.shape[1]):
+                        x, y = kp.xy[inst_idx, kp_idx]
+                        c = (
+                            float(kp.confidence[inst_idx, kp_idx])
+                            if kp.confidence is not None
+                            else 0.5
+                        )
+                        kp_records.append({
+                            "frame":  frame_idx,
+                            "kp_idx": kp_idx,
+                            "x_px":   float(x),
+                            "y_px":   float(y),
+                            "conf":   c,
+                        })
+
+        # ---- Build and validate trajectories DataFrame -----------------
         if not rows:
             df = _empty_df()
         else:
@@ -318,4 +387,50 @@ class RoboflowBackend:
             })
 
         validate_trajectories(df)
+
+        # ---- Build keypoints DataFrame ---------------------------------
+        if not kp_records:
+            kp_df = self._empty_kp_df()
+        else:
+            kp_df = pd.DataFrame(kp_records).astype({
+                "frame":  "int64",
+                "kp_idx": "int64",
+                "x_px":   "float64",
+                "y_px":   "float64",
+                "conf":   "float64",
+            })
+
+        return df, kp_df
+
+    # ------------------------------------------------------------------
+    # Public processing entry-points
+    # ------------------------------------------------------------------
+
+    def process(self, video_path: Path) -> pd.DataFrame:
+        """Run roboflow/sports detection + tracking on *video_path*.
+
+        Returns a DataFrame validated against validate_trajectories().
+        An empty (but schema-conformant) DataFrame is returned when the
+        video contains no detections (e.g. a blank test clip).
+        """
+        df, _ = self._run_pipeline(video_path, emit_keypoints=False)
         return df
+
+    def process_with_pitch(self, video_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Run detection + tracking and pitch keypoint detection on *video_path*.
+
+        Requires that the backend was constructed with detect_pitch=True.
+
+        Returns
+        -------
+        (trajectories_df, keypoints_df)
+            trajectories_df: validated against validate_trajectories().
+            keypoints_df: per-frame pitch keypoints with columns
+                frame, kp_idx, x_px, y_px, conf.
+        """
+        if not self.detect_pitch:
+            raise ValueError(
+                "process_with_pitch() requires detect_pitch=True. "
+                "Re-create the backend with RoboflowBackend(detect_pitch=True)."
+            )
+        return self._run_pipeline(video_path, emit_keypoints=True)

@@ -6,7 +6,7 @@ import pandas as pd
 from soccer_vision.phase.possession import classify_possession
 
 
-def _make_frame(rows: list[dict]) -> pd.DataFrame:
+def _make_frame(rows: list[dict[str, object]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 

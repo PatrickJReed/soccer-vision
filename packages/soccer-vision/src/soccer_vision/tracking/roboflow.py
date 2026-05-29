@@ -78,6 +78,78 @@ def _empty_df() -> pd.DataFrame:
     return pd.DataFrame({col: pd.Series(dtype=t) for col, t in _SCHEMA_DTYPES.items()})
 
 
+# Position columns linearly interpolated when bridging a ball-trajectory gap.
+_BALL_INTERP_COLS: Final = ("x_px", "y_px", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2")
+
+
+def interpolate_ball_gaps(
+    df: pd.DataFrame,
+    fps: float,
+    max_gap_frames: int = 15,
+) -> pd.DataFrame:
+    """Bridge short gaps in the ball trajectory with interpolated rows.
+
+    The roboflow ball detector assigns a fresh synthetic ``track_id`` per frame
+    and bypasses ByteTrack, so any frame the detector misses leaves a hole in
+    the ball trajectory. Downstream possession/phase logic needs a continuous
+    ball signal, so we linearly interpolate position across runs of at most
+    ``max_gap_frames`` consecutive missing frames.
+
+    Interpolated rows carry ``conf == 0.0`` so they stay distinguishable from
+    real detections (which run at a conf floor > 0). Gaps longer than
+    ``max_gap_frames`` are left untouched — those are sustained losses (fast
+    pans, long occlusions) that interpolation must not paper over.
+
+    Non-ball rows pass through unchanged. The result is sorted by frame and
+    remains schema-conformant. When a frame holds multiple ball detections,
+    the highest-conf one anchors the interpolation; original rows are never
+    modified or dropped.
+    """
+    if max_gap_frames < 1 or df.empty:
+        return df
+
+    ball = df[df["class"] == "ball"]
+    if ball["frame"].nunique() < 2:
+        return df
+
+    # One anchor position per frame: the highest-conf detection that frame.
+    anchors = (
+        ball.sort_values("conf")
+        .drop_duplicates("frame", keep="last")
+        .sort_values("frame")
+        .reset_index(drop=True)
+    )
+    frames = anchors["frame"].to_numpy()
+
+    new_rows: list[dict[str, float | int | str]] = []
+    for i in range(len(frames) - 1):
+        f0, f1 = int(frames[i]), int(frames[i + 1])
+        n_missing = f1 - f0 - 1
+        if n_missing < 1 or n_missing > max_gap_frames:
+            continue
+        a, b = anchors.iloc[i], anchors.iloc[i + 1]
+        for fm in range(f0 + 1, f1):
+            alpha = (fm - f0) / (f1 - f0)
+            row: dict[str, float | int | str] = {
+                "frame":     fm,
+                "t_seconds": fm / fps,
+                "track_id":  _BALL_TRACK_ID_BASE - fm,
+                "class":     "ball",
+                "team":      "unknown",
+                "conf":      0.0,
+            }
+            for col in _BALL_INTERP_COLS:
+                row[col] = float(a[col] + alpha * (b[col] - a[col]))
+            new_rows.append(row)
+
+    if not new_rows:
+        return df
+
+    filled = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+    filled = filled.astype(_SCHEMA_DTYPES)
+    return filled.sort_values(["frame", "track_id"]).reset_index(drop=True)
+
+
 # ---------------------------------------------------------------------------
 # Backend class
 # ---------------------------------------------------------------------------
@@ -97,6 +169,20 @@ class RoboflowBackend:
         Optional path to a fine-tuned ball detector weights file (.pt).
         When provided, this model is used instead of the default ball detector.
         If the path does not exist, raises FileNotFoundError.
+    ball_imgsz:
+        Inference resolution for the ball model. Defaults to 1280 to match the
+        fine-tune training resolution — the ball is a tiny object, and running
+        inference at ultralytics' 640 default downscales it below the
+        detection floor.
+    ball_conf:
+        Confidence threshold for the ball model. Defaults to 0.05: the
+        fine-tuned detector's operating point sits well below the ultralytics
+        0.25 default, and the gap is bridged by interpolation + downstream
+        tracking rather than a high threshold.
+    ball_max_gap_frames:
+        Maximum run of consecutive missed frames to bridge by linear
+        interpolation of the ball position. Defaults to 15 (~0.5s at 30fps).
+        Longer gaps are left as holes (sustained losses, not flicker).
     detect_pitch:
         When True, download and load the pitch keypoint detection model.
         Required to call process_with_pitch(). Defaults to False to avoid
@@ -111,6 +197,9 @@ class RoboflowBackend:
         device: str | None = None,
         weights_cache_dir: Path | None = None,
         ball_weights_path: Path | None = None,
+        ball_imgsz: int = 1280,
+        ball_conf: float = 0.05,
+        ball_max_gap_frames: int = 15,
         detect_pitch: bool = False,
     ) -> None:
         self._device_override = device
@@ -118,6 +207,9 @@ class RoboflowBackend:
         if ball_weights_path is not None and not ball_weights_path.exists():
             raise FileNotFoundError(f"ball_weights_path does not exist: {ball_weights_path}")
         self.ball_weights_path: Path | None = ball_weights_path
+        self.ball_imgsz: int = ball_imgsz
+        self.ball_conf: float = ball_conf
+        self.ball_max_gap_frames: int = ball_max_gap_frames
         self.detect_pitch: bool = detect_pitch
 
     # ------------------------------------------------------------------
@@ -319,7 +411,16 @@ class RoboflowBackend:
                 })
 
             # --- ball detection (separate model, synthetic track IDs) ---
-            b_result = ball_model(frame, device=device, verbose=False)[0]
+            # imgsz/conf default to the ball model's training resolution and a
+            # low operating point; missed frames are bridged downstream by
+            # interpolate_ball_gaps() rather than a high threshold.
+            b_result = ball_model(
+                frame,
+                imgsz=self.ball_imgsz,
+                conf=self.ball_conf,
+                device=device,
+                verbose=False,
+            )[0]
             b_dets = sv.Detections.from_ultralytics(b_result)
 
             for j in range(len(b_dets)):
@@ -385,6 +486,10 @@ class RoboflowBackend:
                 "conf":     "float64",
                 "t_seconds": "float64",
             })
+
+        # Bridge short ball-detection gaps so downstream possession/phase logic
+        # gets a continuous ball signal (the ball bypasses ByteTrack above).
+        df = interpolate_ball_gaps(df, fps=fps, max_gap_frames=self.ball_max_gap_frames)
 
         validate_trajectories(df)
 

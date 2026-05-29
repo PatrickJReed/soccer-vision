@@ -29,3 +29,17 @@ def test_preserves_index_and_name() -> None:
     out = smooth_possession(s, window_frames=3)
     assert list(out.index) == [10, 11, 12]
     assert out.name == "possession_state"
+
+
+def test_contested_neighbors_do_not_flip_clear_frame() -> None:
+    # 'own' frame flanked by a contested scramble keeps 'own' (contested excluded from the vote).
+    s = pd.Series(["own", "contested", "contested", "contested", "contested"], index=[0, 1, 2, 3, 4])
+    out = smooth_possession(s, window_frames=5)
+    assert out.iloc[0] == "own"
+
+
+def test_boundary_frames_use_clipped_window() -> None:
+    s = pd.Series(["opp", "own", "own", "own", "own"], index=[0, 1, 2, 3, 4])
+    out = smooth_possession(s, window_frames=5)
+    # frame 0's window is the clipped [0:3] = opp, own, own -> mode 'own'
+    assert out.iloc[0] == "own"

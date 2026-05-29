@@ -80,9 +80,12 @@ def smooth_possession(possession_state: pd.Series, window_frames: int) -> pd.Ser
     """Mode-smooth the per-frame possession series over a centered window.
 
     A frame whose raw state is 'contested' is preserved as 'contested'
-    (spec §6.1); every other frame takes the modal state of the surrounding
-    window_frames-wide window (ties broken by first occurrence). Operates
-    positionally on the series as given, so callers should pass a series sorted
+    (spec §6.1). Every other frame takes the modal state of the surrounding
+    window_frames-wide window, computed over non-'contested' neighbours only
+    (so a clear-possession frame beside a contested scramble keeps its label,
+    while contested frames still pass through untouched). If the window has no
+    non-'contested' neighbours, the frame is left as-is. Ties break by first
+    occurrence. Operates positionally, so callers should pass a series sorted
     by frame.
     """
     if window_frames <= 1 or len(possession_state) == 0:
@@ -95,6 +98,9 @@ def smooth_possession(possession_state: pd.Series, window_frames: int) -> pd.Ser
         if states[i] == "contested":
             out.append("contested")
             continue
-        window = states[max(0, i - half):min(n, i + half + 1)]
-        out.append(Counter(window).most_common(1)[0][0])
+        window = [
+            s for s in states[max(0, i - half):min(n, i + half + 1)]
+            if s != "contested"
+        ]
+        out.append(Counter(window).most_common(1)[0][0] if window else states[i])
     return pd.Series(out, index=possession_state.index, name=possession_state.name)

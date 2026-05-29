@@ -10,6 +10,7 @@ Install extras:
 
 from __future__ import annotations
 
+import urllib.request
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -25,10 +26,22 @@ if TYPE_CHECKING:
 # Weight registry
 # ---------------------------------------------------------------------------
 
-WEIGHTS: Final[dict[str, tuple[str, str]]] = {
-    "ball":   ("1isw4wx-MK9h9LMr36VvIWlJD6ppUvw7V", "football-ball-detection.pt"),
-    "player": ("17PXFNlx-jI7VjVo_vQnB1sONjRyvoB-q", "football-player-detection.pt"),
-    "pitch":  ("1Ma5Kt86tgpdjCTKfum79YMgNnSjcoOyf", "football-pitch-detection.pt"),
+# Direct download URL for the fine-tuned ball detector (Phase 2), published as
+# a GitHub release asset. The asset filename must match the tail of this URL.
+BALL_V1_URL: Final = (
+    "https://github.com/PatrickJReed/soccer-vision/releases/download/"
+    "ball-v1/ball_yolov8_v1.pt"
+)
+
+# Model weights registry. Each entry: (kind, locator, filename).
+#   kind="gdrive" -> locator is a Google Drive file ID (fetched via gdown)
+#   kind="url"    -> locator is a direct HTTPS download URL (fetched via urllib)
+# The ball role defaults to the fine-tuned detector. The roboflow baseline ball
+# model it replaced lived at gdrive id 1isw4wx-MK9h9LMr36VvIWlJD6ppUvw7V.
+WEIGHTS: Final[dict[str, tuple[str, str, str]]] = {
+    "ball":   ("url",    BALL_V1_URL, "ball_yolov8_v1.pt"),
+    "player": ("gdrive", "17PXFNlx-jI7VjVo_vQnB1sONjRyvoB-q", "football-player-detection.pt"),
+    "pitch":  ("gdrive", "1Ma5Kt86tgpdjCTKfum79YMgNnSjcoOyf", "football-pitch-detection.pt"),
 }
 
 DEFAULT_CACHE_DIR: Final[Path] = Path.home() / ".cache" / "soccer_vision" / "weights"
@@ -232,13 +245,15 @@ class RoboflowBackend:
 
         self._weights_dir.mkdir(parents=True, exist_ok=True)
         paths: dict[str, Path] = {}
-        for role, (gdrive_id, filename) in WEIGHTS.items():
+        for role, (kind, locator, filename) in WEIGHTS.items():
             if role == "pitch" and not self.detect_pitch:
                 continue
             dest = self._weights_dir / filename
             if not dest.exists():
-                url = f"https://drive.google.com/uc?id={gdrive_id}"
-                gdown.download(url, str(dest), quiet=False)
+                if kind == "gdrive":
+                    gdown.download(f"https://drive.google.com/uc?id={locator}", str(dest), quiet=False)
+                else:  # direct HTTPS URL (e.g. GitHub release asset)
+                    urllib.request.urlretrieve(locator, str(dest))
             paths[role] = dest
         return paths
 

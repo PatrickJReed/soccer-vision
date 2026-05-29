@@ -59,3 +59,24 @@ def test_low_confidence_keypoints_filtered() -> None:
 def test_empty_keypoints_returns_empty() -> None:
     empty = pd.DataFrame(columns=["frame", "kp_idx", "x_px", "y_px", "conf"])
     assert build_frame_homographies(empty) == {}
+
+
+def test_collinear_keypoints_are_skipped() -> None:
+    # 5 points on a line: passes min_points but degenerate -> HomographyError -> skipped.
+    idxs = [0, 1, 2, 3, 4]
+    kp = pd.DataFrame({
+        "frame": [9] * 5,
+        "kp_idx": idxs,
+        "x_px": [0.0, 1.0, 2.0, 3.0, 4.0],
+        "y_px": [0.0, 1.0, 2.0, 3.0, 4.0],
+        "conf": [0.9] * 5,
+    })
+    assert build_frame_homographies(kp) == {}
+
+
+def test_multiple_frames_dispatched_independently() -> None:
+    good = _keypoints_for_identity(0)        # 6 points -> fitted
+    sparse = _keypoints_for_identity(1).head(3)  # 3 points -> skipped
+    kp = pd.concat([good, sparse], ignore_index=True)
+    homographies = build_frame_homographies(kp)
+    assert set(homographies) == {0}

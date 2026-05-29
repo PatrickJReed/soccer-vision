@@ -63,8 +63,12 @@ def build_frame_homographies(
     if keypoints.empty:
         return homographies
     n_landmarks = len(PITCH_LANDMARKS)
-    for frame_idx, group in keypoints.groupby("frame", sort=True):
-        sel = group[(group["conf"] >= conf_threshold) & (group["kp_idx"] < n_landmarks)]
+    for frame_idx, group in keypoints.groupby("frame", sort=False):
+        sel = group[
+            (group["conf"] >= conf_threshold)
+            & (group["kp_idx"] >= 0)
+            & (group["kp_idx"] < n_landmarks)
+        ]
         if len(sel) < min_points:
             continue
         image_points = sel[["x_px", "y_px"]].to_numpy(dtype=np.float64)

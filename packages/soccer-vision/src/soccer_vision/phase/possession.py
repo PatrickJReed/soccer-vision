@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Literal, cast
 
@@ -73,3 +74,27 @@ def classify_possession(
         states[fkey] = "own" if d_own < d_opp else "opp"
 
     return pd.Series(states, name="possession_state")
+
+
+def smooth_possession(possession_state: pd.Series, window_frames: int) -> pd.Series:
+    """Mode-smooth the per-frame possession series over a centered window.
+
+    A frame whose raw state is 'contested' is preserved as 'contested'
+    (spec §6.1); every other frame takes the modal state of the surrounding
+    window_frames-wide window (ties broken by first occurrence). Operates
+    positionally on the series as given, so callers should pass a series sorted
+    by frame.
+    """
+    if window_frames <= 1 or len(possession_state) == 0:
+        return possession_state.copy()
+    states = possession_state.to_list()
+    n = len(states)
+    half = window_frames // 2
+    out: list[str] = []
+    for i in range(n):
+        if states[i] == "contested":
+            out.append("contested")
+            continue
+        window = states[max(0, i - half):min(n, i + half + 1)]
+        out.append(Counter(window).most_common(1)[0][0])
+    return pd.Series(out, index=possession_state.index, name=possession_state.name)

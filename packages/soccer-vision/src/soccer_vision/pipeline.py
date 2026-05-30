@@ -107,8 +107,13 @@ def assemble_phases(
 
 
 def _infer_fps(trajectories_px: pd.DataFrame) -> float:
-    """Recover fps from a row's frame / t_seconds (t = frame / fps). Defaults to 30."""
-    nonzero = trajectories_px[trajectories_px["t_seconds"] > 0]
+    """Recover fps from a row's frame / t_seconds (t = frame / fps).
+
+    Uses the first row with frame > 0 and t_seconds > 0. Falls back to 30.0
+    (common broadcast default) when no such row exists; callers who know the
+    source fps should pass it explicitly.
+    """
+    nonzero = trajectories_px[(trajectories_px["t_seconds"] > 0) & (trajectories_px["frame"] > 0)]
     if nonzero.empty:
         return 30.0
     row = nonzero.iloc[0]
@@ -136,6 +141,7 @@ def assemble_from_parquet(
     trajectories_px = pd.read_parquet(trajectories_px_path)
     keypoints = pd.read_parquet(keypoints_path)
     resolved_fps = fps if fps is not None else _infer_fps(trajectories_px)
+    # total_frames from the last detected frame; trailing detection-free frames are omitted.
     total_frames = int(trajectories_px["frame"].max()) + 1 if not trajectories_px.empty else 0
     result = assemble_phases(
         trajectories_px, keypoints, fps=resolved_fps, total_frames=total_frames, **assemble_opts  # type: ignore[arg-type]

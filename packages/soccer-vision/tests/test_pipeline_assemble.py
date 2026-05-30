@@ -117,3 +117,10 @@ def test_assemble_from_parquet_roundtrip(tmp_path) -> None:
     assert list(reloaded_phases.columns) == [
         "frame", "t_seconds", "possession_state", "phase", "ball_x_pitch", "ball_y_pitch",
     ]
+
+
+def test_infer_fps_falls_back_to_30_when_no_positive_frame() -> None:
+    from soccer_vision.pipeline import _infer_fps
+
+    df = pd.DataFrame({"frame": [0], "t_seconds": [0.0]})
+    assert _infer_fps(df) == 30.0

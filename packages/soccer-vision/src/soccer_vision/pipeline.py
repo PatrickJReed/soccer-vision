@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -147,4 +148,41 @@ def assemble_from_parquet(
         trajectories_px, keypoints, fps=resolved_fps, total_frames=total_frames, **assemble_opts  # type: ignore[arg-type]
     )
     _write_deliverables(result, Path(out_dir))
+    return result
+
+
+def analyze_video(
+    video_path: Path,
+    out_dir: Path,
+    *,
+    backend: Any | None = None,
+    **assemble_opts: object,
+) -> PipelineResult:
+    """Run the full pipeline on a video and write checkpoints + deliverables.
+
+    Stage 1 (GPU): run the backend's pitch-aware tracking and checkpoint the raw
+    px trajectories + keypoints. Stage 2 (pure): assemble and write deliverables.
+    fps and total_frames are derived from the tracker output so this is testable
+    with a stub backend and needs no second video read.
+    """
+    if backend is None:
+        from soccer_vision.tracking.roboflow import (
+            RoboflowBackend,  # lazy: avoids roboflow extra at import
+        )
+
+        backend = RoboflowBackend(detect_pitch=True)
+
+    trajectories_px, keypoints = backend.process_with_pitch(video_path)
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    trajectories_px.to_parquet(out / "trajectories_px.parquet", index=False)
+    keypoints.to_parquet(out / "keypoints.parquet", index=False)
+
+    resolved_fps = _infer_fps(trajectories_px)
+    total_frames = int(trajectories_px["frame"].max()) + 1 if not trajectories_px.empty else 0
+    result = assemble_phases(
+        trajectories_px, keypoints, fps=resolved_fps, total_frames=total_frames, **assemble_opts  # type: ignore[arg-type]
+    )
+    _write_deliverables(result, out)
     return result

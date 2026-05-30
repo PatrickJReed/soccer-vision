@@ -91,3 +91,29 @@ def test_assemble_phases_fills_full_frame_range() -> None:
     result = assemble_phases(traj, kp, fps=FPS, total_frames=5)  # 2 trailing empty frames
     assert list(result.phases["frame"]) == [0, 1, 2, 3, 4]
     assert result.phases.set_index("frame").loc[4, "possession_state"] == "unknown"
+
+
+def test_assemble_from_parquet_roundtrip(tmp_path) -> None:
+    from soccer_vision.pipeline import assemble_from_parquet
+
+    traj = _scene()
+    kp = _identity_keypoints(3)
+    traj_path = tmp_path / "trajectories_px.parquet"
+    kp_path = tmp_path / "keypoints.parquet"
+    traj.to_parquet(traj_path, index=False)
+    kp.to_parquet(kp_path, index=False)
+    out_dir = tmp_path / "out"
+
+    result = assemble_from_parquet(traj_path, kp_path, out_dir)
+
+    # fps inferred from t_seconds (= 1.0 here), total_frames from max(frame)+1 (= 3).
+    assert list(result.phases["frame"]) == [0, 1, 2]
+    # Deliverables written.
+    assert (out_dir / "trajectories.parquet").exists()
+    assert (out_dir / "phases.parquet").exists()
+    reloaded = pd.read_parquet(out_dir / "trajectories.parquet")
+    assert "x_pitch" in reloaded.columns
+    reloaded_phases = pd.read_parquet(out_dir / "phases.parquet")
+    assert list(reloaded_phases.columns) == [
+        "frame", "t_seconds", "possession_state", "phase", "ball_x_pitch", "ball_y_pitch",
+    ]

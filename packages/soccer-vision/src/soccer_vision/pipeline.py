@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import pandas as pd
 
@@ -103,3 +104,41 @@ def assemble_phases(
         homography_coverage=hom_cov,
         ball_coverage=ball_cov,
     )
+
+
+def _infer_fps(trajectories_px: pd.DataFrame) -> float:
+    """Recover fps from a row's frame / t_seconds (t = frame / fps). Defaults to 30."""
+    nonzero = trajectories_px[trajectories_px["t_seconds"] > 0]
+    if nonzero.empty:
+        return 30.0
+    row = nonzero.iloc[0]
+    return float(row["frame"]) / float(row["t_seconds"])
+
+
+def _write_deliverables(result: PipelineResult, out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    result.trajectories.to_parquet(out_dir / "trajectories.parquet", index=False)
+    result.phases.to_parquet(out_dir / "phases.parquet", index=False)
+
+
+def assemble_from_parquet(
+    trajectories_px_path: Path,
+    keypoints_path: Path,
+    out_dir: Path,
+    *,
+    fps: float | None = None,
+    **assemble_opts: object,
+) -> PipelineResult:
+    """Re-run the pure assembly stage from a Stage-1 checkpoint and write deliverables.
+
+    This is the cheap-recompute path: tweak thresholds without re-running GPU tracking.
+    """
+    trajectories_px = pd.read_parquet(trajectories_px_path)
+    keypoints = pd.read_parquet(keypoints_path)
+    resolved_fps = fps if fps is not None else _infer_fps(trajectories_px)
+    total_frames = int(trajectories_px["frame"].max()) + 1 if not trajectories_px.empty else 0
+    result = assemble_phases(
+        trajectories_px, keypoints, fps=resolved_fps, total_frames=total_frames, **assemble_opts  # type: ignore[arg-type]
+    )
+    _write_deliverables(result, Path(out_dir))
+    return result

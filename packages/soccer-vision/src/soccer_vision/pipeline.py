@@ -121,6 +121,19 @@ def _infer_fps(trajectories_px: pd.DataFrame) -> float:
     return float(row["frame"]) / float(row["t_seconds"])
 
 
+def _resolve_fps_and_frames(
+    trajectories_px: pd.DataFrame, fps_override: float | None = None
+) -> tuple[float, int]:
+    """Resolve (fps, total_frames) from tracker output.
+
+    fps comes from fps_override when given, else inferred. total_frames is the
+    last detected frame + 1; trailing detection-free frames are omitted.
+    """
+    fps = fps_override if fps_override is not None else _infer_fps(trajectories_px)
+    total_frames = int(trajectories_px["frame"].max()) + 1 if not trajectories_px.empty else 0
+    return fps, total_frames
+
+
 def _write_deliverables(result: PipelineResult, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     result.trajectories.to_parquet(out_dir / "trajectories.parquet", index=False)
@@ -141,9 +154,7 @@ def assemble_from_parquet(
     """
     trajectories_px = pd.read_parquet(trajectories_px_path)
     keypoints = pd.read_parquet(keypoints_path)
-    resolved_fps = fps if fps is not None else _infer_fps(trajectories_px)
-    # total_frames from the last detected frame; trailing detection-free frames are omitted.
-    total_frames = int(trajectories_px["frame"].max()) + 1 if not trajectories_px.empty else 0
+    resolved_fps, total_frames = _resolve_fps_and_frames(trajectories_px, fps)
     result = assemble_phases(
         trajectories_px, keypoints, fps=resolved_fps, total_frames=total_frames, **assemble_opts  # type: ignore[arg-type]
     )
@@ -179,8 +190,7 @@ def analyze_video(
     trajectories_px.to_parquet(out / "trajectories_px.parquet", index=False)
     keypoints.to_parquet(out / "keypoints.parquet", index=False)
 
-    resolved_fps = _infer_fps(trajectories_px)
-    total_frames = int(trajectories_px["frame"].max()) + 1 if not trajectories_px.empty else 0
+    resolved_fps, total_frames = _resolve_fps_and_frames(trajectories_px)
     result = assemble_phases(
         trajectories_px, keypoints, fps=resolved_fps, total_frames=total_frames, **assemble_opts  # type: ignore[arg-type]
     )

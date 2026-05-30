@@ -64,6 +64,8 @@ def test_analyze_video_writes_four_parquets(tmp_path: Path) -> None:
     # Checkpoint is the verbatim tracker output.
     checkpoint = pd.read_parquet(out_dir / "trajectories_px.parquet")
     assert "x_pitch" not in checkpoint.columns
+    assert checkpoint.shape == _trajectories().shape
+    assert list(checkpoint.columns) == list(_trajectories().columns)
     # Deliverable is enriched.
     enriched = pd.read_parquet(out_dir / "trajectories.parquet")
     assert "x_pitch" in enriched.columns

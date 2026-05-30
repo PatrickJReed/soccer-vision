@@ -15,7 +15,7 @@ def _identity_keypoints(n_frames: int) -> pd.DataFrame:
     pts = PITCH_LANDMARKS[idxs]
     rows = []
     for f in range(n_frames):
-        for k, (x, y) in zip(idxs, pts, strict=False):
+        for k, (x, y) in zip(idxs, pts, strict=True):
             rows.append({"frame": f, "kp_idx": k, "x_px": float(x), "y_px": float(y), "conf": 0.9})
     return pd.DataFrame(rows)
 
@@ -33,7 +33,7 @@ def _det(frame, track_id, x, y, cls, team, conf=0.9):
 def _scene() -> pd.DataFrame:
     rows = []
     # own player track 1: own third, team flickers own/opp/own -> modal "own"
-    for f, team in zip(range(3), ["own", "opp", "own"], strict=False):
+    for f, team in zip(range(3), ["own", "opp", "own"], strict=True):
         rows.append(_det(f, 1, 0.50, 0.25, "player", team))
     # opp player track 101: opp end, always "opp"
     for f in range(3):

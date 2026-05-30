@@ -34,7 +34,7 @@ class PipelineResult:
 
     trajectories: pd.DataFrame   # per-detection, +x_pitch/+y_pitch, team modal-cleaned
     phases: pd.DataFrame         # per-frame over [0, total_frames)
-    homography_coverage: float   # fraction of frames with a smoothed H
+    homography_coverage: float   # fraction of frames where the pitch model fit a homography (pre-smoothing)
     ball_coverage: float         # fraction of frames with a non-NaN ball pitch coord
 
 
@@ -65,8 +65,9 @@ def assemble_phases(
     window = max(1, round(fps))
     poss_smoothed = smooth_possession(poss, window_frames=window)
 
+    # Highest-confidence ball per frame (multiple low-conf detections are possible at conf=0.05).
     ball = enriched[enriched["class"] == "ball"]
-    ball_by_frame = ball.groupby("frame")[["x_pitch", "y_pitch"]].first()
+    ball_by_frame = ball.sort_values("conf").groupby("frame")[["x_pitch", "y_pitch"]].last()
 
     full_index = pd.RangeIndex(0, total_frames, name="frame")
     poss_full = poss_smoothed.reindex(full_index, fill_value="unknown")
@@ -93,7 +94,7 @@ def assemble_phases(
         "ball_y_pitch": "float64",
     })
 
-    hom_cov = len(homographies) / total_frames if total_frames else 0.0
+    hom_cov = len(raw_h) / total_frames if total_frames else 0.0
     ball_cov = float(ball_y_full.notna().sum()) / total_frames if total_frames else 0.0
 
     return PipelineResult(

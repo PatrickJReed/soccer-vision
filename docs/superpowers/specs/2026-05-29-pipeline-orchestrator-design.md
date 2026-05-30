@@ -160,7 +160,7 @@ preserving contested"), which Task 14 never built.
 class PipelineResult:
     trajectories: pd.DataFrame   # per-detection, enriched: +x_pitch, +y_pitch; team = modal-cleaned
     phases: pd.DataFrame         # per-frame, full contiguous frame range
-    homography_coverage: float   # fraction of frames with a smoothed H
+    homography_coverage: float   # fraction of frames where the pitch model fit a homography (pre-smoothing, from raw_h)
     ball_coverage: float         # fraction of frames with a non-NaN ball pitch coord
 
 

@@ -124,3 +124,22 @@ def test_infer_fps_falls_back_to_30_when_no_positive_frame() -> None:
 
     df = pd.DataFrame({"frame": [0], "t_seconds": [0.0]})
     assert _infer_fps(df) == 30.0
+
+
+def test_assemble_phases_applies_possession_smoothing() -> None:
+    # fps=5 -> window=5; a single-frame opp flicker (frame 2) smooths back to own.
+    rows = []
+    for f in range(5):
+        rows.append(_det(f, 1, 0.50, 0.25, "player", "own"))    # own player, own third
+        rows.append(_det(f, 101, 0.50, 0.75, "player", "opp"))  # opp player
+    # ball near own except frame 2 near opp -> raw possession own,own,opp,own,own
+    for f, by in enumerate([0.27, 0.27, 0.73, 0.27, 0.27]):
+        rows.append(_det(f, -1 - f, 0.50, by, "ball", "unknown"))
+    traj = pd.DataFrame(rows).astype({"frame": "int64", "track_id": "int64"})
+    kp = _identity_keypoints(5)
+
+    result = assemble_phases(traj, kp, fps=5.0, total_frames=5)
+    states = result.phases.set_index("frame")["possession_state"]
+    # Frame 2 is 'opp' before smoothing; the window=5 mode smooths it back to 'own'.
+    assert states.loc[2] == "own"
+    assert states.loc[0] == "own"

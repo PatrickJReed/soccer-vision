@@ -11,8 +11,10 @@ Install extras:
 from __future__ import annotations
 
 import urllib.request
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
 import pandas as pd
 
@@ -84,6 +86,68 @@ _CLS_NAME: Final[dict[int, str]] = {
 
 # Cluster index → team label (by convention; caller may flip if needed)
 _CLUSTER_TEAM: Final[dict[int, str]] = {0: "own", 1: "opp"}
+
+# Max crops sampled per track for team classification (largest-area = clearest kit).
+_TEAM_CROPS_PER_TRACK: Final = 12
+
+
+def _keep_top_crop(
+    track_crops: dict[int, list[tuple[float, object]]],
+    track_id: int,
+    crop: object,
+    area: float,
+    limit: int = _TEAM_CROPS_PER_TRACK,
+) -> None:
+    """Keep up to `limit` largest-area crops per track (proxy for the clearest kit).
+
+    Bounds memory to limit crops per track while biasing the team-classification
+    sample toward near-camera, high-resolution detections.
+    """
+    bucket = track_crops.setdefault(track_id, [])
+    if len(bucket) < limit:
+        bucket.append((area, crop))
+        return
+    min_idx = min(range(len(bucket)), key=lambda i: bucket[i][0])
+    if area > bucket[min_idx][0]:
+        bucket[min_idx] = (area, crop)
+
+
+def _classify_teams_per_track(
+    track_crops: Mapping[int, list[object]],
+    predict: Callable[[list[object]], Sequence[int]],
+    cluster_team: Mapping[int, str],
+) -> dict[int, str]:
+    """Assign one team per track from a single batched team-classifier call.
+
+    All sampled crops across all tracks are embedded in ONE ``predict()`` call
+    (the classifier batches internally), then each track takes the modal team
+    over its crops. Ties resolve to ``"unknown"`` (matching
+    ``apply_modal_team_per_track``). This replaces per-frame, per-detection
+    prediction: a track's team is effectively constant, and the pipeline
+    collapses to a per-track modal team downstream regardless.
+    """
+    flat_crops: list[object] = []
+    owners: list[int] = []
+    for track_id, crops in track_crops.items():
+        for crop in crops:
+            flat_crops.append(crop)
+            owners.append(track_id)
+    if not flat_crops:
+        return {}
+
+    clusters = predict(flat_crops)
+    per_track: dict[int, Counter[str]] = {}
+    for track_id, cluster in zip(owners, clusters, strict=True):
+        team = cluster_team.get(int(cluster), "unknown")
+        per_track.setdefault(track_id, Counter())[team] += 1
+
+    team_map: dict[int, str] = {}
+    for track_id, counts in per_track.items():
+        top = counts.most_common(2)
+        team_map[track_id] = (
+            "unknown" if len(top) >= 2 and top[0][1] == top[1][1] else top[0][0]
+        )
+    return team_map
 
 
 def _empty_df() -> pd.DataFrame:
@@ -371,6 +435,8 @@ class RoboflowBackend:
         tracker = sv.ByteTrack()
         rows: list[dict[str, float | int | str]] = []
         kp_records: list[dict[str, float | int]] = []
+        # Per-track player/GK crops (area, crop); classified in one batch after the pass.
+        track_crops: dict[int, list[tuple[float, object]]] = {}
 
         for frame_idx, frame in enumerate(
             sv.get_video_frames_generator(source_path=str(video_path))
@@ -397,18 +463,17 @@ class RoboflowBackend:
                 conf_val = float(tracked.confidence[j]) if tracked.confidence is not None else 0.5
                 track_id = int(tracked.tracker_id[j]) if tracked.tracker_id is not None else 0
 
-                # Team assignment
+                # Team assignment: referees come from the class; players/GKs are
+                # classified per-track after the pass (one batched call). Collect
+                # their crops here with a placeholder team to be filled in below.
                 if cls_name == "referee":
                     team = "ref"
-                elif cls_name in ("player", "goalkeeper") and team_classifier is not None:
-                    crop = frame[max(0, int(y1)):max(0, int(y2)), max(0, int(x1)):max(0, int(x2))]
-                    if crop.size > 0:
-                        cluster = int(team_classifier.predict([crop])[0])
-                        team = _CLUSTER_TEAM.get(cluster, "unknown")
-                    else:
-                        team = "unknown"
                 else:
                     team = "unknown"
+                    if cls_name in ("player", "goalkeeper") and team_classifier is not None:
+                        crop = frame[max(0, int(y1)):max(0, int(y2)), max(0, int(x1)):max(0, int(x2))]
+                        if crop.size > 0:
+                            _keep_top_crop(track_crops, track_id, crop, (x2 - x1) * (y2 - y1))
 
                 rows.append({
                     "frame":    frame_idx,
@@ -483,6 +548,16 @@ class RoboflowBackend:
                             "y_px":   float(y),
                             "conf":   c,
                         })
+
+        # ---- Per-track team classification (single batched call) -------
+        # A track's team is effectively constant; classify each track once from
+        # its clearest crops instead of every detection on every frame.
+        if team_classifier is not None and track_crops:
+            sampled = {tid: [c for _, c in lst] for tid, lst in track_crops.items()}
+            team_map = _classify_teams_per_track(sampled, team_classifier.predict, _CLUSTER_TEAM)
+            for record in rows:
+                if record["class"] in ("player", "goalkeeper"):
+                    record["team"] = team_map.get(cast(int, record["track_id"]), "unknown")
 
         # ---- Build and validate trajectories DataFrame -----------------
         if not rows:

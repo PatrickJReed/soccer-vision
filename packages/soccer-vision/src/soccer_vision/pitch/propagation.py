@@ -24,7 +24,12 @@ _GRID = np.array([(x, y) for x in (0.2, 0.5, 0.8) for y in (0.2, 0.5, 0.8)], dty
 
 @dataclass(frozen=True)
 class HomographyEntry:
-    """A frame's homography plus where it came from."""
+    """A frame's homography plus where it came from.
+
+    confidence is 1.0 for anchors and a runtime estimate for propagated frames
+    (which can legitimately reach 0.0 at maximum disagreement). Use ``source`` —
+    not confidence — to detect absence: absent frames are reported as 'none'.
+    """
 
     H: NDArray[np.floating]
     source: str           # "anchor" | "propagated"

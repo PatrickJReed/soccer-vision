@@ -8,6 +8,7 @@ add model invocation and parquet I/O around it.
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -66,21 +67,19 @@ def assemble_phases(
     stage) is given, it is used directly; otherwise homographies are computed from
     keypoints (landmark anchors + carry-forward smoothing) exactly as before.
     """
-    h_map_extra: dict[int, np.ndarray] = {}
     if homographies is not None:
         h_entries = homographies
+        h_map = {f: e.H for f, e in h_entries.items()}
     else:
         raw_h = build_frame_homographies(keypoints, conf_threshold=kp_conf_threshold)
         smoothed = smooth_homographies(raw_h, alpha=homography_alpha)
-        # Only landmark frames are provenance-bearing anchors; carry-forward frames
-        # are mapped but not counted as coverage (preserves the raw-anchor metric).
+        # Only landmark frames are provenance-bearing anchors; carry-forward frames are
+        # still mapped for pitch coords but excluded from provenance/coverage (preserves
+        # the raw-anchor coverage metric).
         h_entries = {f: HomographyEntry(smoothed[f], "anchor", 1.0) for f in raw_h}
-        h_map_extra = {f: H for f, H in smoothed.items() if f not in raw_h}
+        h_map = dict(smoothed)
     if not h_entries:
         logger.warning("No homographies fitted; pitch coords NaN, phases all 'unknown'.")
-
-    h_map = {f: e.H for f, e in h_entries.items()}
-    h_map.update(h_map_extra)   # legacy: still map carry-forward frames
 
     enriched = PitchMapper().transform(trajectories_px, h_map)
     enriched = filter_outside_pitch(enriched, margin=filter_margin)
@@ -91,6 +90,7 @@ def assemble_phases(
     window = max(1, round(fps))
     poss_smoothed = smooth_possession(poss, window_frames=window)
 
+    # Highest-confidence ball per frame (multiple low-conf detections are possible at conf=0.05).
     ball = enriched[enriched["class"] == "ball"]
     ball_by_frame = ball.sort_values("conf").groupby("frame")[["x_pitch", "y_pitch"]].last()
 
@@ -101,12 +101,12 @@ def assemble_phases(
 
     phase_series = label_phase(poss_full, ball_y_full, fps, transition_seconds=transition_seconds)
 
+    valid = {f: e for f, e in h_entries.items() if 0 <= f < total_frames}
     src = pd.Series("none", index=full_index)
     conf = pd.Series(0.0, index=full_index)
-    for f, e in h_entries.items():
-        if 0 <= f < total_frames:
-            src.at[f] = e.source
-            conf.at[f] = e.confidence
+    if valid:
+        src.update(pd.Series({f: e.source for f, e in valid.items()}))
+        conf.update(pd.Series({f: e.confidence for f, e in valid.items()}))
 
     phases = pd.DataFrame({
         "frame": full_index,
@@ -124,8 +124,9 @@ def assemble_phases(
         "homography_source": "object", "homography_conf": "float64",
     })
 
-    n_anchor = sum(1 for e in h_entries.values() if e.source == "anchor")
-    n_prop = sum(1 for e in h_entries.values() if e.source == "propagated")
+    counts = Counter(e.source for e in h_entries.values())
+    n_anchor = counts["anchor"]
+    n_prop = counts["propagated"]
     anchor_cov = n_anchor / total_frames if total_frames else 0.0
     prop_cov = n_prop / total_frames if total_frames else 0.0
     ball_cov = float(ball_y_full.notna().sum()) / total_frames if total_frames else 0.0

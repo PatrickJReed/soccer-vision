@@ -9,8 +9,9 @@ sides of a gap and blend them, lifting pitch-homography coverage without labelin
 from __future__ import annotations
 
 import itertools
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import cv2
 import numpy as np
@@ -205,3 +206,75 @@ def propagate_homographies(
             elif hb is not None:
                 out[t] = HomographyEntry(hb, "propagated", max(0.0, 1.0 - (b - t) / (max_gap + 1)))
     return out
+
+
+def _orb_downscaled(
+    img: NDArray[np.uint8], mask: NDArray[np.uint8], downscale: float, n_features: int
+) -> tuple[list[Any], NDArray[Any] | None]:
+    """ORB keypoints+descriptors on a downscaled copy (keypoints in DOWNSCALED coords)."""
+    if downscale != 1.0:
+        small = cv2.resize(img, None, fx=downscale, fy=downscale, interpolation=cv2.INTER_AREA)
+        smask = cv2.resize(mask, None, fx=downscale, fy=downscale, interpolation=cv2.INTER_NEAREST)
+    else:
+        small, smask = img, mask
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    orb = cv2.ORB_create(n_features)  # type: ignore[attr-defined]
+    return orb.detectAndCompute(gray, smask)  # type: ignore[no-any-return]
+
+
+def _homography_from_descriptors(
+    kp_a: list[Any], d_a: NDArray[Any] | None, kp_b: list[Any], d_b: NDArray[Any] | None,
+    downscale: float, min_inliers: int,
+) -> NDArray[np.floating] | None:
+    """Match descriptors -> homography (downscaled px), rescaled to FULL-res px->px."""
+    if d_a is None or d_b is None or len(d_a) < min_inliers or len(d_b) < min_inliers:
+        return None
+    matches = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True).match(d_a, d_b)
+    if len(matches) < min_inliers:
+        return None
+    src = np.array([kp_a[m.queryIdx].pt for m in matches], dtype=np.float32)
+    dst = np.array([kp_b[m.trainIdx].pt for m in matches], dtype=np.float32)
+    g_small, _ = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
+    if g_small is None:
+        return None
+    s = np.diag([downscale, downscale, 1.0])            # full px -> small px
+    s_inv = np.diag([1.0 / downscale, 1.0 / downscale, 1.0])
+    return (s_inv @ g_small @ s).astype(np.float64)     # full px -> full px
+
+
+def compute_interframe_homographies(
+    read_frame: Callable[[int], NDArray[np.uint8] | None],
+    needed_pairs: set[int],
+    player_boxes: pd.DataFrame,
+    *,
+    downscale: float = 0.5,
+    n_features: int = 3000,
+    min_inliers: int = 12,
+) -> dict[int, NDArray[np.floating]]:
+    """Register every needed consecutive frame pair in ONE ascending pass.
+
+    `needed_pairs` is the set of indices i for which interframe[i] (frame i -> i+1) is
+    wanted. Each frame is read once (read_frame is called in ascending order, so the
+    caller can decode sequentially) and ORB'd once on a `downscale` copy; the resulting
+    homography is rescaled back to full-resolution pixels. Returns {i: full-res G[i]}.
+    """
+    interframe: dict[int, NDArray[np.floating]] = {}
+    if not needed_pairs:
+        return interframe
+    frames = sorted(needed_pairs | {i + 1 for i in needed_pairs})
+    prev_idx: int | None = None
+    prev_kp: list[Any] = []
+    prev_d: NDArray[Any] | None = None
+    for idx in frames:
+        img = read_frame(idx)
+        if img is None:
+            prev_idx = None
+            continue
+        mask = _frame_mask(player_boxes, idx, img.shape[:2])
+        kp, d = _orb_downscaled(img, mask, downscale, n_features)
+        if prev_idx == idx - 1 and (idx - 1) in needed_pairs:
+            g = _homography_from_descriptors(prev_kp, prev_d, kp, d, downscale, min_inliers)
+            if g is not None:
+                interframe[idx - 1] = g
+        prev_idx, prev_kp, prev_d = idx, kp, d
+    return interframe

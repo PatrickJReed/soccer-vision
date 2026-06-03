@@ -8,6 +8,7 @@ import pandas as pd
 from soccer_vision.pitch.propagation import (
     HomographyEntry,
     blend_homographies,
+    compute_interframe_homographies,
     disagreement_confidence,
     propagate_homographies,
     register,
@@ -138,3 +139,42 @@ def test_anchors_have_unit_confidence() -> None:
     out = propagate_homographies(anchors, _pan_interframe(10), max_gap=15)
     assert out[0].confidence == 1.0 and out[10].confidence == 1.0
     assert 0.0 <= out[5].confidence <= 1.0
+
+
+def _textured(seed: int = 5) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    g = (rng.random((400, 600)) * 60).astype(np.uint8)
+    for _ in range(60):
+        x, y = int(rng.integers(20, 560)), int(rng.integers(20, 360))
+        cv2.rectangle(g, (x, y), (x + 18, y + 18), int(rng.integers(80, 255)), -1)
+    return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+
+
+def test_compute_interframe_recovers_known_pan_downscaled() -> None:
+    base = _textured()
+    dx = 6
+
+    def shift(f: int) -> np.ndarray:
+        M = np.array([[1.0, 0.0, float(f * dx)], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        return cv2.warpPerspective(base, M, (600, 400))
+
+    frames = {f: shift(f) for f in range(4)}
+
+    def read_frame(i):
+        return frames.get(i)
+
+    boxes = pd.DataFrame(columns=["frame", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "class"])
+    interframe = compute_interframe_homographies(
+        read_frame, needed_pairs={0, 1, 2}, player_boxes=boxes, downscale=0.5,
+    )
+    assert set(interframe) == {0, 1, 2}
+    # G[1] maps frame1 px -> frame2 px: a +dx translation, recovered at FULL resolution.
+    p = np.array([300.0, 200.0, 1.0])
+    q = interframe[1] @ p
+    q /= q[2]
+    assert abs(q[0] - (300 + dx)) < 2.0 and abs(q[1] - 200.0) < 2.0
+
+
+def test_compute_interframe_empty_pairs() -> None:
+    boxes = pd.DataFrame(columns=["frame", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "class"])
+    assert compute_interframe_homographies(lambda i: None, set(), boxes) == {}

@@ -136,3 +136,33 @@ def test_empty_anchors_returns_empty() -> None:
     read_frame, _, _ = _scene(3)
     boxes = pd.DataFrame(columns=["frame", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "class"])
     assert propagate_homographies({}, read_frame, boxes, max_gap=15) == {}
+
+
+def test_one_sided_coverage_when_a_chain_breaks() -> None:
+    # Frame 2 is unregisterable (blank) -> breaks the forward chain after frame 1
+    # and the backward chain after frame 3. Frame 1 is reached forward-only, frame 9
+    # backward-only, frame 2 by neither (spec: either chain can bridge a frame).
+    read_frame, anchor_H, _ = _scene(11)
+    blank = np.zeros((400, 600, 3), np.uint8)
+
+    def gated(f: int):
+        return blank if f == 2 else read_frame(f)
+
+    anchors = {0: anchor_H(0), 10: anchor_H(10)}
+    boxes = pd.DataFrame(columns=["frame", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "class"])
+    out = propagate_homographies(anchors, gated, boxes, max_gap=15)
+
+    assert 2 not in out                                   # reachable by neither chain
+    assert 1 in out and out[1].source == "propagated"     # forward-only reach
+    assert 9 in out and out[9].source == "propagated"     # backward-only reach
+
+
+def test_frame_mask_blanks_player_boxes() -> None:
+    from soccer_vision.pitch.propagation import _frame_mask
+
+    boxes = pd.DataFrame([
+        {"frame": 0, "bbox_x1": 100, "bbox_y1": 100, "bbox_x2": 140, "bbox_y2": 180, "class": "player"},
+    ])
+    mask = _frame_mask(boxes, 0, (400, 600))   # shape (rows=400, cols=600)
+    assert mask[140, 120] == 0     # inside the dilated player box -> ignored by ORB
+    assert mask[10, 10] == 255     # background -> used

@@ -22,6 +22,7 @@ class PitchSpec:
     penalty_box_width_frac: float = 0.720
     center_circle_radius_frac: float = 0.106
     coverage_cell_frac: float = 0.011
+    goal_width_frac: float = 0.140
 
     @classmethod
     def standard_9v9(cls) -> PitchSpec:
@@ -36,4 +37,5 @@ class PitchSpec:
             penalty_box_width_frac=0.592,
             center_circle_radius_frac=0.087,
             coverage_cell_frac=0.0095,
+            goal_width_frac=0.108,
         )

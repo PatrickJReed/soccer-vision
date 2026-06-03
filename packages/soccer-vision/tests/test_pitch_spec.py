@@ -30,3 +30,15 @@ def test_immutable() -> None:
     except (AttributeError, Exception):
         return
     raise AssertionError("PitchSpec should be frozen")
+
+
+def test_standard_9v9_has_goal_width_frac() -> None:
+    spec = PitchSpec.standard_9v9()
+    # US Soccer 9v9: ~6.4 m goal on a ~45.7 m wide field -> ~0.14 of width.
+    assert 0.10 < spec.goal_width_frac < 0.20
+
+
+def test_fifa_11v11_has_goal_width_frac() -> None:
+    spec = PitchSpec.fifa_11v11()
+    # 7.32 m goal on a 68 m wide field -> ~0.108 of width.
+    assert 0.08 < spec.goal_width_frac < 0.14

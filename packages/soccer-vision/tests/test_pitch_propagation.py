@@ -8,6 +8,7 @@ import pandas as pd
 from soccer_vision.pitch.propagation import (
     HomographyEntry,
     blend_homographies,
+    compute_interframe_homographies,
     disagreement_confidence,
     propagate_homographies,
     register,
@@ -76,87 +77,6 @@ def test_homography_entry_fields() -> None:
     assert e.source == "anchor" and e.confidence == 1.0 and e.H.shape == (3, 3)
 
 
-def _shift_frame(base: np.ndarray, dx: int) -> np.ndarray:
-    M = np.array([[1.0, 0.0, float(dx)], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-    return cv2.warpPerspective(base, M, (base.shape[1], base.shape[0]))
-
-
-def _scene(n_frames: int, pan_per_frame: int = 4):
-    """A panning clip: frame f is base shifted by f*pan. read_frame + anchors map
-    each frame's pixels back to a fixed 'pitch' = base-frame pixel coords / 1000."""
-    base = _textured_image(1)
-    frames = {f: _shift_frame(base, f * pan_per_frame) for f in range(n_frames)}
-
-    def read_frame(f: int):
-        return frames.get(f)
-
-    def anchor_H(f: int) -> np.ndarray:
-        undo = np.array([[1.0, 0.0, -f * pan_per_frame], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-        scale = np.diag([1 / 1000.0, 1 / 1000.0, 1.0])
-        return scale @ undo
-
-    return read_frame, anchor_H, frames
-
-
-def test_propagation_bridges_gap_within_window() -> None:
-    read_frame, anchor_H, _ = _scene(11)
-    anchors = {0: anchor_H(0), 10: anchor_H(10)}     # gap of 9 frames between
-    boxes = pd.DataFrame(columns=["frame", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "class"])
-    out = propagate_homographies(anchors, read_frame, boxes, max_gap=15)
-
-    assert out[0].source == "anchor" and out[10].source == "anchor"
-    assert 5 in out and out[5].source == "propagated"
-    truth = anchor_H(5)
-    p = np.array([300.0, 200.0])
-    got = (out[5].H @ np.array([p[0], p[1], 1.0]))
-    got = got[:2] / got[2]
-    exp = (truth @ np.array([p[0], p[1], 1.0]))
-    exp = exp[:2] / exp[2]
-    assert np.linalg.norm(got - exp) < 0.02   # < 0.02 pitch-units
-
-
-def test_gap_beyond_max_is_not_bridged() -> None:
-    read_frame, anchor_H, _ = _scene(11)
-    anchors = {0: anchor_H(0), 10: anchor_H(10)}
-    boxes = pd.DataFrame(columns=["frame", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "class"])
-    out = propagate_homographies(anchors, read_frame, boxes, max_gap=4)   # gap 9 > 4
-    assert set(out) == {0, 10}                # only anchors, nothing bridged
-
-
-def test_unbridged_frames_absent_and_anchors_confident() -> None:
-    read_frame, anchor_H, _ = _scene(11)
-    anchors = {0: anchor_H(0), 10: anchor_H(10)}
-    boxes = pd.DataFrame(columns=["frame", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "class"])
-    out = propagate_homographies(anchors, read_frame, boxes, max_gap=15)
-    assert out[0].confidence == 1.0
-    assert 0.0 <= out[5].confidence <= 1.0
-
-
-def test_empty_anchors_returns_empty() -> None:
-    read_frame, _, _ = _scene(3)
-    boxes = pd.DataFrame(columns=["frame", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "class"])
-    assert propagate_homographies({}, read_frame, boxes, max_gap=15) == {}
-
-
-def test_one_sided_coverage_when_a_chain_breaks() -> None:
-    # Frame 2 is unregisterable (blank) -> breaks the forward chain after frame 1
-    # and the backward chain after frame 3. Frame 1 is reached forward-only, frame 9
-    # backward-only, frame 2 by neither (spec: either chain can bridge a frame).
-    read_frame, anchor_H, _ = _scene(11)
-    blank = np.zeros((400, 600, 3), np.uint8)
-
-    def gated(f: int):
-        return blank if f == 2 else read_frame(f)
-
-    anchors = {0: anchor_H(0), 10: anchor_H(10)}
-    boxes = pd.DataFrame(columns=["frame", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "class"])
-    out = propagate_homographies(anchors, gated, boxes, max_gap=15)
-
-    assert 2 not in out                                   # reachable by neither chain
-    assert 1 in out and out[1].source == "propagated"     # forward-only reach
-    assert 9 in out and out[9].source == "propagated"     # backward-only reach
-
-
 def test_frame_mask_blanks_player_boxes() -> None:
     from soccer_vision.pitch.propagation import _frame_mask
 
@@ -166,3 +86,95 @@ def test_frame_mask_blanks_player_boxes() -> None:
     mask = _frame_mask(boxes, 0, (400, 600))   # shape (rows=400, cols=600)
     assert mask[140, 120] == 0     # inside the dilated player box -> ignored by ORB
     assert mask[10, 10] == 255     # background -> used
+
+
+def _pan_interframe(n_pairs: int, dx: float = 4.0) -> dict[int, np.ndarray]:
+    """interframe[i] maps frame i pixels -> i+1 pixels: a constant +dx translation."""
+    G = np.array([[1.0, 0.0, dx], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    return {i: G for i in range(n_pairs)}
+
+
+def _pan_anchor_H(frame: int, dx: float = 4.0) -> np.ndarray:
+    """pixel->pitch for a frame panned by frame*dx: undo pan, then /1000."""
+    undo = np.array([[1.0, 0.0, -frame * dx], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    return np.diag([1 / 1000.0, 1 / 1000.0, 1.0]) @ undo
+
+
+def test_propagation_bridges_gap_within_window() -> None:
+    anchors = {0: _pan_anchor_H(0), 10: _pan_anchor_H(10)}
+    interframe = _pan_interframe(10)                       # G[0..9]
+    out = propagate_homographies(anchors, interframe, max_gap=15)
+
+    assert out[0].source == "anchor" and out[10].source == "anchor"
+    assert out[5].source == "propagated"
+    p = np.array([300.0, 200.0, 1.0])
+    got = out[5].H @ p
+    got = got[:2] / got[2]
+    exp = _pan_anchor_H(5) @ p
+    exp = exp[:2] / exp[2]
+    assert np.linalg.norm(got - exp) < 1e-9
+
+
+def test_gap_beyond_max_is_not_bridged() -> None:
+    anchors = {0: _pan_anchor_H(0), 10: _pan_anchor_H(10)}
+    out = propagate_homographies(anchors, _pan_interframe(10), max_gap=4)  # gap 9 > 4
+    assert set(out) == {0, 10}
+
+
+def test_one_sided_when_interframe_missing() -> None:
+    anchors = {0: _pan_anchor_H(0), 10: _pan_anchor_H(10)}
+    interframe = _pan_interframe(10)
+    del interframe[1]                  # break forward after frame 1; backward stops before frame 1
+    out = propagate_homographies(anchors, interframe, max_gap=15)
+    assert out[1].source == "propagated"   # forward reaches frame 1 (via G[0])
+    assert out[9].source == "propagated"   # backward reaches frame 9 (via inv(G[9]))
+
+
+def test_empty_anchors_returns_empty() -> None:
+    assert propagate_homographies({}, {}, max_gap=15) == {}
+
+
+def test_anchors_have_unit_confidence() -> None:
+    anchors = {0: _pan_anchor_H(0), 10: _pan_anchor_H(10)}
+    out = propagate_homographies(anchors, _pan_interframe(10), max_gap=15)
+    assert out[0].confidence == 1.0 and out[10].confidence == 1.0
+    assert 0.0 <= out[5].confidence <= 1.0
+
+
+def _textured(seed: int = 5) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    g = (rng.random((400, 600)) * 60).astype(np.uint8)
+    for _ in range(60):
+        x, y = int(rng.integers(20, 560)), int(rng.integers(20, 360))
+        cv2.rectangle(g, (x, y), (x + 18, y + 18), int(rng.integers(80, 255)), -1)
+    return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+
+
+def test_compute_interframe_recovers_known_pan_downscaled() -> None:
+    base = _textured()
+    dx = 6
+
+    def shift(f: int) -> np.ndarray:
+        M = np.array([[1.0, 0.0, float(f * dx)], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        return cv2.warpPerspective(base, M, (600, 400))
+
+    frames = {f: shift(f) for f in range(4)}
+
+    def read_frame(i):
+        return frames.get(i)
+
+    boxes = pd.DataFrame(columns=["frame", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "class"])
+    interframe = compute_interframe_homographies(
+        read_frame, needed_pairs={0, 1, 2}, player_boxes=boxes, downscale=0.5,
+    )
+    assert set(interframe) == {0, 1, 2}
+    # G[1] maps frame1 px -> frame2 px: a +dx translation, recovered at FULL resolution.
+    p = np.array([300.0, 200.0, 1.0])
+    q = interframe[1] @ p
+    q /= q[2]
+    assert abs(q[0] - (300 + dx)) < 2.0 and abs(q[1] - 200.0) < 2.0
+
+
+def test_compute_interframe_empty_pairs() -> None:
+    boxes = pd.DataFrame(columns=["frame", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "class"])
+    assert compute_interframe_homographies(lambda i: None, set(), boxes) == {}

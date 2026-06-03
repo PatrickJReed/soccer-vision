@@ -101,6 +101,12 @@ Each registration uses ORB features + `cv2.findHomography(RANSAC)` between two
 frames, **masking out player/referee boxes** (from `trajectories_px`, dilated)
 so matching keys on static field/goal/background, not moving people.
 
+Inter-frame homographies are computed in **one sequential video pass**
+(`compute_interframe_homographies`): frames are read in ascending order via
+grab/retrieve (each decoded once), ORB'd on a downscaled copy, and the resulting
+homography is rescaled back to full-resolution pixels. `propagate_homographies`
+then composes them — pure matrix multiplication, no video I/O.
+
 ### 3.2 Confidence — measured at runtime
 
 For a frame bridged by **both** chains, `H_fwd` and `H_bwd` are two independent
@@ -138,19 +144,26 @@ between-anchor gaps are where the coverage is.
 
 ```python
 # pitch/propagation.py
+def compute_interframe_homographies(
+    read_frame: Callable[[int], NDArray | None],  # frame index -> image (sequential; called in ascending order)
+    needed_pairs: set[int],               # indices i for which G[i] (frame i -> i+1) is wanted
+    player_boxes: pd.DataFrame,           # trajectories_px (for masking)
+    *,
+    downscale: float = 0.5,
+    n_features: int = 3000,
+    min_inliers: int = 12,
+) -> dict[int, NDArray]: ...              # {i: full-res G[i]}
+
 def propagate_homographies(
     anchors: Mapping[int, NDArray],       # {frame: H} from build_frame_homographies
-    read_frame: Callable[[int], NDArray | None],  # frame index -> image (video I/O kept in the caller)
-    player_boxes: pd.DataFrame,           # trajectories_px (for masking)
+    interframe: Mapping[int, NDArray],    # precomputed {i: G[i]} from compute_interframe_homographies
     *,
     max_gap: int = 25,
     disagreement_tau: float = 0.10,
-    n_features: int = 3000,
-    min_inliers: int = 12,
+    frame_size: tuple[int, int] = (1920, 1080),
 ) -> dict[int, HomographyEntry]: ...      # frame -> (H, source, confidence)
-# Note: propagation takes a read_frame callable (not a video_path) so it is pure
-# of video I/O and unit-testable with synthetic frames; build_homographies owns
-# the cv2.VideoCapture and passes the closure.
+# Note: propagate_homographies is pure (no video I/O); compute_interframe_homographies
+# owns the sequential video read. build_homographies orchestrates both.
 
 # pipeline.py
 def build_homographies(
@@ -159,7 +172,9 @@ def build_homographies(
     trajectories_px: pd.DataFrame,
     *,
     kp_conf_threshold: float = 0.5,
-    **propagation_opts,
+    max_gap: int = 25,
+    disagreement_tau: float = 0.10,
+    downscale: float = 0.5,
 ) -> dict[int, HomographyEntry]: ...
 
 def assemble_phases(
@@ -199,10 +214,13 @@ def assemble_from_homographies(
 
 ## 7. Performance & scale
 
-Stage 2 reads gap frames and runs ORB per consecutive pair — minutes for the
-2-minute clip. Written **streaming** (process gap-by-gap, never holding the whole
-video) so full games are possible. Full-game speedups (downscaled-frame ORB,
-coarser sampling) are **v1+**, not in scope.
+Stage 2 reads gap frames in **one sequential pass** (grab/retrieve, each frame
+decoded once) and runs ORB on a **downscaled copy** (`downscale=0.5` default),
+rescaling the resulting homography back to full-resolution pixels. This is
+minutes per clip, not hours. `propagate_homographies` then composes the
+precomputed inter-frame map — pure matrix multiplication, no further video I/O.
+Written **streaming** (process gap-by-gap, never holding the whole video) so
+full games are possible.
 
 ## 8. Testing & acceptance
 

@@ -7,6 +7,7 @@ invocation and parquet I/O around it.
 
 from __future__ import annotations
 
+import itertools
 import logging
 from collections import Counter
 from dataclasses import dataclass
@@ -29,7 +30,11 @@ from soccer_vision.pitch.filter import filter_outside_pitch
 from soccer_vision.pitch.homography import smooth_homographies
 from soccer_vision.pitch.landmarks import build_frame_homographies
 from soccer_vision.pitch.mapper import PitchMapper
-from soccer_vision.pitch.propagation import HomographyEntry, propagate_homographies
+from soccer_vision.pitch.propagation import (
+    HomographyEntry,
+    compute_interframe_homographies,
+    propagate_homographies,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -267,24 +272,50 @@ def build_homographies(
     kp_conf_threshold: float = 0.5,
     max_gap: int = 25,
     disagreement_tau: float = 0.10,
+    downscale: float = 0.5,
 ) -> dict[int, HomographyEntry]:
-    """Anchors from keypoints + propagation into the gaps. Reads frames from the video."""
+    """Anchors from keypoints + propagation into the gaps.
+
+    Computes the needed consecutive inter-frame homographies in one sequential video
+    pass (each frame decoded once via grab/retrieve, ORB on a downscaled copy), then
+    composes them with the pure propagate_homographies. CPU; reads frames sequentially.
+    """
     anchors = build_frame_homographies(keypoints, conf_threshold=kp_conf_threshold)
+    keys = sorted(anchors)
+    needed_pairs: set[int] = set()
+    for a, b in itertools.pairwise(keys):
+        if 1 <= b - a - 1 <= max_gap:
+            needed_pairs.update(range(a, b))          # G[a..b-1] span the gap
+
     cap = cv2.VideoCapture(str(video_path))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+    pos = 0
 
     def read_frame(idx: int) -> np.ndarray | None:
-        # NOTE: random-seek per frame; for full-game perf, sequential reads (v1+).
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        nonlocal pos
+        if idx < pos:                                 # backward jump (rare) -> seek
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            pos = idx
+        while pos < idx:                              # skip forward cheaply (no decode)
+            if not cap.grab():
+                return None
+            pos += 1
         ok, frame = cap.read()
+        pos += 1
         return frame if ok else None
 
     try:
-        return propagate_homographies(
-            anchors, read_frame, trajectories_px,
-            max_gap=max_gap, disagreement_tau=disagreement_tau,
+        interframe = compute_interframe_homographies(
+            read_frame, needed_pairs, trajectories_px, downscale=downscale,
         )
     finally:
         cap.release()
+
+    return propagate_homographies(
+        anchors, interframe, max_gap=max_gap, disagreement_tau=disagreement_tau,
+        frame_size=(width, height),
+    )
 
 
 def assemble_from_homographies(

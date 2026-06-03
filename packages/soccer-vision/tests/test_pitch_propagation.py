@@ -53,14 +53,20 @@ def test_blend_is_weighted_average_normalized() -> None:
     assert np.isclose(mid[0, 2], 5.0)
 
 
-def test_disagreement_confidence_monotonic_and_clamped() -> None:
-    # identical Hs -> zero disagreement -> confidence 1.0
+def test_disagreement_confidence_clamped_to_zero() -> None:
     h = np.eye(3)
-    assert disagreement_confidence(h, h, tau=0.1) == 1.0
-    # a large shift -> disagreement >> tau -> clamped to 0.0
+    assert disagreement_confidence(h, h, tau=0.1) == 1.0   # identical -> 1.0
     far = np.array([[1.0, 0.0, 500.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-    c = disagreement_confidence(h, far, tau=0.1)
-    assert 0.0 <= c < 0.5
+    assert disagreement_confidence(h, far, tau=0.1) == 0.0  # huge disagree -> clamped 0
+
+
+def test_disagreement_confidence_linear_region() -> None:
+    # pixel->pitch Hs (divide by 1000); a 0.05 pitch-unit shift with tau=0.10 -> conf 0.5
+    h1 = np.diag([1 / 1000.0, 1 / 1000.0, 1.0])
+    h2 = h1.copy()
+    h2[0, 2] += 0.05
+    c = disagreement_confidence(h1, h2, tau=0.10, frame_size=(1920, 1080))
+    assert abs(c - 0.5) < 0.05
 
 
 def test_homography_entry_fields() -> None:

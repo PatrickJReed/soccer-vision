@@ -65,9 +65,13 @@ def register(
 def blend_homographies(
     h_a: NDArray[np.floating], h_b: NDArray[np.floating], w_a: float
 ) -> NDArray[np.floating]:
-    """Weighted element-wise blend of two homographies, normalized so H[2,2]=1."""
+    """Weighted element-wise blend of two homographies, normalized so H[2,2]=1.
+
+    Element-wise blending is an approximation (homographies are not a vector
+    space); it is accurate for the small inter-frame motions we blend here.
+    """
     blended = w_a * h_a + (1.0 - w_a) * h_b
-    if blended[2, 2] != 0:
+    if abs(blended[2, 2]) > 1e-9:
         blended = blended / blended[2, 2]
     return blended
 
@@ -89,6 +93,10 @@ def disagreement_confidence(
 
     Both Hs map the same reference grid into pitch space; their mean separation is
     a runtime estimate of propagation error. confidence = clamp(1 - disagree/tau).
+
+    Pass the actual frame size; the (1920, 1080) default suits 1080p clips like the
+    bake-off clip. The disagreement magnitude (and thus tau's calibration) depends
+    on it.
     """
     grid_px = _GRID * np.array(frame_size, dtype=np.float64)
     disagree = float(

@@ -11,7 +11,7 @@ FPS = 1.0  # window_frames = round(1.0) = 1 -> smoothing is a no-op, so per-fram
 
 def _identity_keypoints(n_frames: int) -> pd.DataFrame:
     """6 landmarks per frame with image points == pitch coords -> identity H."""
-    idxs = [0, 5, 13, 16, 24, 29]
+    idxs = [0, 3, 6, 11, 16, 19]
     pts = PITCH_LANDMARKS[idxs]
     rows = []
     for f in range(n_frames):

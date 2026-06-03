@@ -71,3 +71,35 @@ def test_adapter_with_pitch_returns_keypoints(tiny_video: Path) -> None:
     df, kp_df = backend.process_with_pitch(tiny_video)
     validate_trajectories(df)
     assert {"frame", "kp_idx", "x_px", "y_px", "conf"}.issubset(kp_df.columns)
+
+
+def test_pitch_weights_use_release_url() -> None:
+    from soccer_vision.tracking.roboflow import PITCH_V1_URL, WEIGHTS
+
+    kind, locator, filename = WEIGHTS["pitch"]
+    assert kind == "url"
+    assert locator == PITCH_V1_URL
+    assert filename == "pitch_yolov8_v1.pt"
+    assert PITCH_V1_URL.endswith("pitch_yolov8_v1.pt")
+    assert "releases/download/pitch-v1/" in PITCH_V1_URL
+
+
+def test_pitch_weights_path_override_missing_raises(tmp_path) -> None:
+    from soccer_vision.tracking.roboflow import RoboflowBackend
+
+    missing = tmp_path / "nope.pt"
+    try:
+        RoboflowBackend(pitch_weights_path=missing)
+    except FileNotFoundError as e:
+        assert "pitch_weights_path" in str(e)
+    else:
+        raise AssertionError("expected FileNotFoundError")
+
+
+def test_pitch_weights_path_override_accepted(tmp_path) -> None:
+    from soccer_vision.tracking.roboflow import RoboflowBackend
+
+    w = tmp_path / "custom_pitch.pt"
+    w.write_bytes(b"stub")
+    backend = RoboflowBackend(pitch_weights_path=w, detect_pitch=True)
+    assert backend.pitch_weights_path == w

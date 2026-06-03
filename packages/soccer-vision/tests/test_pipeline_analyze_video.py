@@ -12,7 +12,7 @@ FPS = 1.0
 
 
 def _identity_keypoints(n_frames: int) -> pd.DataFrame:
-    idxs = [0, 5, 13, 16, 24, 29]
+    idxs = [0, 3, 6, 11, 16, 19]
     pts = PITCH_LANDMARKS[idxs]
     rows = []
     for f in range(n_frames):

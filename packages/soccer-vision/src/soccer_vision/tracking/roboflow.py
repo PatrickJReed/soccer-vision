@@ -35,15 +35,23 @@ BALL_V1_URL: Final = (
     "ball-v1/ball_yolov8_v1.pt"
 )
 
+# Direct download URL for the fine-tuned pitch-keypoint detector (Phase 3.5b),
+# published as a GitHub release asset. The asset filename must match the URL tail.
+PITCH_V1_URL: Final = (
+    "https://github.com/PatrickJReed/soccer-vision/releases/download/"
+    "pitch-v1/pitch_yolov8_v1.pt"
+)
+
 # Model weights registry. Each entry: (kind, locator, filename).
 #   kind="gdrive" -> locator is a Google Drive file ID (fetched via gdown)
 #   kind="url"    -> locator is a direct HTTPS download URL (fetched via urllib)
 # The ball role defaults to the fine-tuned detector. The roboflow baseline ball
 # model it replaced lived at gdrive id 1isw4wx-MK9h9LMr36VvIWlJD6ppUvw7V.
 WEIGHTS: Final[dict[str, tuple[str, str, str]]] = {
-    "ball":   ("url",    BALL_V1_URL, "ball_yolov8_v1.pt"),
+    "ball":   ("url",    BALL_V1_URL,  "ball_yolov8_v1.pt"),
     "player": ("gdrive", "17PXFNlx-jI7VjVo_vQnB1sONjRyvoB-q", "football-player-detection.pt"),
-    "pitch":  ("gdrive", "1Ma5Kt86tgpdjCTKfum79YMgNnSjcoOyf", "football-pitch-detection.pt"),
+    # roboflow baseline pitch model lived at gdrive id 1Ma5Kt86tgpdjCTKfum79YMgNnSjcoOyf.
+    "pitch":  ("url",    PITCH_V1_URL, "pitch_yolov8_v1.pt"),
 }
 
 DEFAULT_CACHE_DIR: Final[Path] = Path.home() / ".cache" / "soccer_vision" / "weights"
@@ -260,6 +268,10 @@ class RoboflowBackend:
         Maximum run of consecutive missed frames to bridge by linear
         interpolation of the ball position. Defaults to 15 (~0.5s at 30fps).
         Longer gaps are left as holes (sustained losses, not flicker).
+    pitch_weights_path:
+        Optional path to a fine-tuned pitch keypoint detector weights file (.pt).
+        When provided, this model is used instead of the default pitch detector.
+        If the path does not exist, raises FileNotFoundError.
     detect_pitch:
         When True, download and load the pitch keypoint detection model.
         Required to call process_with_pitch(). Defaults to False to avoid
@@ -277,6 +289,7 @@ class RoboflowBackend:
         ball_imgsz: int = 1280,
         ball_conf: float = 0.05,
         ball_max_gap_frames: int = 15,
+        pitch_weights_path: Path | None = None,
         detect_pitch: bool = False,
     ) -> None:
         self._device_override = device
@@ -287,6 +300,9 @@ class RoboflowBackend:
         self.ball_imgsz: int = ball_imgsz
         self.ball_conf: float = ball_conf
         self.ball_max_gap_frames: int = ball_max_gap_frames
+        if pitch_weights_path is not None and not pitch_weights_path.exists():
+            raise FileNotFoundError(f"pitch_weights_path does not exist: {pitch_weights_path}")
+        self.pitch_weights_path: Path | None = pitch_weights_path
         self.detect_pitch: bool = detect_pitch
 
     # ------------------------------------------------------------------
@@ -400,7 +416,8 @@ class RoboflowBackend:
 
         pitch_model = None
         if emit_keypoints:
-            pitch_model = YOLO(str(weight_paths["pitch"])).to(device=device)
+            pitch_weights = self.pitch_weights_path or weight_paths["pitch"]
+            pitch_model = YOLO(str(pitch_weights)).to(device=device)
 
         # ---- video metadata --------------------------------------------
         cap = cv2.VideoCapture(str(video_path))

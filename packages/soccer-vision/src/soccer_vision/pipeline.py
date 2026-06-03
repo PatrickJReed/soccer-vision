@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from soccer_vision.io.schema import validate_trajectories
@@ -26,6 +27,7 @@ from soccer_vision.pitch.filter import filter_outside_pitch
 from soccer_vision.pitch.homography import smooth_homographies
 from soccer_vision.pitch.landmarks import build_frame_homographies
 from soccer_vision.pitch.mapper import PitchMapper
+from soccer_vision.pitch.propagation import HomographyEntry, propagate_homographies
 
 logger = logging.getLogger(__name__)
 
@@ -196,3 +198,56 @@ def analyze_video(
     )
     _write_deliverables(result, out)
     return result
+
+
+_H_COLS = [f"h{i}{j}" for i in range(3) for j in range(3)]
+
+
+def homographies_to_parquet(entries: dict[int, HomographyEntry], path: Path) -> None:
+    """Serialize {frame: HomographyEntry} to a flat parquet (frame, h00..h22, source, conf)."""
+    rows = []
+    for frame, e in sorted(entries.items()):
+        flat = np.asarray(e.H, dtype=np.float64).reshape(9)
+        rows.append({"frame": frame, **dict(zip(_H_COLS, flat, strict=True)),
+                     "source": e.source, "confidence": e.confidence})
+    df = pd.DataFrame(rows, columns=["frame", *_H_COLS, "source", "confidence"])
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, index=False)
+
+
+def homographies_from_parquet(path: Path) -> dict[int, HomographyEntry]:
+    df = pd.read_parquet(path)
+    out: dict[int, HomographyEntry] = {}
+    for _, r in df.iterrows():
+        H = np.array([r[c] for c in _H_COLS], dtype=np.float64).reshape(3, 3)
+        out[int(r["frame"])] = HomographyEntry(H, str(r["source"]), float(r["confidence"]))
+    return out
+
+
+def build_homographies(
+    keypoints: pd.DataFrame,
+    video_path: Path,
+    trajectories_px: pd.DataFrame,
+    *,
+    kp_conf_threshold: float = 0.5,
+    max_gap: int = 25,
+    disagreement_tau: float = 0.10,
+) -> dict[int, HomographyEntry]:
+    """Anchors from keypoints + propagation into the gaps. Reads frames from the video."""
+    import cv2
+
+    anchors = build_frame_homographies(keypoints, conf_threshold=kp_conf_threshold)
+    cap = cv2.VideoCapture(str(video_path))
+
+    def read_frame(idx: int) -> np.ndarray | None:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        return frame if ok else None
+
+    try:
+        return propagate_homographies(
+            anchors, read_frame, trajectories_px,
+            max_gap=max_gap, disagreement_tau=disagreement_tau,
+        )
+    finally:
+        cap.release()

@@ -76,6 +76,10 @@ def propose_labels(
     Anchors have confidence 1.0; propagated frames carry a runtime estimate. Frames
     below min_confidence are dropped (their proposals would be too noisy to correct
     cheaply). Returns {frame: (N, 3) projected keypoints}.
+
+    Boundary semantics: frames where ``confidence >= min_confidence`` are kept
+    (equal-to-threshold is included); frames where ``confidence < min_confidence``
+    are dropped.
     """
     out: dict[int, NDArray[np.float64]] = {}
     for frame, entry in homographies.items():
@@ -98,6 +102,11 @@ def to_yolo_pose_line(
     to [0,1] by frame_size. The bounding box is the tight box around the visible
     keypoints (padded by bbox_pad, clamped to the frame). Invisible keypoints are
     written as ``0 0 0``. If no keypoints are visible the box covers the full frame.
+
+    Visibility convention: keypoints from ``project_landmarks`` carry visibility 0
+    (absent/out-of-frame) or 2 (visible in-frame). Any positive visibility value is
+    passed through to the label line as-is (YOLO/COCO: 1 = occluded, 2 = visible);
+    only visibility 0 produces the ``0 0 0`` placeholder.
     """
     width, height = frame_size
     vis = keypoints[:, 2] > 0

@@ -124,7 +124,7 @@ def assemble_phases(
         "homography_source": "object", "homography_conf": "float64",
     })
 
-    counts = Counter(e.source for e in h_entries.values())
+    counts = Counter(e.source for e in valid.values())
     n_anchor = counts["anchor"]
     n_prop = counts["propagated"]
     anchor_cov = n_anchor / total_frames if total_frames else 0.0

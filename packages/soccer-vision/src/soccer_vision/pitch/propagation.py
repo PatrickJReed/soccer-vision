@@ -8,10 +8,13 @@ sides of a gap and blend them, lifting pitch-homography coverage without labelin
 
 from __future__ import annotations
 
+import itertools
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
+import pandas as pd
 from numpy.typing import NDArray
 
 # Image-space reference grid (normalized 0..1) used to measure forward/backward
@@ -105,3 +108,112 @@ def disagreement_confidence(
         ).mean()
     )
     return float(np.clip(1.0 - disagree / tau, 0.0, 1.0))
+
+
+_PLAYER_CLASSES = ("player", "goalkeeper", "referee")
+
+
+def _frame_mask(boxes: pd.DataFrame, frame: int, shape: tuple[int, int]) -> NDArray[np.uint8]:
+    """255 on static background, 0 over player/ref boxes (dilated)."""
+    mask = np.full(shape, 255, np.uint8)
+    sel = boxes[(boxes["frame"] == frame) & boxes["class"].isin(_PLAYER_CLASSES)]
+    for _, r in sel.iterrows():
+        cv2.rectangle(
+            mask,
+            (int(r["bbox_x1"]) - 12, int(r["bbox_y1"]) - 12),
+            (int(r["bbox_x2"]) + 12, int(r["bbox_y2"]) + 12),
+            0, -1,
+        )
+    return mask
+
+
+def _chain(
+    anchor: int,
+    targets: list[int],
+    read_frame: Callable[[int], NDArray[np.uint8] | None],
+    boxes: pd.DataFrame,
+    H_anchor: NDArray[np.floating],
+    n_features: int,
+    min_inliers: int,
+) -> dict[int, NDArray[np.floating]]:
+    """Chain consecutive registrations from `anchor` over `targets` (ordered, adjacent).
+
+    Returns {frame: pitch_H} for each reached frame; stops at the first failure.
+    """
+    out: dict[int, NDArray[np.floating]] = {}
+    prev_img = read_frame(anchor)
+    if prev_img is None:
+        return out
+    shape = prev_img.shape[:2]
+    W = np.eye(3)                                  # maps anchor pixels -> current pixels
+    prev_frame = anchor
+    for f in targets:
+        cur = read_frame(f)
+        if cur is None:
+            break
+        G = register(prev_img, cur, _frame_mask(boxes, prev_frame, shape),
+                     _frame_mask(boxes, f, shape), n_features=n_features, min_inliers=min_inliers)
+        if G is None:
+            break
+        W = G @ W
+        out[f] = H_anchor @ np.linalg.inv(W)       # pixel_f -> pitch
+        prev_img, prev_frame = cur, f
+    return out
+
+
+def propagate_homographies(
+    anchors: Mapping[int, NDArray[np.floating]],
+    read_frame: Callable[[int], NDArray[np.uint8] | None],
+    player_boxes: pd.DataFrame,
+    *,
+    max_gap: int = 25,
+    disagreement_tau: float = 0.10,
+    n_features: int = 3000,
+    min_inliers: int = 12,
+) -> dict[int, HomographyEntry]:
+    """Bridge no-landmark gaps between anchors via bidirectional chaining.
+
+    Each anchor keeps source='anchor', confidence=1.0. For each gap <= max_gap,
+    chain forward from the left anchor and backward from the right anchor, blend by
+    distance, and set confidence from forward/backward disagreement. Frames reached
+    by neither chain are absent. Edge gaps (before first / after last anchor) are
+    not bridged in v1.
+    """
+    out: dict[int, HomographyEntry] = {
+        f: HomographyEntry(np.asarray(H, dtype=np.float64), "anchor", 1.0)
+        for f, H in anchors.items()
+    }
+    keys = sorted(anchors)
+    if not keys:
+        return out
+
+    # Frame size (width, height) for the disagreement metric; default 1080p if unreadable.
+    frame_size = (1920, 1080)
+    for f in keys:
+        img = read_frame(f)
+        if img is not None:
+            frame_size = (int(img.shape[1]), int(img.shape[0]))
+            break
+
+    for a, b in itertools.pairwise(keys):
+        gap = b - a - 1
+        if gap < 1 or gap > max_gap:
+            continue
+        inner = list(range(a + 1, b))
+        fwd = _chain(a, inner, read_frame, player_boxes, np.asarray(anchors[a], np.float64),
+                     n_features, min_inliers)
+        bwd = _chain(b, inner[::-1], read_frame, player_boxes, np.asarray(anchors[b], np.float64),
+                     n_features, min_inliers)
+        for t in inner:
+            hf, hb = fwd.get(t), bwd.get(t)
+            if hf is not None and hb is not None:
+                w_f = (b - t) / (b - a)
+                out[t] = HomographyEntry(
+                    blend_homographies(hf, hb, w_f), "propagated",
+                    disagreement_confidence(hf, hb, tau=disagreement_tau, frame_size=frame_size),
+                )
+            elif hf is not None:
+                out[t] = HomographyEntry(hf, "propagated", max(0.0, 1.0 - (t - a) / (max_gap + 1)))
+            elif hb is not None:
+                out[t] = HomographyEntry(hb, "propagated", max(0.0, 1.0 - (b - t) / (max_gap + 1)))
+    return out

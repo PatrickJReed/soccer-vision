@@ -118,7 +118,7 @@ def to_yolo_pose_line(
     for row in keypoints:
         v = float(row[2])
         if v > 0:
-            tokens += [_f(float(row[0]) / width), _f(float(row[1]) / height), "1"]
+            tokens += [_f(float(row[0]) / width), _f(float(row[1]) / height), str(int(v))]
         else:
             tokens += ["0", "0", "0"]
     return " ".join(tokens)

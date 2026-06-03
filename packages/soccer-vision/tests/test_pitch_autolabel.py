@@ -69,9 +69,15 @@ def test_to_yolo_pose_line_format() -> None:
     # class + bbox(4) + 21*(x,y,v)=63  -> 68 tokens
     assert len(parts) == 1 + 4 + 21 * 3
     assert parts[0] == "0"
-    coords = np.array(parts[1:], dtype=float)
-    assert coords.min() >= 0.0
-    assert coords.max() <= 1.0
+    # bbox normalized to [0,1]
+    bbox = np.array(parts[1:5], dtype=float)
+    assert bbox.min() >= 0.0
+    assert bbox.max() <= 1.0
+    # keypoint triplets: x,y normalized to [0,1]; visibility in {0, 2}
+    kp = np.array(parts[5:], dtype=float).reshape(21, 3)
+    assert kp[:, :2].min() >= 0.0
+    assert kp[:, :2].max() <= 1.0
+    assert set(np.unique(kp[:, 2]).tolist()) <= {0.0, 2.0}
 
 
 def test_to_yolo_pose_line_invisible_keypoints_are_zero() -> None:

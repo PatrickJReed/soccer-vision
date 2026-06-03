@@ -1,8 +1,8 @@
 """Pipeline orchestrator: chains pitch + phase modules into enriched outputs.
 
 assemble_phases is pure (no models, no GPU, no ultralytics/sports import) so the
-integration logic is testable without a GPU. analyze_video / assemble_from_parquet
-add model invocation and parquet I/O around it.
+integration logic is testable without a GPU. analyze_video / assemble_from_parquet / assemble_from_homographies add model
+invocation and parquet I/O around it.
 """
 
 from __future__ import annotations

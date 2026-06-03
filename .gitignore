@@ -40,3 +40,6 @@ packages/soccer-vision/src/soccer_vision/models/*.pt
 
 # OS extras
 *.swp
+
+# brainstorming visual companion sessions
+.superpowers/

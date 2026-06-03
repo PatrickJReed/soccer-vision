@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 import pandas as pd
 
@@ -30,6 +31,8 @@ from soccer_vision.pitch.mapper import PitchMapper
 from soccer_vision.pitch.propagation import HomographyEntry, propagate_homographies
 
 logger = logging.getLogger(__name__)
+
+_H_COLS = [f"h{i}{j}" for i in range(3) for j in range(3)]
 
 
 @dataclass(frozen=True)
@@ -200,9 +203,6 @@ def analyze_video(
     return result
 
 
-_H_COLS = [f"h{i}{j}" for i in range(3) for j in range(3)]
-
-
 def homographies_to_parquet(entries: dict[int, HomographyEntry], path: Path) -> None:
     """Serialize {frame: HomographyEntry} to a flat parquet (frame, h00..h22, source, conf)."""
     rows = []
@@ -211,11 +211,14 @@ def homographies_to_parquet(entries: dict[int, HomographyEntry], path: Path) -> 
         rows.append({"frame": frame, **dict(zip(_H_COLS, flat, strict=True)),
                      "source": e.source, "confidence": e.confidence})
     df = pd.DataFrame(rows, columns=["frame", *_H_COLS, "source", "confidence"])
+    df = df.astype({"frame": "int64", "source": "object", "confidence": "float64",
+                    **{c: "float64" for c in _H_COLS}})
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path, index=False)
 
 
 def homographies_from_parquet(path: Path) -> dict[int, HomographyEntry]:
+    """Read a homographies.parquet checkpoint back into {frame: HomographyEntry}."""
     df = pd.read_parquet(path)
     out: dict[int, HomographyEntry] = {}
     for _, r in df.iterrows():
@@ -234,12 +237,11 @@ def build_homographies(
     disagreement_tau: float = 0.10,
 ) -> dict[int, HomographyEntry]:
     """Anchors from keypoints + propagation into the gaps. Reads frames from the video."""
-    import cv2
-
     anchors = build_frame_homographies(keypoints, conf_threshold=kp_conf_threshold)
     cap = cv2.VideoCapture(str(video_path))
 
     def read_frame(idx: int) -> np.ndarray | None:
+        # NOTE: random-seek per frame; for full-game perf, sequential reads (v1+).
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ok, frame = cap.read()
         return frame if ok else None

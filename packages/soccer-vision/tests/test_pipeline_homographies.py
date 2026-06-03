@@ -21,6 +21,7 @@ def test_homographies_parquet_roundtrip(tmp_path) -> None:
     assert back[3].source == "anchor" and back[3].confidence == 1.0
     assert back[4].source == "propagated" and abs(back[4].confidence - 0.7) < 1e-9
     assert np.allclose(back[4].H, entries[4].H)
+    assert np.allclose(back[3].H, entries[3].H)
 
 
 def test_homographies_to_parquet_columns(tmp_path) -> None:

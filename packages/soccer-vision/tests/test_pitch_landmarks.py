@@ -75,6 +75,12 @@ def test_youth_landmarks_scales_with_spec() -> None:
     assert np.isclose(wide[18, 0] - wide[17, 0], 0.30)
 
 
+def test_youth_landmarks_scales_with_box_depth() -> None:
+    deep = youth_landmarks(PitchSpec(penalty_box_length_frac=0.25))
+    assert np.isclose(deep[9, 1], 0.25)   # own box outer y = bl
+    assert np.isclose(deep[13, 1], 0.75)  # opp box outer y = 1 - bl
+
+
 def _keypoints_for_identity(frame: int, conf: float = 0.9) -> pd.DataFrame:
     pts = PITCH_LANDMARKS[_FIT_IDXS]
     return pd.DataFrame({

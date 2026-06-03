@@ -149,7 +149,7 @@ def compute_interframe_homographies(
     needed_pairs: set[int],               # indices i for which G[i] (frame i -> i+1) is wanted
     player_boxes: pd.DataFrame,           # trajectories_px (for masking)
     *,
-    downscale: float = 0.5,
+    downscale: float = 1.0,
     n_features: int = 3000,
     min_inliers: int = 12,
 ) -> dict[int, NDArray]: ...              # {i: full-res G[i]}
@@ -158,7 +158,7 @@ def propagate_homographies(
     anchors: Mapping[int, NDArray],       # {frame: H} from build_frame_homographies
     interframe: Mapping[int, NDArray],    # precomputed {i: G[i]} from compute_interframe_homographies
     *,
-    max_gap: int = 25,
+    max_gap: int = 45,
     disagreement_tau: float = 0.10,
     frame_size: tuple[int, int] = (1920, 1080),
 ) -> dict[int, HomographyEntry]: ...      # frame -> (H, source, confidence)
@@ -172,9 +172,9 @@ def build_homographies(
     trajectories_px: pd.DataFrame,
     *,
     kp_conf_threshold: float = 0.5,
-    max_gap: int = 25,
+    max_gap: int = 45,
     disagreement_tau: float = 0.10,
-    downscale: float = 0.5,
+    downscale: float = 1.0,
 ) -> dict[int, HomographyEntry]: ...
 
 def assemble_phases(
@@ -215,10 +215,21 @@ def assemble_from_homographies(
 ## 7. Performance & scale
 
 Stage 2 reads gap frames in **one sequential pass** (grab/retrieve, each frame
-decoded once) and runs ORB on a **downscaled copy** (`downscale=0.5` default),
-rescaling the resulting homography back to full-resolution pixels. This is
-minutes per clip, not hours. `propagate_homographies` then composes the
-precomputed inter-frame map — pure matrix multiplication, no further video I/O.
+decoded once); the sequential read is the dominant speedup (minutes per clip,
+not hours). ORB runs at full resolution by default (`downscale=1.0`): on Trace
+1080p, `downscale=0.5` dropped too many ORB features on the masked low-texture
+grass and propagation bridged almost nothing — full-res is required for
+registration recall here. `propagate_homographies` then composes the precomputed
+inter-frame map — pure matrix multiplication, no further video I/O.
+
+**Calibration result (bake-off clip, downscale=1.0):** held-out reprojection
+error is a flat **0.021** (well under the 0.05 gate) from `max_gap` 10 → 60, with
+held-out coverage climbing 18% → 27% (true full-anchor coverage ~30–35%). No
+accuracy knee; `max_gap=45` is the default (balances coverage against
+less-validated long bridges, which the runtime disagreement-confidence flags).
+Propagation roughly doubles homography coverage but leaves the long landmark-free
+stretches unbridged — denser anchors (a 3.5b pitch-detector fine-tune) remain the
+path to high coverage, and compound with propagation.
 Written **streaming** (process gap-by-gap, never holding the whole video) so
 full games are possible.
 

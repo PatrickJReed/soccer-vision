@@ -270,9 +270,9 @@ def build_homographies(
     trajectories_px: pd.DataFrame,
     *,
     kp_conf_threshold: float = 0.5,
-    max_gap: int = 25,
+    max_gap: int = 45,
     disagreement_tau: float = 0.10,
-    downscale: float = 0.5,
+    downscale: float = 1.0,
 ) -> dict[int, HomographyEntry]:
     """Anchors from keypoints + propagation into the gaps.
 

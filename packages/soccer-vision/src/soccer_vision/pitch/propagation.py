@@ -168,7 +168,7 @@ def propagate_homographies(
     anchors: Mapping[int, NDArray[np.floating]],
     interframe: Mapping[int, NDArray[np.floating]],
     *,
-    max_gap: int = 25,
+    max_gap: int = 45,
     disagreement_tau: float = 0.10,
     frame_size: tuple[int, int] = (1920, 1080),
 ) -> dict[int, HomographyEntry]:
@@ -247,7 +247,7 @@ def compute_interframe_homographies(
     needed_pairs: set[int],
     player_boxes: pd.DataFrame,
     *,
-    downscale: float = 0.5,
+    downscale: float = 1.0,
     n_features: int = 3000,
     min_inliers: int = 12,
 ) -> dict[int, NDArray[np.floating]]:
@@ -257,6 +257,10 @@ def compute_interframe_homographies(
     wanted. Each frame is read once (read_frame is called in ascending order, so the
     caller can decode sequentially) and ORB'd once on a `downscale` copy; the resulting
     homography is rescaled back to full-resolution pixels. Returns {i: full-res G[i]}.
+
+    downscale < 1.0 trades registration recall for ORB speed; on Trace 1080p footage
+    0.5 dropped too many features on the masked low-texture grass (near-zero coverage),
+    so the default is full-res. The sequential read pass is the dominant speedup anyway.
     """
     interframe: dict[int, NDArray[np.floating]] = {}
     if not needed_pairs:

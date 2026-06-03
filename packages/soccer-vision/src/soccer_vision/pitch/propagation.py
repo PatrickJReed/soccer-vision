@@ -9,7 +9,7 @@ sides of a gap and blend them, lifting pitch-homography coverage without labelin
 from __future__ import annotations
 
 import itertools
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import cv2
@@ -135,80 +135,63 @@ def _frame_mask(boxes: pd.DataFrame, frame: int, shape: tuple[int, int]) -> NDAr
 def _chain(
     anchor: int,
     targets: list[int],
-    read_frame: Callable[[int], NDArray[np.uint8] | None],
-    boxes: pd.DataFrame,
+    interframe: Mapping[int, NDArray[np.floating]],
     H_anchor: NDArray[np.floating],
-    n_features: int,
-    min_inliers: int,
 ) -> dict[int, NDArray[np.floating]]:
-    """Chain consecutive registrations from `anchor` over `targets` (ordered, adjacent).
+    """Compose precomputed inter-frame homographies from `anchor` over adjacent `targets`.
 
-    Returns {frame: pitch_H} for each reached frame; stops at the first failure.
+    `interframe[i]` maps frame i pixels -> frame i+1 pixels. `targets` is the ordered
+    adjacent sequence (ascending for a forward chain, descending for backward). Returns
+    {frame: pixel->pitch H}; stops at the first missing inter-frame homography.
     """
     out: dict[int, NDArray[np.floating]] = {}
-    prev_img = read_frame(anchor)
-    if prev_img is None:
-        return out
-    shape = prev_img.shape[:2]
     W = np.eye(3)                                  # maps anchor pixels -> current pixels
-    prev_frame = anchor
+    prev = anchor
     for f in targets:
-        cur = read_frame(f)
-        if cur is None:
+        if f == prev + 1:
+            step = interframe.get(prev)            # prev -> f
+        elif f == prev - 1:
+            g = interframe.get(f)                  # f -> prev
+            step = np.linalg.inv(g) if g is not None else None  # prev -> f
+        else:
+            break                                  # non-adjacent target (should not happen)
+        if step is None:
             break
-        G = register(prev_img, cur, _frame_mask(boxes, prev_frame, shape),
-                     _frame_mask(boxes, f, shape), n_features=n_features, min_inliers=min_inliers)
-        if G is None:
-            break
-        W = G @ W
+        W = step @ W
         out[f] = H_anchor @ np.linalg.inv(W)       # pixel_f -> pitch
-        prev_img, prev_frame = cur, f
+        prev = f
     return out
 
 
 def propagate_homographies(
     anchors: Mapping[int, NDArray[np.floating]],
-    read_frame: Callable[[int], NDArray[np.uint8] | None],
-    player_boxes: pd.DataFrame,
+    interframe: Mapping[int, NDArray[np.floating]],
     *,
     max_gap: int = 25,
     disagreement_tau: float = 0.10,
-    n_features: int = 3000,
-    min_inliers: int = 12,
+    frame_size: tuple[int, int] = (1920, 1080),
 ) -> dict[int, HomographyEntry]:
-    """Bridge no-landmark gaps between anchors via bidirectional chaining.
+    """Bridge no-landmark gaps between anchors by composing inter-frame homographies.
 
-    Each anchor keeps source='anchor', confidence=1.0. For each gap <= max_gap,
-    chain forward from the left anchor and backward from the right anchor, blend by
-    distance, and set confidence from forward/backward disagreement. Frames reached
-    by neither chain are absent. Edge gaps (before first / after last anchor) are
-    not bridged in v1.
+    `interframe[i]` maps frame i pixels -> frame i+1 pixels (from
+    compute_interframe_homographies). Each anchor keeps source='anchor', confidence=1.0.
+    For each gap <= max_gap, chain forward from the left anchor and backward from the
+    right anchor, blend by distance, and set confidence from forward/backward
+    disagreement. Frames reached by neither chain are absent. Edge gaps are not bridged
+    in v1. Pure: no video I/O.
     """
     out: dict[int, HomographyEntry] = {
         f: HomographyEntry(np.asarray(H, dtype=np.float64), "anchor", 1.0)
         for f, H in anchors.items()
     }
     keys = sorted(anchors)
-    if not keys:
-        return out
-
-    # Frame size (width, height) for the disagreement metric; default 1080p if unreadable.
-    frame_size = (1920, 1080)
-    for f in keys:
-        img = read_frame(f)
-        if img is not None:
-            frame_size = (int(img.shape[1]), int(img.shape[0]))
-            break
-
     for a, b in itertools.pairwise(keys):
         gap = b - a - 1
         if gap < 1 or gap > max_gap:
             continue
         inner = list(range(a + 1, b))
-        fwd = _chain(a, inner, read_frame, player_boxes, np.asarray(anchors[a], np.float64),
-                     n_features, min_inliers)
-        bwd = _chain(b, inner[::-1], read_frame, player_boxes, np.asarray(anchors[b], np.float64),
-                     n_features, min_inliers)
+        fwd = _chain(a, inner, interframe, np.asarray(anchors[a], np.float64))
+        bwd = _chain(b, inner[::-1], interframe, np.asarray(anchors[b], np.float64))
         for t in inner:
             hf, hb = fwd.get(t), bwd.get(t)
             if hf is not None and hb is not None:

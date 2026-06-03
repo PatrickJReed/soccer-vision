@@ -130,23 +130,27 @@ The two chains are independent: a frame is bridged if **either** reaches it. A
 mid-gap forward-chain failure does not lose the frame when the backward chain
 arrives — bidirectional gives both an accuracy win (halved drift) and a coverage
 win (either-side reach). **Edge gaps** (before the first / after the last anchor)
-are one-sided: chain from the single adjacent anchor up to `max_gap`, with
-distance-based confidence.
+are **not bridged in v1** — they would require a one-sided chain from the single
+adjacent anchor (with distance-based confidence) and are deferred to v1+; the
+between-anchor gaps are where the coverage is.
 
 ## 4. Public API
 
 ```python
 # pitch/propagation.py
 def propagate_homographies(
-    anchors: dict[int, NDArray],          # {frame: H} from build_frame_homographies
-    video_path: Path,
+    anchors: Mapping[int, NDArray],       # {frame: H} from build_frame_homographies
+    read_frame: Callable[[int], NDArray | None],  # frame index -> image (video I/O kept in the caller)
     player_boxes: pd.DataFrame,           # trajectories_px (for masking)
     *,
     max_gap: int = 25,
     disagreement_tau: float = 0.10,
-    orb_features: int = 3000,
+    n_features: int = 3000,
     min_inliers: int = 12,
 ) -> dict[int, HomographyEntry]: ...      # frame -> (H, source, confidence)
+# Note: propagation takes a read_frame callable (not a video_path) so it is pure
+# of video I/O and unit-testable with synthetic frames; build_homographies owns
+# the cv2.VideoCapture and passes the closure.
 
 # pipeline.py
 def build_homographies(

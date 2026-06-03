@@ -3,6 +3,7 @@
 from soccer_vision.pipeline import (
     PipelineResult,
     analyze_video,
+    assemble_from_homographies,
     assemble_from_parquet,
     assemble_phases,
 )
@@ -13,6 +14,7 @@ __all__ = [
     "PipelineResult",
     "__version__",
     "analyze_video",
+    "assemble_from_homographies",
     "assemble_from_parquet",
     "assemble_phases",
 ]

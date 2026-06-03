@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 import numpy as np
-from soccer_vision.pipeline import homographies_from_parquet, homographies_to_parquet
+import pandas as pd
+from soccer_vision.pipeline import (
+    PipelineResult,
+    assemble_from_homographies,
+    homographies_from_parquet,
+    homographies_to_parquet,
+)
 from soccer_vision.pitch.propagation import HomographyEntry
+
+FPS = 1.0
 
 
 def test_homographies_parquet_roundtrip(tmp_path) -> None:
@@ -25,10 +33,36 @@ def test_homographies_parquet_roundtrip(tmp_path) -> None:
 
 
 def test_homographies_to_parquet_columns(tmp_path) -> None:
-    import pandas as pd
     homographies_to_parquet({3: HomographyEntry(np.eye(3), "anchor", 1.0)},
                             tmp_path / "h.parquet")
     df = pd.read_parquet(tmp_path / "h.parquet")
     assert list(df.columns) == [
         "frame", *[f"h{i}{j}" for i in range(3) for j in range(3)], "source", "confidence",
     ]
+
+
+def _traj() -> pd.DataFrame:
+    rows = []
+    for f in range(3):
+        rows.append({"frame": f, "t_seconds": f / FPS, "track_id": 1,
+                     "x_px": 0.5, "y_px": 0.25, "bbox_x1": 0.49, "bbox_y1": 0.24,
+                     "bbox_x2": 0.51, "bbox_y2": 0.26, "class": "player", "team": "own", "conf": 0.9})
+        rows.append({"frame": f, "t_seconds": f / FPS, "track_id": -1 - f,
+                     "x_px": 0.5, "y_px": 0.27, "bbox_x1": 0.49, "bbox_y1": 0.26,
+                     "bbox_x2": 0.51, "bbox_y2": 0.28, "class": "ball", "team": "unknown", "conf": 0.9})
+    return pd.DataFrame(rows).astype({"frame": "int64", "track_id": "int64"})
+
+
+def test_assemble_from_homographies_roundtrip(tmp_path) -> None:
+    traj = _traj()
+    traj_path = tmp_path / "trajectories_px.parquet"
+    h_path = tmp_path / "homographies.parquet"
+    traj.to_parquet(traj_path, index=False)
+    homographies_to_parquet({f: HomographyEntry(np.eye(3), "anchor", 1.0) for f in range(3)}, h_path)
+    out_dir = tmp_path / "out"
+
+    result = assemble_from_homographies(traj_path, h_path, out_dir)
+    assert isinstance(result, PipelineResult)
+    assert (out_dir / "trajectories.parquet").exists()
+    assert (out_dir / "phases.parquet").exists()
+    assert result.anchor_coverage == 1.0

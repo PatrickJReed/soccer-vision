@@ -51,7 +51,7 @@ class _StubBackend:
         return self._traj, self._kp
 
 
-def test_analyze_video_writes_four_parquets(tmp_path: Path) -> None:
+def test_analyze_video_writes_five_parquets(tmp_path: Path) -> None:
     backend = _StubBackend(_trajectories(), _identity_keypoints(3))
     out_dir = tmp_path / "game1"
 
@@ -59,7 +59,7 @@ def test_analyze_video_writes_four_parquets(tmp_path: Path) -> None:
 
     assert isinstance(result, PipelineResult)
     for name in ("trajectories_px.parquet", "keypoints.parquet",
-                 "trajectories.parquet", "phases.parquet"):
+                 "homographies.parquet", "trajectories.parquet", "phases.parquet"):
         assert (out_dir / name).exists(), f"missing {name}"
     # Checkpoint is the verbatim tracker output.
     checkpoint = pd.read_parquet(out_dir / "trajectories_px.parquet")

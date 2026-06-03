@@ -205,10 +205,9 @@ def analyze_video(
 ) -> PipelineResult:
     """Run the full pipeline on a video and write checkpoints + deliverables.
 
-    Stage 1 (GPU): run the backend's pitch-aware tracking and checkpoint the raw
-    px trajectories + keypoints. Stage 2 (pure): assemble and write deliverables.
-    fps and total_frames are derived from the tracker output so this is testable
-    with a stub backend and needs no second video read.
+    Stage 1 (GPU): pitch-aware tracking + checkpoints. Stage 2 (CPU): propagate
+    homographies from anchors → homographies.parquet. Stage 3 (pure): assemble +
+    write deliverables.
     """
     if backend is None:
         from soccer_vision.tracking.roboflow import (
@@ -224,9 +223,13 @@ def analyze_video(
     trajectories_px.to_parquet(out / "trajectories_px.parquet", index=False)
     keypoints.to_parquet(out / "keypoints.parquet", index=False)
 
+    homographies = build_homographies(keypoints, video_path, trajectories_px)
+    homographies_to_parquet(homographies, out / "homographies.parquet")
+
     resolved_fps, total_frames = _resolve_fps_and_frames(trajectories_px)
     result = assemble_phases(
-        trajectories_px, keypoints, fps=resolved_fps, total_frames=total_frames, **assemble_opts  # type: ignore[arg-type]
+        trajectories_px, keypoints, fps=resolved_fps, total_frames=total_frames,
+        homographies=homographies, **assemble_opts,  # type: ignore[arg-type]
     )
     _write_deliverables(result, out)
     return result
@@ -282,3 +285,25 @@ def build_homographies(
         )
     finally:
         cap.release()
+
+
+def assemble_from_homographies(
+    trajectories_px_path: Path,
+    homographies_path: Path,
+    out_dir: Path,
+    *,
+    fps: float | None = None,
+    **assemble_opts: object,
+) -> PipelineResult:
+    """Stage-3 re-run from precomputed homographies (instant; no video, no GPU)."""
+    trajectories_px = pd.read_parquet(trajectories_px_path)
+    homographies = homographies_from_parquet(homographies_path)
+    resolved_fps, total_frames = _resolve_fps_and_frames(trajectories_px, fps)
+    # keypoints are unused when homographies are supplied; pass an empty frame.
+    empty_kp = pd.DataFrame(columns=["frame", "kp_idx", "x_px", "y_px", "conf"])
+    result = assemble_phases(
+        trajectories_px, empty_kp, fps=resolved_fps, total_frames=total_frames,
+        homographies=homographies, **assemble_opts,  # type: ignore[arg-type]
+    )
+    _write_deliverables(result, Path(out_dir))
+    return result

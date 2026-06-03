@@ -83,6 +83,8 @@ def test_assemble_phases_no_homography_degrades_to_unknown() -> None:
     assert result.homography_coverage == 0.0
     assert set(result.phases["possession_state"]) == {"unknown"}
     assert set(result.phases["phase"]) == {"unknown"}
+    assert set(result.phases["homography_source"]) == {"none"}
+    assert result.anchor_coverage == 0.0 and result.propagated_coverage == 0.0
 
 
 def test_assemble_phases_fills_full_frame_range() -> None:
@@ -116,6 +118,7 @@ def test_assemble_from_parquet_roundtrip(tmp_path) -> None:
     reloaded_phases = pd.read_parquet(out_dir / "phases.parquet")
     assert list(reloaded_phases.columns) == [
         "frame", "t_seconds", "possession_state", "phase", "ball_x_pitch", "ball_y_pitch",
+        "homography_source", "homography_conf",
     ]
 
 
@@ -143,3 +146,36 @@ def test_assemble_phases_applies_possession_smoothing() -> None:
     # Frame 2 is 'opp' before smoothing; the window=5 mode smooths it back to 'own'.
     assert states.loc[2] == "own"
     assert states.loc[0] == "own"
+
+
+def test_assemble_phases_accepts_precomputed_homographies() -> None:
+    import numpy as np
+    from soccer_vision.pitch.propagation import HomographyEntry
+
+    traj = _scene()
+    kp = _identity_keypoints(3)
+    # identity-H entries: frame 0 anchor, frames 1-2 propagated (lower conf)
+    homs = {
+        0: HomographyEntry(np.eye(3), "anchor", 1.0),
+        1: HomographyEntry(np.eye(3), "propagated", 0.6),
+        2: HomographyEntry(np.eye(3), "propagated", 0.6),
+    }
+    result = assemble_phases(traj, kp, fps=FPS, total_frames=3, homographies=homs)
+
+    ph = result.phases.set_index("frame")
+    assert ph.loc[0, "homography_source"] == "anchor"
+    assert ph.loc[1, "homography_source"] == "propagated"
+    assert abs(ph.loc[1, "homography_conf"] - 0.6) < 1e-9
+    assert result.anchor_coverage == 1 / 3
+    assert abs(result.propagated_coverage - 2 / 3) < 1e-9
+    assert abs(result.homography_coverage - 1.0) < 1e-9
+
+
+def test_assemble_phases_legacy_path_marks_anchors() -> None:
+    traj = _scene()
+    kp = _identity_keypoints(3)
+    result = assemble_phases(traj, kp, fps=FPS, total_frames=3)  # no homographies arg
+    ph = result.phases.set_index("frame")
+    assert set(ph["homography_source"]) <= {"anchor", "none"}
+    assert result.propagated_coverage == 0.0
+    assert result.anchor_coverage == 1.0   # all 3 frames are landmark anchors in the fixture

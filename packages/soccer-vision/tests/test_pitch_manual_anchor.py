@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import numpy as np
-from soccer_vision.pitch.manual_anchor import Click, FrameFit, build_segments, cumulative_transforms, map_point
+from soccer_vision.pitch.manual_anchor import (
+    Click,
+    FrameFit,
+    build_segments,
+    cumulative_transforms,
+    map_point,
+)
 
 
 def test_click_and_framefit_fields() -> None:
@@ -41,7 +47,8 @@ def test_cumulative_identity_chain() -> None:
 
 def test_cumulative_translation_chain() -> None:
     # each frame shifts +10px in x relative to the previous (i -> i+1).
-    g = np.eye(3); g[0, 2] = 10.0
+    g = np.eye(3)
+    g[0, 2] = 10.0
     interframe = {0: g, 1: g}
     seg = build_segments(interframe, 3)
     M = cumulative_transforms(interframe, seg)
@@ -51,7 +58,8 @@ def test_cumulative_translation_chain() -> None:
 
 
 def test_cumulative_resets_per_segment() -> None:
-    g = np.eye(3); g[0, 2] = 10.0
+    g = np.eye(3)
+    g[0, 2] = 10.0
     interframe = {0: g}  # link 0-1 only; frame 2 is a new segment
     seg = build_segments(interframe, 3)
     M = cumulative_transforms(interframe, seg)
@@ -59,7 +67,8 @@ def test_cumulative_resets_per_segment() -> None:
 
 
 def test_map_point_through_translation() -> None:
-    g = np.eye(3); g[0, 2] = 10.0
+    g = np.eye(3)
+    g[0, 2] = 10.0
     interframe = {0: g, 1: g}
     seg = build_segments(interframe, 3)
     M = cumulative_transforms(interframe, seg)

@@ -57,3 +57,35 @@ def build_segments(
             cur += 1
             seg[f] = cur
     return seg
+
+
+def cumulative_transforms(
+    interframe: Mapping[int, NDArray[np.floating]], segment_of: Mapping[int, int]
+) -> dict[int, NDArray[np.float64]]:
+    """M[f] maps frame f pixels -> its segment's reference (first) frame pixels.
+
+    M[start] = I; M[f] = M[f-1] @ inv(interframe[f-1]) within a segment, since
+    interframe[f-1] maps f-1 -> f so its inverse maps f -> f-1.
+    """
+    transforms: dict[int, NDArray[np.float64]] = {}
+    for f in sorted(segment_of):
+        prev_same = (f - 1) in segment_of and segment_of[f] == segment_of[f - 1]
+        if not prev_same:
+            transforms[f] = np.eye(3)
+        else:
+            g = np.asarray(interframe[f - 1], dtype=np.float64)
+            transforms[f] = transforms[f - 1] @ np.linalg.inv(g)
+    return transforms
+
+
+def map_point(
+    m_src: NDArray[np.floating], m_dst: NDArray[np.floating], x: float, y: float
+) -> tuple[float, float]:
+    """Map pixel (x, y) from the source frame into the destination frame.
+
+    src -> reference via m_src, reference -> dst via inv(m_dst). Both must be in
+    the same segment (caller ensures this).
+    """
+    ref = np.asarray(m_src, dtype=np.float64) @ np.array([x, y, 1.0])
+    dst = np.linalg.inv(np.asarray(m_dst, dtype=np.float64)) @ ref
+    return float(dst[0] / dst[2]), float(dst[1] / dst[2])

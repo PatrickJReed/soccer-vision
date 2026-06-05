@@ -148,3 +148,21 @@ def test_clicks_do_not_cross_segments() -> None:
     fits = fit_frame_homographies(clicks, transforms, seg, PITCH_LANDMARKS, window=10)
     assert 2 not in fits
     assert 0 in fits and 1 in fits
+
+
+def test_degenerate_collinear_clicks_yield_large_residual() -> None:
+    # 4 landmarks whose image points are collinear cannot define a valid pitch
+    # homography; the fit's residual is far above the coverage threshold (0.05),
+    # so the residual gate downstream rejects it even though no error is raised.
+    interframe = _identity_chain(2)
+    seg = build_segments(interframe, 2)
+    transforms = cumulative_transforms(interframe, seg)
+    clicks = [
+        Click(0, _FIT_IDXS[0], 0.0, 0.0),
+        Click(0, _FIT_IDXS[1], 1.0, 1.0),
+        Click(0, _FIT_IDXS[2], 2.0, 2.0),
+        Click(0, _FIT_IDXS[3], 3.0, 3.0),
+    ]
+    fits = fit_frame_homographies(clicks, transforms, seg, PITCH_LANDMARKS, window=10)
+    assert 0 in fits
+    assert fits[0].residual > 0.05

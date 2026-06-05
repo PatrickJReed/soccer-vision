@@ -29,7 +29,7 @@ class Click:
     y: float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class FrameFit:
     """A fitted per-frame homography plus its quality."""
 

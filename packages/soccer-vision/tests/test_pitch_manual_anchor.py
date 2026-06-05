@@ -11,6 +11,7 @@ def test_click_and_framefit_fields() -> None:
     assert (c.frame, c.kp_idx, c.x, c.y) == (3, 0, 10.0, 20.0)
     f = FrameFit(H=np.eye(3), residual=0.01, n_points=5)
     assert f.n_points == 5 and f.residual == 0.01
+    assert np.array_equal(f.H, np.eye(3))
 
 
 def test_segments_single_connected_run() -> None:

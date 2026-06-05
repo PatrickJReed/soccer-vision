@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import numpy as np
+from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 from soccer_vision.pitch.manual_anchor import (
     Click,
     FrameFit,
     build_segments,
     cumulative_transforms,
+    fit_frame_homographies,
     map_point,
 )
+
+_SCALE = 1000.0
+_FIT_IDXS = [0, 3, 6, 11, 16, 19]
 
 
 def test_click_and_framefit_fields() -> None:
@@ -75,3 +80,71 @@ def test_map_point_through_translation() -> None:
     # a point at x=5 in frame 0 appears at x=25 in frame 2 (camera moved +20).
     x, y = map_point(M[0], M[2], 5.0, 0.0)
     assert np.isclose(x, 25.0) and np.isclose(y, 0.0)
+
+
+def _identity_chain(n: int) -> dict[int, np.ndarray]:
+    return {i: np.eye(3) for i in range(n - 1)}
+
+
+def _clicks_one_per_frame() -> list[Click]:
+    clicks = []
+    for f, idx in enumerate(_FIT_IDXS):
+        px, py = PITCH_LANDMARKS[idx] * _SCALE
+        clicks.append(Click(frame=f, kp_idx=idx, x=float(px), y=float(py)))
+    return clicks
+
+
+def test_fit_recovers_homography_from_spread_clicks() -> None:
+    n = 6
+    interframe = _identity_chain(n)
+    seg = build_segments(interframe, n)
+    transforms = cumulative_transforms(interframe, seg)
+    fits = fit_frame_homographies(
+        _clicks_one_per_frame(), transforms, seg, PITCH_LANDMARKS, window=10
+    )
+    assert set(fits) == set(range(n))
+    f3 = fits[3]
+    assert f3.n_points == 6
+    assert f3.residual < 1e-6
+    pt = np.array([PITCH_LANDMARKS[0, 0] * _SCALE, PITCH_LANDMARKS[0, 1] * _SCALE, 1.0])
+    mapped = f3.H @ pt
+    mapped = mapped[:2] / mapped[2]
+    assert np.allclose(mapped, PITCH_LANDMARKS[0], atol=1e-6)
+
+
+def test_window_excludes_distant_clicks() -> None:
+    n = 6
+    interframe = _identity_chain(n)
+    seg = build_segments(interframe, n)
+    transforms = cumulative_transforms(interframe, seg)
+    fits = fit_frame_homographies(
+        _clicks_one_per_frame(), transforms, seg, PITCH_LANDMARKS, window=1
+    )
+    assert 5 not in fits
+
+
+def test_fewer_than_four_landmarks_uncovered() -> None:
+    n = 3
+    interframe = _identity_chain(n)
+    seg = build_segments(interframe, n)
+    transforms = cumulative_transforms(interframe, seg)
+    clicks = [
+        Click(0, _FIT_IDXS[0], *(PITCH_LANDMARKS[_FIT_IDXS[0]] * _SCALE)),
+        Click(0, _FIT_IDXS[1], *(PITCH_LANDMARKS[_FIT_IDXS[1]] * _SCALE)),
+        Click(0, _FIT_IDXS[2], *(PITCH_LANDMARKS[_FIT_IDXS[2]] * _SCALE)),
+    ]
+    fits = fit_frame_homographies(clicks, transforms, seg, PITCH_LANDMARKS, window=10)
+    assert fits == {}
+
+
+def test_clicks_do_not_cross_segments() -> None:
+    interframe = {0: np.eye(3)}  # links 0-1; frame 2 isolated
+    seg = build_segments(interframe, 3)
+    transforms = cumulative_transforms(interframe, seg)
+    clicks = [
+        Click(0 if i < 2 else 1, idx, *(PITCH_LANDMARKS[idx] * _SCALE))
+        for i, idx in enumerate(_FIT_IDXS[:4])
+    ]
+    fits = fit_frame_homographies(clicks, transforms, seg, PITCH_LANDMARKS, window=10)
+    assert 2 not in fits
+    assert 0 in fits and 1 in fits

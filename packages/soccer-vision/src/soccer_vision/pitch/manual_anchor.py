@@ -12,11 +12,13 @@ All homographies map image pixels -> pitch [0,1]^2. Pure: no I/O.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
+
+from soccer_vision.pitch.homography import HomographyError, fit_homography
 
 
 @dataclass(frozen=True)
@@ -89,3 +91,53 @@ def map_point(
     ref = np.asarray(m_src, dtype=np.float64) @ np.array([x, y, 1.0])
     dst = np.linalg.inv(np.asarray(m_dst, dtype=np.float64)) @ ref
     return float(dst[0] / dst[2]), float(dst[1] / dst[2])
+
+
+def _apply(H: NDArray[np.floating], pts: NDArray[np.floating]) -> NDArray[np.float64]:
+    """Apply a 3x3 homography to (N, 2) points -> (N, 2)."""
+    homog = np.column_stack([pts, np.ones(len(pts))])
+    out = (np.asarray(H, dtype=np.float64) @ homog.T).T
+    return out[:, :2] / out[:, 2:3]
+
+
+def fit_frame_homographies(
+    clicks: Sequence[Click],
+    transforms: Mapping[int, NDArray[np.floating]],
+    segment_of: Mapping[int, int],
+    landmarks: NDArray[np.floating],
+    *,
+    window: int,
+    min_points: int = 4,
+) -> dict[int, FrameFit]:
+    """Fit each frame's image->pitch homography from clicks propagated into it.
+
+    For target frame g, gather clicks in the same segment with |click.frame - g|
+    <= window, mapped into g's pixels; keep one observation per landmark (nearest
+    click frame wins). With >= min_points distinct landmarks, fit a homography and
+    record its mean reprojection residual (pitch units).
+    """
+    fits: dict[int, FrameFit] = {}
+    for g in sorted(transforms):
+        seg_g = segment_of[g]
+        best: dict[int, tuple[int, float, float]] = {}  # kp_idx -> (dist, x, y)
+        for c in clicks:
+            if segment_of.get(c.frame) != seg_g:
+                continue
+            dist = abs(c.frame - g)
+            if dist > window:
+                continue
+            x, y = map_point(transforms[c.frame], transforms[g], c.x, c.y)
+            if c.kp_idx not in best or dist < best[c.kp_idx][0]:
+                best[c.kp_idx] = (dist, x, y)
+        if len(best) < min_points:
+            continue
+        idxs = sorted(best)
+        image_pts = np.array([[best[i][1], best[i][2]] for i in idxs], dtype=np.float64)
+        pitch_pts = np.asarray(landmarks, dtype=np.float64)[idxs]
+        try:
+            H = fit_homography(image_pts, pitch_pts)
+        except HomographyError:
+            continue
+        residual = float(np.linalg.norm(_apply(H, image_pts) - pitch_pts, axis=1).mean())
+        fits[g] = FrameFit(H=H, residual=residual, n_points=len(idxs))
+    return fits

@@ -16,9 +16,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 from numpy.typing import NDArray
 
 from soccer_vision.pitch.homography import HomographyError, fit_homography
+from soccer_vision.pitch.propagation import HomographyEntry
 
 
 @dataclass(frozen=True)
@@ -141,3 +143,54 @@ def fit_frame_homographies(
         residual = float(np.linalg.norm(_apply(H, image_pts) - pitch_pts, axis=1).mean())
         fits[g] = FrameFit(H=H, residual=residual, n_points=len(idxs))
     return fits
+
+
+def frame_status(
+    fits: Mapping[int, FrameFit], n_frames: int, *, residual_threshold: float = 0.05
+) -> dict[int, str]:
+    """Per-frame label: green (fit & residual<=thr), yellow (fit & residual>thr),
+    red (no fit / <4 landmarks)."""
+    status: dict[int, str] = {}
+    for f in range(n_frames):
+        fit = fits.get(f)
+        if fit is None:
+            status[f] = "red"
+        elif fit.residual <= residual_threshold:
+            status[f] = "green"
+        else:
+            status[f] = "yellow"
+    return status
+
+
+def coverage_fraction(
+    fits: Mapping[int, FrameFit], n_frames: int, *, residual_threshold: float = 0.05
+) -> float:
+    """Fraction of frames that are green (covered & low residual)."""
+    if n_frames == 0:
+        return 0.0
+    green = sum(1 for fit in fits.values() if fit.residual <= residual_threshold)
+    return green / n_frames
+
+
+def to_homography_entries(
+    fits: Mapping[int, FrameFit], *, residual_threshold: float = 0.05
+) -> dict[int, HomographyEntry]:
+    """Green frames -> HomographyEntry(source='manual', confidence from residual)."""
+    out: dict[int, HomographyEntry] = {}
+    for f, fit in fits.items():
+        if fit.residual > residual_threshold:
+            continue
+        conf = float(np.clip(1.0 - fit.residual / residual_threshold, 0.0, 1.0))
+        out[f] = HomographyEntry(np.asarray(fit.H, dtype=np.float64), "manual", conf)
+    return out
+
+
+def clicks_to_keypoints_df(clicks: Sequence[Click]) -> pd.DataFrame:
+    """Clicks -> keypoints DataFrame (frame, kp_idx, x_px, y_px, conf=1.0)."""
+    df = pd.DataFrame(
+        [{"frame": c.frame, "kp_idx": c.kp_idx, "x_px": c.x, "y_px": c.y, "conf": 1.0}
+         for c in clicks],
+        columns=["frame", "kp_idx", "x_px", "y_px", "conf"],
+    )
+    return df.astype({"frame": "int64", "kp_idx": "int64", "x_px": "float64",
+                      "y_px": "float64", "conf": "float64"})

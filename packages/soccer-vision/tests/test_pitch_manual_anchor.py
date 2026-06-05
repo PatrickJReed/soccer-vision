@@ -8,9 +8,13 @@ from soccer_vision.pitch.manual_anchor import (
     Click,
     FrameFit,
     build_segments,
+    clicks_to_keypoints_df,
+    coverage_fraction,
     cumulative_transforms,
     fit_frame_homographies,
+    frame_status,
     map_point,
+    to_homography_entries,
 )
 
 _SCALE = 1000.0
@@ -166,3 +170,36 @@ def test_degenerate_collinear_clicks_yield_large_residual() -> None:
     fits = fit_frame_homographies(clicks, transforms, seg, PITCH_LANDMARKS, window=10)
     assert 0 in fits
     assert fits[0].residual > 0.05
+
+
+def _fits() -> dict[int, FrameFit]:
+    return {
+        0: FrameFit(np.eye(3), residual=0.01, n_points=6),
+        1: FrameFit(np.eye(3), residual=0.09, n_points=5),
+    }
+
+
+def test_frame_status_green_yellow_red() -> None:
+    status = frame_status(_fits(), n_frames=3, residual_threshold=0.05)
+    assert status == {0: "green", 1: "yellow", 2: "red"}
+
+
+def test_coverage_fraction_counts_green_only() -> None:
+    assert coverage_fraction(_fits(), n_frames=3, residual_threshold=0.05) == 1 / 3
+
+
+def test_to_homography_entries_keeps_green_with_source_manual() -> None:
+    entries = to_homography_entries(_fits(), residual_threshold=0.05)
+    assert set(entries) == {0}
+    assert entries[0].source == "manual"
+    assert 0.0 <= entries[0].confidence <= 1.0
+
+
+def test_clicks_to_keypoints_df_schema() -> None:
+    clicks = [Click(2, 0, 10.0, 20.0), Click(5, 3, 30.0, 40.0)]
+    df = clicks_to_keypoints_df(clicks)
+    assert list(df.columns) == ["frame", "kp_idx", "x_px", "y_px", "conf"]
+    assert (df["conf"] == 1.0).all()
+    assert df.iloc[0].to_dict() == {
+        "frame": 2, "kp_idx": 0, "x_px": 10.0, "y_px": 20.0, "conf": 1.0
+    }

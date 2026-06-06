@@ -84,7 +84,7 @@ def test_pitch_weights_use_release_url() -> None:
     assert "releases/download/pitch-v1/" in PITCH_V1_URL
 
 
-def test_pitch_weights_path_override_missing_raises(tmp_path) -> None:
+def test_pitch_weights_path_override_missing_raises(tmp_path: Path) -> None:
     from soccer_vision.tracking.roboflow import RoboflowBackend
 
     missing = tmp_path / "nope.pt"
@@ -96,7 +96,7 @@ def test_pitch_weights_path_override_missing_raises(tmp_path) -> None:
         raise AssertionError("expected FileNotFoundError")
 
 
-def test_pitch_weights_path_override_accepted(tmp_path) -> None:
+def test_pitch_weights_path_override_accepted(tmp_path: Path) -> None:
     from soccer_vision.tracking.roboflow import RoboflowBackend
 
     w = tmp_path / "custom_pitch.pt"

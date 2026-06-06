@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from soccer_vision.pipeline import (
@@ -15,7 +17,7 @@ from soccer_vision.pitch.propagation import HomographyEntry
 FPS = 1.0
 
 
-def test_homographies_parquet_roundtrip(tmp_path) -> None:
+def test_homographies_parquet_roundtrip(tmp_path: Path) -> None:
     entries = {
         3: HomographyEntry(np.eye(3), "anchor", 1.0),
         4: HomographyEntry(np.array([[1.0, 0.0, 0.5], [0.0, 1.0, 0.2], [0.0, 0.0, 1.0]]),
@@ -32,7 +34,7 @@ def test_homographies_parquet_roundtrip(tmp_path) -> None:
     assert np.allclose(back[3].H, entries[3].H)
 
 
-def test_homographies_to_parquet_columns(tmp_path) -> None:
+def test_homographies_to_parquet_columns(tmp_path: Path) -> None:
     homographies_to_parquet({3: HomographyEntry(np.eye(3), "anchor", 1.0)},
                             tmp_path / "h.parquet")
     df = pd.read_parquet(tmp_path / "h.parquet")
@@ -53,7 +55,7 @@ def _traj() -> pd.DataFrame:
     return pd.DataFrame(rows).astype({"frame": "int64", "track_id": "int64"})
 
 
-def test_assemble_from_homographies_roundtrip(tmp_path) -> None:
+def test_assemble_from_homographies_roundtrip(tmp_path: Path) -> None:
     traj = _traj()
     traj_path = tmp_path / "trajectories_px.parquet"
     h_path = tmp_path / "homographies.parquet"
@@ -68,7 +70,7 @@ def test_assemble_from_homographies_roundtrip(tmp_path) -> None:
     assert result.anchor_coverage == 1.0
 
 
-def test_manual_source_counts_toward_coverage(tmp_path) -> None:
+def test_manual_source_counts_toward_coverage(tmp_path: Path) -> None:
     # I1 lock: homographies with source="manual" must contribute to coverage.
     traj = _traj()
     traj_path = tmp_path / "trajectories_px.parquet"

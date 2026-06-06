@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from soccer_vision.labeler.state import LabelerState
@@ -40,7 +42,7 @@ def test_status_list_length_matches_frames() -> None:
     assert set(st.status_list()) <= {"green", "yellow", "red"}
 
 
-def test_export_writes_both_parquets(tmp_path) -> None:
+def test_export_writes_both_parquets(tmp_path: Path) -> None:
     st = _state()
     for f, idx in enumerate(_IDXS):
         px, py = PITCH_LANDMARKS[idx] * _SCALE

@@ -90,6 +90,7 @@ canvas.onclick=async(e)=>{
 
 document.getElementById("scrub").oninput=(e)=>loadFrame(+e.target.value);
 document.getElementById("undo").onclick=async()=>{clicks.pop();
+  placed=new Set(clicks.map(c=>c.kp_idx));   // recompute ✓ set after removal
   applyState(await postJSON("/api/undo",{})); const fh=await api(`/api/frame_h/${cur}`);
   curH=fh.h; drawFrame();};
 document.getElementById("grid").onclick=()=>{showGrid=!showGrid; drawFrame();};

@@ -128,4 +128,7 @@ def run(
     handler = make_handler(state, frame_jpeg, names, landmark_xy=xy, export_dir=export_dir)
     httpd = HTTPServer(("127.0.0.1", port), handler)
     print(f"Labeler running at http://127.0.0.1:{port}  (video: {video_path})")
-    httpd.serve_forever()
+    try:
+        httpd.serve_forever()
+    finally:
+        cap.release()

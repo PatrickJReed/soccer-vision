@@ -66,3 +66,18 @@ def test_assemble_from_homographies_roundtrip(tmp_path) -> None:
     assert (out_dir / "trajectories.parquet").exists()
     assert (out_dir / "phases.parquet").exists()
     assert result.anchor_coverage == 1.0
+
+
+def test_manual_source_counts_toward_coverage(tmp_path) -> None:
+    # I1 lock: homographies with source="manual" must contribute to coverage.
+    traj = _traj()
+    traj_path = tmp_path / "trajectories_px.parquet"
+    h_path = tmp_path / "homographies.parquet"
+    traj.to_parquet(traj_path, index=False)
+    homographies_to_parquet(
+        {f: HomographyEntry(np.eye(3), "manual", 1.0) for f in range(3)}, h_path
+    )
+    out_dir = tmp_path / "out"
+
+    result = assemble_from_homographies(traj_path, h_path, out_dir)
+    assert result.homography_coverage > 0

@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
+from soccer_vision.labeler.chain import denormalize_homography
 from soccer_vision.pipeline import homographies_to_parquet
 from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 from soccer_vision.pitch.manual_anchor import (
@@ -25,6 +26,7 @@ from soccer_vision.pitch.manual_anchor import (
     frame_status,
     to_homography_entries,
 )
+from soccer_vision.pitch.propagation import HomographyEntry
 
 
 class LabelerState:
@@ -35,10 +37,12 @@ class LabelerState:
         interframe: Mapping[int, NDArray[np.floating]],
         n_frames: int,
         *,
+        size: tuple[int, int],
         window: int = 60,
         residual_threshold: float = 0.05,
     ) -> None:
         self.n_frames = n_frames
+        self.size = size
         self.window = window
         self.residual_threshold = residual_threshold
         self._segment_of = build_segments(interframe, n_frames)
@@ -78,10 +82,18 @@ class LabelerState:
     def export(self, out_dir: Path) -> None:
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
-        clicks_to_keypoints_df(self.clicks).to_parquet(
+        w, h = self.size
+        px_clicks = [Click(c.frame, c.kp_idx, c.x * w, c.y * h) for c in self.clicks]
+        clicks_to_keypoints_df(px_clicks).to_parquet(
             out / "keypoints.parquet", index=False
         )
         entries = to_homography_entries(
             self._fits, residual_threshold=self.residual_threshold
         )
-        homographies_to_parquet(entries, out / "homographies.parquet")
+        px_entries = {
+            f: HomographyEntry(
+                denormalize_homography(e.H, self.size), e.source, e.confidence
+            )
+            for f, e in entries.items()
+        }
+        homographies_to_parquet(px_entries, out / "homographies.parquet")

@@ -130,7 +130,8 @@ def assemble_phases(
     })
 
     counts = Counter(e.source for e in valid.values())
-    n_anchor = counts["anchor"]
+    # Manual-anchor frames are direct high-confidence observations; count as anchor coverage.
+    n_anchor = counts["anchor"] + counts["manual"]
     n_prop = counts["propagated"]
     anchor_cov = n_anchor / total_frames if total_frames else 0.0
     prop_cov = n_prop / total_frames if total_frames else 0.0

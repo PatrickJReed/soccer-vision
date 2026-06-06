@@ -34,6 +34,18 @@ def normalize_homography(
     return (s @ np.asarray(g, dtype=np.float64) @ s_inv).astype(np.float64)
 
 
+def denormalize_homography(
+    h_norm: NDArray[np.floating], size: tuple[int, int]
+) -> NDArray[np.float64]:
+    """Convert a normalized-image->pitch homography to full-pixel->pitch.
+
+    H_pixel = H_norm @ diag(1/W, 1/H, 1), since normalized = diag(1/W,1/H,1) @ pixel.
+    """
+    w, h = size
+    s = np.diag([1.0 / w, 1.0 / h, 1.0])
+    return (np.asarray(h_norm, dtype=np.float64) @ s).astype(np.float64)
+
+
 def save_chain(
     path: Path,
     interframe: Mapping[int, NDArray[np.floating]],

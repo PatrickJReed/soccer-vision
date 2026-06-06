@@ -110,8 +110,8 @@ def run(
     from soccer_vision.labeler.chain import compute_chain
     from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 
-    interframe, n_frames, _ = compute_chain(video_path)
-    state = LabelerState(interframe=interframe, n_frames=n_frames)
+    interframe, n_frames, size = compute_chain(video_path)
+    state = LabelerState(interframe=interframe, n_frames=n_frames, size=size)
     cap = cv2.VideoCapture(str(video_path))
 
     def frame_jpeg(idx: int) -> bytes:

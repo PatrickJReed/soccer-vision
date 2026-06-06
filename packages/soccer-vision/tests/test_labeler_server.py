@@ -16,7 +16,7 @@ from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 
 def _serve() -> tuple[HTTPServer, LabelerState]:
     interframe = {i: np.eye(3) for i in range(5)}
-    state = LabelerState(interframe=interframe, n_frames=6, window=10)
+    state = LabelerState(interframe=interframe, n_frames=6, size=(1920, 1080), window=10)
 
     def frame_jpeg(idx: int) -> bytes:
         return b"\xff\xd8stub-jpeg"

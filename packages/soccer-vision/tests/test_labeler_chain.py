@@ -5,7 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from soccer_vision.labeler.chain import load_chain, normalize_homography, save_chain
+from soccer_vision.labeler.chain import (
+    denormalize_homography,
+    load_chain,
+    normalize_homography,
+    save_chain,
+)
 
 
 def test_normalize_homography_translation() -> None:
@@ -33,3 +38,13 @@ def test_chain_cache_round_trip(tmp_path: Path) -> None:
 
 def test_load_missing_returns_none(tmp_path: Path) -> None:
     assert load_chain(tmp_path / "nope.npz") is None
+
+
+def test_denormalize_homography_inverts_normalize() -> None:
+    # a normalized-space identity maps normalized->normalized; denormalized it
+    # should map full-pixel (W,H) to normalized (1,1).
+    hn = np.eye(3)
+    hp = denormalize_homography(hn, (200, 100))
+    out = hp @ np.array([200.0, 100.0, 1.0])
+    out = out[:2] / out[2]
+    assert np.allclose(out, [1.0, 1.0])

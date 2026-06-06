@@ -31,7 +31,7 @@ def test_register_recovers_translation() -> None:
     warped = cv2.warpPerspective(base, M, (600, 400))
     full = np.full((400, 600), 255, np.uint8)
 
-    G = register(base, warped, full, full)   # maps base pixels -> warped pixels
+    G = register(base, warped.astype(np.uint8), full, full)   # maps base pixels -> warped pixels
     assert G is not None
     p = np.array([300.0, 200.0, 1.0])
     q = G @ p
@@ -97,7 +97,7 @@ def _pan_interframe(n_pairs: int, dx: float = 4.0) -> dict[int, np.ndarray]:
 def _pan_anchor_H(frame: int, dx: float = 4.0) -> np.ndarray:
     """pixel->pitch for a frame panned by frame*dx: undo pan, then /1000."""
     undo = np.array([[1.0, 0.0, -frame * dx], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-    return np.diag([1 / 1000.0, 1 / 1000.0, 1.0]) @ undo
+    return np.asarray(np.diag([1 / 1000.0, 1 / 1000.0, 1.0]) @ undo)
 
 
 def test_propagation_bridges_gap_within_window() -> None:
@@ -160,7 +160,7 @@ def test_compute_interframe_recovers_known_pan_downscaled() -> None:
 
     frames = {f: shift(f) for f in range(4)}
 
-    def read_frame(i):
+    def read_frame(i: int) -> np.ndarray | None:
         return frames.get(i)
 
     boxes = pd.DataFrame(columns=["frame", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "class"])

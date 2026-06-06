@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import cast
+
 import pandas as pd
 from soccer_vision.pipeline import PipelineResult, assemble_phases
 from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
@@ -20,7 +23,7 @@ def _identity_keypoints(n_frames: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _det(frame, track_id, x, y, cls, team, conf=0.9):
+def _det(frame: int, track_id: int, x: float, y: float, cls: str, team: str, conf: float = 0.9) -> dict[str, object]:
     # Identity homography -> x_px/y_px ARE the pitch coords.
     return {
         "frame": frame, "t_seconds": frame / FPS, "track_id": track_id,
@@ -95,7 +98,7 @@ def test_assemble_phases_fills_full_frame_range() -> None:
     assert result.phases.set_index("frame").loc[4, "possession_state"] == "unknown"
 
 
-def test_assemble_from_parquet_roundtrip(tmp_path) -> None:
+def test_assemble_from_parquet_roundtrip(tmp_path: Path) -> None:
     from soccer_vision.pipeline import assemble_from_parquet
 
     traj = _scene()
@@ -165,7 +168,7 @@ def test_assemble_phases_accepts_precomputed_homographies() -> None:
     ph = result.phases.set_index("frame")
     assert ph.loc[0, "homography_source"] == "anchor"
     assert ph.loc[1, "homography_source"] == "propagated"
-    assert abs(ph.loc[1, "homography_conf"] - 0.6) < 1e-9
+    assert abs(float(cast(float, ph.loc[1, "homography_conf"])) - 0.6) < 1e-9
     assert result.anchor_coverage == 1 / 3
     assert abs(result.propagated_coverage - 2 / 3) < 1e-9
     assert abs(result.homography_coverage - 1.0) < 1e-9

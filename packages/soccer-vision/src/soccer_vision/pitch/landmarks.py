@@ -36,6 +36,32 @@ FLIP_IDX: Final[list[int]] = [
     1, 0, 3, 2, 5, 4, 6, 7, 8, 10, 9, 12, 11, 14, 13, 16, 15, 18, 17, 20, 19,
 ]
 
+# Human-readable name per landmark index (for the labeler palette). "own"/"opp"
+# = goal at y=0 / y=1; "left"/"right" = near/far touchline side.
+LANDMARK_NAMES: Final[list[str]] = [
+    "corner_own_left",       # 0
+    "corner_own_right",      # 1
+    "corner_opp_left",       # 2
+    "corner_opp_right",      # 3
+    "halfway_far",           # 4
+    "halfway_near (hidden)", # 5  under the camera, never visible
+    "center_mark",           # 6
+    "circle_far",            # 7  center-circle apex toward opp goal
+    "circle_near",           # 8  center-circle apex toward own goal
+    "own_box_outer_left",    # 9
+    "own_box_outer_right",   # 10
+    "own_box_goal_left",     # 11
+    "own_box_goal_right",    # 12
+    "opp_box_outer_left",    # 13
+    "opp_box_outer_right",   # 14
+    "opp_box_goal_left",     # 15
+    "opp_box_goal_right",    # 16
+    "own_post_left",         # 17
+    "own_post_right",        # 18
+    "opp_post_left",         # 19
+    "opp_post_right",        # 20
+]
+
 
 def youth_landmarks(spec: PitchSpec) -> NDArray[np.float64]:
     """Compute the 21 canonical [0,1]^2 landmark coords from a PitchSpec.

@@ -60,20 +60,21 @@ def make_handler(
             }
 
         def do_GET(self) -> None:
-            if self.path in ("/", "/index.html"):
+            path = self.path.split("?", 1)[0]  # drop cache-buster / query string
+            if path in ("/", "/index.html"):
                 self._send(200, (_STATIC / "index.html").read_bytes(), "text/html")
-            elif self.path == "/app.js":
+            elif path == "/app.js":
                 self._send(200, (_STATIC / "app.js").read_bytes(),
                            "application/javascript")
-            elif self.path == "/api/state":
+            elif path == "/api/state":
                 self._json(self._state_payload())
-            elif self.path.startswith("/api/frame_h/"):
-                idx = int(self.path.rsplit("/", 1)[1])
+            elif path.startswith("/api/frame_h/"):
+                idx = int(path.rsplit("/", 1)[1])
                 fit = state.frame_homography(idx)
                 self._json({"h": None if fit is None
                             else [float(v) for v in np.asarray(fit.H).reshape(9)]})
-            elif self.path.startswith("/api/frame/"):
-                idx = int(self.path.rsplit("/", 1)[1])
+            elif path.startswith("/api/frame/"):
+                idx = int(path.rsplit("/", 1)[1])
                 self._send(200, frame_jpeg(idx), "image/jpeg")
             else:
                 self._send(404, b"not found", "text/plain")
@@ -108,7 +109,7 @@ def run(
     import cv2
 
     from soccer_vision.labeler.chain import compute_chain
-    from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
+    from soccer_vision.pitch.landmarks import LANDMARK_NAMES, PITCH_LANDMARKS
 
     interframe, n_frames, size = compute_chain(video_path)
     state = LabelerState(interframe=interframe, n_frames=n_frames, size=size)
@@ -123,7 +124,7 @@ def run(
         ok2, buf = cv2.imencode(".jpg", small)
         return buf.tobytes() if ok2 else b""
 
-    names = [f"kp{i}" for i in range(len(PITCH_LANDMARKS))]
+    names = list(LANDMARK_NAMES)
     xy = [[float(x), float(y)] for x, y in PITCH_LANDMARKS]
     handler = make_handler(state, frame_jpeg, names, landmark_xy=xy, export_dir=export_dir)
     httpd = HTTPServer(("127.0.0.1", port), handler)

@@ -6,6 +6,9 @@ import numpy as np
 import pandas as pd
 from soccer_vision.hygiene.core import (
     Fragment,
+    apply_team_labels,
+    assign_goalkeepers,
+    balance_gate,
     cluster_teams,
     extract_fragments,
     map_own_cluster,
@@ -173,3 +176,81 @@ def test_stitch_true_tie_break_prefers_nearer_of_two_eligible() -> None:
     out = stitch_tracks(df, fps=30.0)
     by_orig = out.groupby("orig_track_id")["track_id"].first()
     assert by_orig[3] == 1  # joined the NEARER chain (a), not b
+
+
+def _scene_with_gks() -> pd.DataFrame:
+    rows = []
+    for f in range(3):
+        for i, (tid, team_cluster) in enumerate([(1, 0), (2, 0), (3, 1), (4, 1)]):
+            y = 0.3 if team_cluster == 0 else 0.7
+            rows.append({"frame": f, "t_seconds": f / 30.0, "track_id": tid,
+                         "x_pitch": 0.4 + 0.05 * i, "y_pitch": y, "class": "player"})
+        rows.append({"frame": f, "t_seconds": f / 30.0, "track_id": 90,
+                     "x_pitch": 0.5, "y_pitch": 0.05, "class": "goalkeeper"})
+        rows.append({"frame": f, "t_seconds": f / 30.0, "track_id": 91,
+                     "x_pitch": 0.5, "y_pitch": 0.95, "class": "goalkeeper"})
+    return pd.DataFrame(rows)
+
+
+def test_assign_goalkeepers_by_nearest_team() -> None:
+    df = _scene_with_gks()
+    teams = {1: "own", 2: "own", 3: "opp", 4: "opp"}
+    gk = assign_goalkeepers(df, teams)
+    assert gk[90] == "own"   # near the y=0.3 group
+    assert gk[91] == "opp"
+
+
+def test_assign_goalkeepers_unknown_without_covisible_players() -> None:
+    rows = [{"frame": 0, "t_seconds": 0.0, "track_id": 90,
+             "x_pitch": 0.5, "y_pitch": 0.05, "class": "goalkeeper"}]
+    gk = assign_goalkeepers(pd.DataFrame(rows), {})
+    assert gk[90] == "unknown"
+
+
+def test_apply_team_labels_inherits_and_passes_through() -> None:
+    df = _scene_with_gks()
+    df["team"] = "stale"
+    teams = {1: "own", 2: "own", 3: "opp", 4: "opp", 90: "own", 91: "opp"}
+    out = apply_team_labels(df, teams)
+    assert (out.loc[out.track_id == 1, "team"] == "own").all()
+    assert (out.loc[out.track_id == 91, "team"] == "opp").all()
+
+
+def test_apply_team_labels_unknown_for_unmapped() -> None:
+    df = _scene_with_gks()
+    df["team"] = "stale"
+    out = apply_team_labels(df, {1: "own"})
+    assert (out.loc[out.track_id == 3, "team"] == "unknown").all()
+
+
+def test_apply_team_labels_leaves_ball_and_ref_untouched() -> None:
+    df = _scene_with_gks()
+    ball = pd.DataFrame([{"frame": 0, "t_seconds": 0.0, "track_id": -1,
+                          "x_pitch": 0.5, "y_pitch": 0.5, "class": "ball"}])
+    df = pd.concat([df, ball], ignore_index=True)
+    df["team"] = "keepme"
+    out = apply_team_labels(df, {1: "own"})
+    assert (out.loc[out["class"] == "ball", "team"] == "keepme").all()
+
+
+def test_balance_gate() -> None:
+    df = _scene_with_gks()
+    df = apply_team_labels(df, {1: "own", 2: "own", 3: "opp", 4: "opp"})
+    ratio, passed = balance_gate(df)
+    assert np.isclose(ratio, 1.0)
+    assert passed
+    df_bad = apply_team_labels(df, {1: "own", 2: "opp", 3: "opp", 4: "opp"})
+    _ratio_bad, passed_bad = balance_gate(df_bad)
+    assert not passed_bad
+
+
+def test_map_own_cluster_warns_when_ambiguous() -> None:
+    # two centroids equally near the hint -> warn_margin fires.
+    # White anchor Lab is [246, 128, 128]; place both centroids equidistant.
+    centroids = np.array([
+        [247.0, 128.0, 128.0, 0.0, 0.0, 0.0],
+        [245.0, 128.0, 128.0, 0.0, 0.0, 0.0],
+    ])
+    _, warning = map_own_cluster(centroids, "white", warn_margin=1.2)
+    assert warning is not None
+    assert "verify" in warning

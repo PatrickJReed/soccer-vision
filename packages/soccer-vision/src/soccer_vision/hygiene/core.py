@@ -258,3 +258,62 @@ def map_own_cluster(
             f"(d={d[own]:.1f} vs {d[other]:.1f}); verify the contact sheets"
         )
     return own, warning
+
+
+def assign_goalkeepers(
+    traj: pd.DataFrame, player_team_by_track: dict[int, str]
+) -> dict[int, str]:
+    """Assign each goalkeeper track the team whose players are nearest on average.
+
+    Uses frames where the GK has pitch coords; compares mean distance (length-
+    normalized) to own- vs opp-assigned players in the same frames. GK tracks
+    with no usable frames or no co-visible teammates -> 'unknown'.
+    """
+    ar = PitchSpec.standard_9v9().aspect_ratio
+    players = traj[traj["class"] == "player"].dropna(subset=["x_pitch", "y_pitch"]).copy()
+    players["team_label"] = players["track_id"].map(
+        lambda t: player_team_by_track.get(int(t), "unknown")
+    )
+    players = players[players["team_label"].isin(["own", "opp"])]
+    out: dict[int, str] = {}
+    gks = traj[traj["class"] == "goalkeeper"].dropna(subset=["x_pitch", "y_pitch"])
+    for tid, g in gks.groupby("track_id", sort=True):
+        merged = g.merge(players, on="frame", suffixes=("_gk", "_pl"))
+        if merged.empty:
+            out[int(cast(int, tid))] = "unknown"
+            continue
+        dx = (merged["x_pitch_gk"] - merged["x_pitch_pl"]) / ar
+        dy = merged["y_pitch_gk"] - merged["y_pitch_pl"]
+        merged = merged.copy()
+        merged["dist"] = np.hypot(dx, dy)
+        mean_by_team = merged.groupby("team_label")["dist"].mean()
+        out[int(cast(int, tid))] = str(mean_by_team.idxmin())
+    return out
+
+
+def apply_team_labels(
+    traj: pd.DataFrame, team_by_track: dict[int, str]
+) -> pd.DataFrame:
+    """Overwrite player/GK rows' team from {stitched track_id -> own/opp/unknown}.
+
+    Unmapped player/GK tracks become 'unknown'. Ball/referee rows untouched.
+    """
+    out = traj.copy()
+    mask = out["class"].isin(["player", "goalkeeper"])
+    out.loc[mask, "team"] = out.loc[mask, "track_id"].map(
+        lambda t: team_by_track.get(int(t), "unknown")
+    )
+    return out
+
+
+def balance_gate(
+    traj: pd.DataFrame, *, lo: float = 0.6, hi: float = 1.6
+) -> tuple[float, bool]:
+    """Own:opp player-detection ratio over all frames and whether it is in [lo, hi]."""
+    players = traj[traj["class"].isin(["player", "goalkeeper"])]
+    n_own = float((players["team"] == "own").sum())
+    n_opp = float((players["team"] == "opp").sum())
+    if n_opp == 0:
+        return float("inf"), False
+    ratio = n_own / n_opp
+    return ratio, lo <= ratio <= hi

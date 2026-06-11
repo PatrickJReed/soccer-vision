@@ -53,7 +53,8 @@ def test_click_then_state_reports_coverage() -> None:
                   {"frame": f, "kp_idx": int(idx), "x": float(px), "y": float(py)})
         state = _get(f"{base}/api/state")
         assert state["coverage"] > 0.0
-        assert len(state["status"]) == 6
+        assert len(state["status_buckets"]) == 6
+        assert state["bucket_size"] == 1
     finally:
         httpd.shutdown()
 
@@ -75,5 +76,34 @@ def test_frame_endpoint_ignores_cache_buster_query() -> None:
     try:
         with urllib.request.urlopen(f"{base}/api/frame/2?t=12345") as r:
             assert r.read().startswith(b"\xff\xd8")
+    finally:
+        httpd.shutdown()
+
+
+def test_frame_h_includes_residual_and_n_points() -> None:
+    httpd, _ = _serve()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        for f, idx in enumerate([0, 3, 6, 11, 16, 19]):
+            px, py = PITCH_LANDMARKS[idx] * 1000.0
+            _post(f"{base}/api/click",
+                  {"frame": f, "kp_idx": int(idx), "x": float(px), "y": float(py)})
+        fh = _get(f"{base}/api/frame_h/3")
+        assert fh["h"] is not None
+        assert fh["residual"] is not None and fh["residual"] < 0.05
+        assert fh["n_points"] == 6
+        assert _get(f"{base}/api/frame_h/0")["h"] is not None
+    finally:
+        httpd.shutdown()
+
+
+def test_nudge_endpoint_moves_click() -> None:
+    httpd, state = _serve()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        _post(f"{base}/api/click", {"frame": 0, "kp_idx": 0, "x": 0.2, "y": 0.3})
+        out = _post(f"{base}/api/nudge", {"frame": 0, "kp_idx": 0, "x": 0.4, "y": 0.5})
+        assert out["n_clicks"] == 1
+        assert np.isclose(state.clicks[0].x, 0.4)
     finally:
         httpd.shutdown()

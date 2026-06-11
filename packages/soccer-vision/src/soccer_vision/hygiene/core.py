@@ -269,6 +269,8 @@ def assign_goalkeepers(
     normalized) to own- vs opp-assigned players in the same frames. GK tracks
     with no usable frames or no co-visible teammates -> 'unknown'.
     """
+    # NOTE: aspect ratio (like extract_fragments' default) is pinned to the 9v9
+    # spec; thread a PitchSpec through here if this stage ever serves 11v11.
     ar = PitchSpec.standard_9v9().aspect_ratio
     players = traj[traj["class"] == "player"].dropna(subset=["x_pitch", "y_pitch"]).copy()
     players["team_label"] = players["track_id"].map(

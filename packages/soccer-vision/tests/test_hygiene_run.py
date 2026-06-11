@@ -136,3 +136,29 @@ def test_report_json_valid_when_one_team_only(tmp_path: Path) -> None:
     assert saved["balance"]["ratio"] is None
     assert saved["balance"]["passed"] is False
     assert report["warning"] is not None
+
+
+def test_degenerate_same_kit_sets_all_unknown(tmp_path: Path) -> None:
+    # both players wear identical kits -> degenerate clustering -> all unknown.
+    video = tmp_path / "v.mp4"
+    vw = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"mp4v"), 30, (_W, _H))  # type: ignore[attr-defined]
+    for _ in range(_N):
+        frame = np.full((_H, _W, 3), (40, 120, 40), dtype=np.uint8)
+        for x in (60, 220):
+            cv2.rectangle(frame, (x, 100), (x + 30, 130), (255, 255, 255), -1)
+            cv2.rectangle(frame, (x, 130), (x + 30, 150), (150, 60, 20), -1)
+        vw.write(frame)
+    vw.release()
+    traj_path = tmp_path / "traj.parquet"
+    _traj().to_parquet(traj_path, index=False)
+    hom_path = tmp_path / "hom.parquet"
+    homographies_to_parquet(
+        {f: HomographyEntry(_H_PX, "manual", 1.0) for f in range(_N)}, hom_path
+    )
+    out = tmp_path / "out"
+    report = run_hygiene(traj_path=traj_path, homographies_path=hom_path,
+                         video_path=video, out_dir=out, own_kit="white")
+    clean = pd.read_parquet(out / "trajectories_px_clean.parquet")
+    players = clean[clean["class"] == "player"]
+    assert (players["team"] == "unknown").all()
+    assert report["warning"] is not None

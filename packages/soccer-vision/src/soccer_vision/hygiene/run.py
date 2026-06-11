@@ -210,9 +210,15 @@ def run_hygiene(
         )
         cluster_of, centroids = cluster_teams(_features_f, weights, seed=seed)
         centroid_list = [[float(v) for v in c] for c in centroids]
-        if float(np.linalg.norm(centroids[0] - centroids[1])) < 10.0:
+        n0 = sum(1 for c in cluster_of.values() if c == 0)
+        n1 = sum(1 for c in cluster_of.values() if c == 1)
+        minority_frac = min(n0, n1) / max(1, n0 + n1)
+        if float(np.linalg.norm(centroids[0] - centroids[1])) < 10.0 or minority_frac < 0.15:
             team_by_track = {tid: "unknown" for tid in features}
-            warning = "cluster centroids nearly identical; all players set unknown"
+            warning = (
+                "degenerate clustering (near-identical centroids or extreme "
+                f"membership imbalance {n0}:{n1}); all players set unknown"
+            )
         else:
             own_cluster, warning = map_own_cluster(centroids, own_kit)
             label = {own_cluster: "own", 1 - own_cluster: "opp"}

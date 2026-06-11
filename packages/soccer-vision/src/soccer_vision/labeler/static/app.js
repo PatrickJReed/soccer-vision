@@ -1,7 +1,7 @@
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
 const NAMES = []; let LXY = []; let N = 0; let armed = 0; let cur = 0; let showGrid = true;
-let status = []; let placed = new Set(); let clicks = []; let curH = null;
+let status = []; let bucketSize = 1; let nFrames = 0; let placed = new Set(); let clicks = []; let curH = null;
 const img = new Image();
 
 // canonical pitch edges (landmark index pairs) for the reprojected overlay
@@ -67,25 +67,70 @@ function drawFrame(){
 async function loadFrame(i){
   cur=i; document.getElementById("frameNum").textContent=i;
   const fh=await api(`/api/frame_h/${i}`); curH=fh.h;
-  document.getElementById("res").textContent = status[i] || "—";
+  const resEl = document.getElementById("res");
+  if (fh.residual == null) { resEl.textContent = "—"; resEl.style.color = ""; }
+  else {
+    resEl.textContent = fh.residual.toFixed(3) + " (" + fh.n_points + " pts)";
+    resEl.style.color = fh.residual <= 0.05 ? "#39d98a" : "#ffb454";
+  }
   img.onload=drawFrame; img.src=`/api/frame/${i}?t=${Date.now()}`;
 }
 
 function applyState(st){
   N=st.landmark_names.length; for(let i=0;i<N;i++) NAMES[i]=st.landmark_names[i];
-  LXY=st.landmark_xy; status=st.status;
+  LXY=st.landmark_xy;
+  status = st.status_buckets;
+  bucketSize = st.bucket_size;
+  nFrames = st.n_frames;
   document.getElementById("cov").textContent=Math.round(st.coverage*100)+"%";
   document.getElementById("nclicks").textContent=st.n_clicks;
   document.getElementById("scrub").max=st.n_frames-1;
   renderPalette(); renderTimeline(); drawFrame();
 }
 
-canvas.onclick=async(e)=>{
-  const r=canvas.getBoundingClientRect();
-  const x=(e.clientX-r.left)/r.width, y=(e.clientY-r.top)/r.height;
-  clicks.push({frame:cur, kp_idx:armed, x, y}); placed.add(armed);
-  applyState(await postJSON("/api/click",{frame:cur,kp_idx:armed,x,y}));
-  const fh=await api(`/api/frame_h/${cur}`); curH=fh.h; drawFrame();
+let dragging = null;  // {kp_idx, c} while dragging an existing same-frame dot
+let didDrag = false;
+
+function canvasNorm(e){
+  const r = canvas.getBoundingClientRect();
+  return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height];
+}
+
+canvas.onmousedown = (e) => {
+  const [x, y] = canvasNorm(e);
+  dragging = null;
+  for (const c of clicks) {
+    if (c.frame !== cur) continue;
+    const dx = (c.x - x) * canvas.width;
+    const dy = (c.y - y) * canvas.height;
+    if (Math.hypot(dx, dy) < 10) { dragging = { kp_idx: c.kp_idx, c }; return; }
+  }
+};
+
+canvas.onmousemove = (e) => {
+  if (!dragging) return;
+  didDrag = true;
+  const [x, y] = canvasNorm(e);
+  dragging.c.x = x; dragging.c.y = y;   // live local preview
+  drawFrame();
+};
+
+canvas.onmouseup = async (e) => {
+  if (dragging && didDrag) {
+    const [x, y] = canvasNorm(e);
+    applyState(await postJSON("/api/nudge",
+      { frame: cur, kp_idx: dragging.kp_idx, x, y }));
+    const fh = await api(`/api/frame_h/${cur}`); curH = fh.h; drawFrame();
+  }
+  dragging = null;
+};
+
+canvas.onclick = async (e) => {
+  if (didDrag) { didDrag = false; return; }   // suppress synthetic click after drag
+  const [x, y] = canvasNorm(e);
+  clicks.push({ frame: cur, kp_idx: armed, x, y }); placed.add(armed);
+  applyState(await postJSON("/api/click", { frame: cur, kp_idx: armed, x, y }));
+  const fh = await api(`/api/frame_h/${cur}`); curH = fh.h; drawFrame();
 };
 
 document.getElementById("scrub").oninput=(e)=>loadFrame(+e.target.value);
@@ -96,8 +141,13 @@ document.getElementById("undo").onclick=async()=>{clicks.pop();
 document.getElementById("grid").onclick=()=>{showGrid=!showGrid; drawFrame();};
 document.getElementById("export").onclick=async()=>{
   const r=await postJSON("/api/export",{}); alert("Exported to "+r.exported_to);};
-function jumpRed(dir){let i=cur+dir;
-  while(i>=0&&i<status.length){if(status[i]==="red"){loadFrame(i);return;} i+=dir;}}
+function jumpRed(dir){
+  let b = Math.floor(cur / bucketSize) + dir;
+  while(b >= 0 && b < status.length){
+    if(status[b] === "red"){ loadFrame(Math.min(nFrames - 1, b * bucketSize)); return; }
+    b += dir;
+  }
+}
 document.getElementById("nextRed").onclick=()=>jumpRed(1);
 document.getElementById("prevRed").onclick=()=>jumpRed(-1);
 window.onkeydown=(e)=>{ if(e.key>="0"&&e.key<="9"){armed=+e.key; renderPalette();} };

@@ -10,9 +10,12 @@ No I/O. See docs/superpowers/specs/2026-06-11-track-hygiene-design.md.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
+import cv2
 import numpy as np
 import pandas as pd
+from numpy.typing import NDArray
 
 from soccer_vision.pitch.spec import PitchSpec
 
@@ -48,7 +51,7 @@ def extract_fragments(
         last = g.iloc[-1]
         frags.append(
             Fragment(
-                track_id=int(str(tid)),
+                track_id=int(cast(int, tid)),
                 start_frame=int(first["frame"]),
                 end_frame=int(last["frame"]),
                 start_xy=(float(first["x_pitch"]) / ar, float(first["y_pitch"])),
@@ -142,3 +145,116 @@ def stitch_tracks(
             .astype("int64")
         )
     return out
+
+
+def weighted_kmeans2(
+    x: NDArray[np.floating],
+    weights: NDArray[np.floating],
+    *,
+    n_iter: int = 50,
+    seed: int = 0,
+) -> tuple[NDArray[np.int64], NDArray[np.float64]]:
+    """Deterministic weighted 2-means (Lloyd's, farthest-point init).
+
+    Returns (labels (n,), centroids (2, d)). Problem sizes are tiny (hundreds of
+    tracks), so no sklearn dependency.
+    """
+    pts = np.asarray(x, dtype=np.float64)
+    w = np.asarray(weights, dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    first = int(rng.integers(len(pts)))
+    d0 = np.linalg.norm(pts - pts[first], axis=1)
+    second = int(d0.argmax())
+    centroids = np.stack([pts[first], pts[second]])
+    labels = np.full(len(pts), -1, dtype=np.int64)
+    for _it in range(n_iter):
+        d = np.linalg.norm(pts[:, None, :] - centroids[None, :, :], axis=2)
+        new_labels = d.argmin(axis=1).astype(np.int64)
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+        for c in (0, 1):
+            mask = labels == c
+            if mask.any():
+                centroids[c] = np.average(pts[mask], axis=0, weights=w[mask])
+    return labels, centroids
+
+
+def cluster_teams(
+    features: dict[int, NDArray[np.floating]],
+    weights: dict[int, float],
+    *,
+    boundary_ratio: float = 0.6,
+    seed: int = 0,
+) -> tuple[dict[int, int | None], NDArray[np.float64]]:
+    """Cluster per-track kit features into 2 teams.
+
+    Returns ({track_id: 0|1|None}, centroids). None = near the decision boundary
+    (d_near/d_far > boundary_ratio) -> better unknown than wrong.
+    """
+    ids = sorted(features)
+    x = np.stack([np.asarray(features[i], dtype=np.float64) for i in ids])
+    w = np.array([weights[i] for i in ids], dtype=np.float64)
+    labels, centroids = weighted_kmeans2(x, w, seed=seed)
+    out: dict[int, int | None] = {}
+    for row, tid in enumerate(ids):
+        d = np.linalg.norm(centroids - x[row], axis=1)
+        near = int(d.argmin())
+        far = 1 - near
+        if d[far] > 0 and float(d[near]) / float(d[far]) > boundary_ratio:
+            out[tid] = None
+        else:
+            out[tid] = int(labels[row])
+    return out, centroids
+
+
+# BGR anchors for --own-kit color words; converted to Lab at runtime.
+KIT_ANCHORS_BGR: dict[str, tuple[int, int, int]] = {
+    "white": (245, 245, 245),
+    "black": (20, 20, 20),
+    "blue": (200, 80, 30),
+    "dark blue": (110, 40, 10),
+    "navy": (80, 30, 5),
+    "red": (40, 40, 200),
+    "yellow": (40, 210, 230),
+    "green": (60, 160, 40),
+    "orange": (30, 130, 240),
+    "purple": (150, 50, 110),
+}
+
+
+def _lab_anchor(color_word: str) -> NDArray[np.float64]:
+    key = color_word.strip().lower()
+    if key not in KIT_ANCHORS_BGR:
+        raise ValueError(
+            f"unknown kit color {color_word!r}; known: {sorted(KIT_ANCHORS_BGR)}"
+        )
+    bgr = np.array([[KIT_ANCHORS_BGR[key]]], dtype=np.uint8)
+    lab_raw = cast(NDArray[np.uint8], cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB))
+    return np.asarray(lab_raw[0, 0], dtype=np.float64)
+
+
+def map_own_cluster(
+    centroids: NDArray[np.floating],
+    own_kit: str,
+    *,
+    warn_margin: float = 1.2,
+) -> tuple[int, str | None]:
+    """Pick the cluster whose SHIRT Lab centroid (first 3 dims) matches own_kit.
+
+    Returns (own_cluster_index, warning|None). Warns when the two clusters are
+    nearly equidistant from the hint (ratio < warn_margin) — contact sheets
+    arbitrate then.
+    """
+    anchor = _lab_anchor(own_kit)
+    shirt = np.asarray(centroids, dtype=np.float64)[:, :3]
+    d = np.linalg.norm(shirt - anchor, axis=1)
+    own = int(d.argmin())
+    other = 1 - own
+    warning: str | None = None
+    if d[own] > 0 and float(d[other]) / float(d[own]) < warn_margin:
+        warning = (
+            f"--own-kit {own_kit!r} matches both clusters similarly "
+            f"(d={d[own]:.1f} vs {d[other]:.1f}); verify the contact sheets"
+        )
+    return own, warning

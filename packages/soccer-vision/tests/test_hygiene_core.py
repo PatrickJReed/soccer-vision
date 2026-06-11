@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from soccer_vision.hygiene.core import Fragment, extract_fragments, stitch_tracks
+from soccer_vision.hygiene.core import (
+    Fragment,
+    cluster_teams,
+    extract_fragments,
+    map_own_cluster,
+    stitch_tracks,
+    weighted_kmeans2,
+)
 
 
 def _rows(
@@ -97,3 +104,70 @@ def test_stitch_classes_do_not_mix() -> None:
     df = pd.concat([a, b], ignore_index=True)
     out = stitch_tracks(df, fps=30.0)
     assert out.track_id.nunique() == 2
+
+
+def test_weighted_kmeans2_separates_two_blobs() -> None:
+    rng = np.random.default_rng(0)
+    a = rng.normal((0, 0, 0, 0, 0, 0), 0.5, size=(20, 6))
+    b = rng.normal((10, 10, 10, 10, 10, 10), 0.5, size=(20, 6))
+    x = np.vstack([a, b])
+    w = np.ones(40)
+    labels, centroids = weighted_kmeans2(x, w, seed=0)
+    assert set(labels[:20].tolist()) != set(labels[20:].tolist())
+    assert len(set(labels.tolist())) == 2
+    assert centroids.shape == (2, 6)
+
+
+def test_weighted_kmeans2_is_deterministic() -> None:
+    rng = np.random.default_rng(1)
+    x = rng.normal(0, 1, size=(30, 6))
+    w = np.ones(30)
+    l1, _ = weighted_kmeans2(x, w, seed=7)
+    l2, _ = weighted_kmeans2(x, w, seed=7)
+    assert np.array_equal(l1, l2)
+
+
+def test_cluster_teams_boundary_tracks_are_unknown() -> None:
+    # two tight blobs + one feature exactly between them -> None (unknown).
+    feats = {
+        1: np.zeros(6), 2: np.zeros(6) + 0.1,
+        3: np.full(6, 10.0), 4: np.full(6, 10.1),
+        5: np.full(6, 5.0),  # equidistant
+    }
+    weights = {k: 1.0 for k in feats}
+    teams, _centroids = cluster_teams(feats, weights, seed=0)
+    assert teams[5] is None
+    assert teams[1] is not None and teams[3] is not None
+    assert teams[1] != teams[3]
+
+
+def test_map_own_cluster_picks_nearer_shirt_color() -> None:
+    # cluster 0 shirt ~ white (Lab L high, a/b neutral), cluster 1 ~ dark blue.
+    centroids = np.array([
+        [250.0, 128.0, 128.0, 100.0, 128.0, 128.0],   # white shirt
+        [40.0, 130.0, 80.0, 180.0, 120.0, 190.0],     # dark-blue shirt
+    ])
+    own, warning = map_own_cluster(centroids, "white")
+    assert own == 0
+    assert warning is None
+
+
+def test_map_own_cluster_unknown_color_word_raises() -> None:
+    centroids = np.zeros((2, 6))
+    try:
+        map_own_cluster(centroids, "tartan")
+    except ValueError as e:
+        assert "tartan" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_stitch_true_tie_break_prefers_nearer_of_two_eligible() -> None:
+    # two ELIGIBLE chains (both within speed bound); the nearer one wins.
+    a = _rows(1, [0, 10], [(0.5, 0.50), (0.5, 0.50)])
+    b = _rows(2, [0, 10], [(0.5, 0.56), (0.5, 0.56)])
+    c = _rows(3, [20, 30], [(0.5, 0.51), (0.5, 0.51)])  # near a's end, eligible for both
+    df = pd.concat([a, b, c], ignore_index=True)
+    out = stitch_tracks(df, fps=30.0)
+    by_orig = out.groupby("orig_track_id")["track_id"].first()
+    assert by_orig[3] == 1  # joined the NEARER chain (a), not b

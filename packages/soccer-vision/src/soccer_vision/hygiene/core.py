@@ -317,3 +317,64 @@ def balance_gate(
         return float("inf"), False
     ratio = n_own / n_opp
     return ratio, lo <= ratio <= hi
+
+
+@dataclass(frozen=True)
+class AgreementResult:
+    """Frame-level possession agreement vs hand-labeled ground truth."""
+
+    n_compared: int
+    agreement: float
+    disagreements: list[tuple[float, float, str, str]]  # (t_start, t_end, gt, pred)
+
+
+def expand_ground_truth(gt: pd.DataFrame, t_seconds: pd.Series) -> pd.Series:
+    """Expand change-point ground truth (t_seconds, possession) to a per-time series.
+
+    Each row's state holds from its t_seconds until the next row. Times before
+    the first row are 'none'.
+    """
+    gt_sorted = gt.sort_values("t_seconds")
+    idx = (
+        np.searchsorted(gt_sorted["t_seconds"].to_numpy(), t_seconds.to_numpy(), side="right") - 1
+    )
+    states = np.where(
+        idx >= 0,
+        gt_sorted["possession"].to_numpy()[np.clip(idx, 0, None)],
+        "none",
+    )
+    return pd.Series(states, index=t_seconds.index)
+
+
+def possession_agreement(gt: pd.DataFrame, phases: pd.DataFrame) -> AgreementResult:
+    """Compare predicted possession_state with ground truth on team-attributed frames.
+
+    Only frames where BOTH sides say own/opp are compared (loose/contested/
+    unknown/none excluded). Disagreements are merged into contiguous spans.
+    """
+    pred = phases["possession_state"]
+    gt_states = expand_ground_truth(gt, phases["t_seconds"])
+    both = pred.isin(["own", "opp"]) & gt_states.isin(["own", "opp"])
+    n = int(both.sum())
+    if n == 0:
+        return AgreementResult(0, 0.0, [])
+    agree = pred[both] == gt_states[both]
+    spans: list[tuple[float, float, str, str]] = []
+    cur: tuple[float, str, str] | None = None
+    last_t = 0.0
+    for i in phases.index[both]:
+        t = float(phases.loc[i, "t_seconds"])
+        if bool(agree.loc[i]):
+            if cur is not None:
+                spans.append((cur[0], last_t, cur[1], cur[2]))
+                cur = None
+        else:
+            g, p = str(gt_states.loc[i]), str(pred.loc[i])
+            if cur is None or (cur[1], cur[2]) != (g, p):
+                if cur is not None:
+                    spans.append((cur[0], last_t, cur[1], cur[2]))
+                cur = (t, g, p)
+        last_t = t
+    if cur is not None:
+        spans.append((cur[0], last_t, cur[1], cur[2]))
+    return AgreementResult(n, float(agree.mean()), spans)

@@ -10,8 +10,10 @@ from soccer_vision.hygiene.core import (
     assign_goalkeepers,
     balance_gate,
     cluster_teams,
+    expand_ground_truth,
     extract_fragments,
     map_own_cluster,
+    possession_agreement,
     stitch_tracks,
     weighted_kmeans2,
 )
@@ -254,3 +256,67 @@ def test_map_own_cluster_warns_when_ambiguous() -> None:
     _, warning = map_own_cluster(centroids, "white", warn_margin=1.2)
     assert warning is not None
     assert "verify" in warning
+
+
+def test_expand_ground_truth_change_points() -> None:
+    gt = pd.DataFrame({"t_seconds": [0.0, 4.0, 10.0],
+                       "possession": ["own", "opp", "none"]})
+    t = pd.Series([0.0, 2.0, 4.0, 9.9, 10.0, 12.0])
+    states = expand_ground_truth(gt, t)
+    assert states.tolist() == ["own", "own", "opp", "opp", "none", "none"]
+
+
+def test_possession_agreement_counts_team_frames_only() -> None:
+    phases = pd.DataFrame({
+        "frame": range(6),
+        "t_seconds": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+        "possession_state": ["own", "own", "opp", "loose_ball", "opp", "own"],
+    })
+    gt = pd.DataFrame({"t_seconds": [0.0, 2.0],
+                       "possession": ["own", "opp"]})
+    res = possession_agreement(gt, phases)
+    # comparable frames: t=0,1 (own/own, own/own), 2,4 (opp/opp, opp/opp), 5 (opp gt vs own pred)
+    # loose_ball frame excluded.
+    assert res.n_compared == 5
+    assert np.isclose(res.agreement, 4 / 5)
+    assert len(res.disagreements) == 1
+    _t0, _t1, gt_s, pred_s = res.disagreements[0]
+    assert (gt_s, pred_s) == ("opp", "own")
+
+
+def test_possession_agreement_empty_when_nothing_comparable() -> None:
+    phases = pd.DataFrame({
+        "frame": range(3),
+        "t_seconds": [0.0, 1.0, 2.0],
+        "possession_state": ["loose_ball", "loose_ball", "contested"],
+    })
+    gt = pd.DataFrame({"t_seconds": [0.0], "possession": ["own"]})
+    res = possession_agreement(gt, phases)
+    assert res.n_compared == 0
+    assert res.disagreements == []
+
+
+def test_possession_agreement_span_closes_on_agree() -> None:
+    # disagree, disagree, agree -> one span covering the two disagreeing frames.
+    phases = pd.DataFrame({
+        "frame": range(3),
+        "t_seconds": [0.0, 1.0, 2.0],
+        "possession_state": ["own", "own", "opp"],
+    })
+    gt = pd.DataFrame({"t_seconds": [0.0], "possession": ["opp"]})
+    res = possession_agreement(gt, phases)
+    assert res.n_compared == 3
+    assert res.disagreements == [(0.0, 1.0, "opp", "own")]
+
+
+def test_possession_agreement_pair_change_opens_new_span() -> None:
+    # gt own vs pred opp, then gt opp vs pred own -> two distinct spans.
+    phases = pd.DataFrame({
+        "frame": range(2),
+        "t_seconds": [0.0, 1.0],
+        "possession_state": ["opp", "own"],
+    })
+    gt = pd.DataFrame({"t_seconds": [0.0, 1.0], "possession": ["own", "opp"]})
+    res = possession_agreement(gt, phases)
+    assert res.n_compared == 2
+    assert res.disagreements == [(0.0, 0.0, "own", "opp"), (1.0, 1.0, "opp", "own")]

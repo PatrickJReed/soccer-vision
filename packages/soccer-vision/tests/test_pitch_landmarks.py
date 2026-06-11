@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from soccer_vision.pitch.landmarks import (
     FLIP_IDX,
+    LANDMARK_NAMES,
     NEAR_HALFWAY_IDX,
     PITCH_LANDMARKS,
     build_frame_homographies,
@@ -56,6 +57,13 @@ def test_box_corners_symmetric_about_x_center() -> None:
 def test_near_halfway_index_constant() -> None:
     assert NEAR_HALFWAY_IDX == 5
     assert np.allclose(PITCH_LANDMARKS[5], (0.0, 0.5))
+
+
+def test_landmark_names_match_schema() -> None:
+    assert len(LANDMARK_NAMES) == len(PITCH_LANDMARKS)
+    assert LANDMARK_NAMES[0] == "corner_own_left"
+    assert "hidden" in LANDMARK_NAMES[NEAR_HALFWAY_IDX]  # idx 5 flagged never-visible
+    assert all(isinstance(n, str) and n for n in LANDMARK_NAMES)
 
 
 def test_flip_idx_is_an_involution() -> None:

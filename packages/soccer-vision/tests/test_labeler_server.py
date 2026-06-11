@@ -66,3 +66,14 @@ def test_frame_endpoint_returns_bytes() -> None:
             assert r.read().startswith(b"\xff\xd8")
     finally:
         httpd.shutdown()
+
+
+def test_frame_endpoint_ignores_cache_buster_query() -> None:
+    # the browser appends ?t=<ms> to bust the cache; the index parse must ignore it.
+    httpd, _ = _serve()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        with urllib.request.urlopen(f"{base}/api/frame/2?t=12345") as r:
+            assert r.read().startswith(b"\xff\xd8")
+    finally:
+        httpd.shutdown()

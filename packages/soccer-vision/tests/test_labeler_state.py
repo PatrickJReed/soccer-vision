@@ -6,9 +6,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from soccer_vision.labeler.state import LabelerState
+from soccer_vision.labeler.state import LabelerState, clicks_from_keypoints_parquet
 from soccer_vision.pipeline import homographies_from_parquet
 from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
+from soccer_vision.pitch.manual_anchor import Click
 
 _SCALE = 1000.0
 _IDXS = [0, 3, 6, 11, 16, 19]
@@ -54,6 +55,33 @@ def test_export_writes_both_parquets(tmp_path: Path) -> None:
     assert list(kp.columns) == ["frame", "kp_idx", "x_px", "y_px", "conf"]
     assert len(kp) == len(_IDXS)
     assert "source" in hom.columns and (hom["source"] == "manual").all()
+
+
+def test_add_clicks_bulk_matches_individual() -> None:
+    individual = _state()
+    bulk = _state()
+    clicks = []
+    for f, idx in enumerate(_IDXS):
+        px, py = PITCH_LANDMARKS[idx] * _SCALE
+        individual.add_click(frame=f, kp_idx=idx, x=float(px), y=float(py))
+        clicks.append(Click(frame=f, kp_idx=idx, x=float(px), y=float(py)))
+    bulk.add_clicks(clicks)
+    assert bulk.coverage() == individual.coverage()
+    assert bulk.status_list() == individual.status_list()
+
+
+def test_resume_round_trip_restores_coverage(tmp_path: Path) -> None:
+    st = _state()
+    for f, idx in enumerate(_IDXS):
+        px, py = PITCH_LANDMARKS[idx] * _SCALE
+        st.add_click(frame=f, kp_idx=idx, x=float(px), y=float(py))
+    st.export(tmp_path)
+    resumed = clicks_from_keypoints_parquet(tmp_path / "keypoints.parquet", (1920, 1080))
+    st2 = _state()
+    st2.add_clicks(resumed)
+    assert len(st2.clicks) == len(st.clicks)
+    assert st2.coverage() == st.coverage()
+    assert st2.status_list() == st.status_list()
 
 
 def test_export_homography_maps_pixels_to_pitch(tmp_path: Path) -> None:

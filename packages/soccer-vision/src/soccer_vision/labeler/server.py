@@ -104,7 +104,7 @@ def run(
     port: int = 8000,
     downscale_display: float = 0.5,
     export_dir: Path | None = None,
-    window: int = 600,
+    window: int = 360,
     resume: Path | None = None,
 ) -> None:  # pragma: no cover - launches a blocking server
     """Precompute the chain, open the video, and serve the labeler UI.

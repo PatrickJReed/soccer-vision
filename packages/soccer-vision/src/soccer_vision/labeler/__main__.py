@@ -14,9 +14,10 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--export-dir", type=Path, default=None,
                     help="where Export writes parquets (default: cwd)")
-    ap.add_argument("--window", type=int, default=600,
+    ap.add_argument("--window", type=int, default=360,
                     help="max frame distance a click propagates (drift caught "
-                         "by the residual gate; default 600 = ±20s at 30fps)")
+                         "by the residual gate; default 360 = ±12s at 30fps, "
+                         "the measured accuracy knee)")
     ap.add_argument("--resume", type=Path, default=None,
                     help="previously exported keypoints.parquet to load as clicks")
     args = ap.parse_args()

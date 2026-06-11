@@ -39,7 +39,7 @@ class LabelerState:
         n_frames: int,
         *,
         size: tuple[int, int],
-        window: int = 600,
+        window: int = 360,
         residual_threshold: float = 0.05,
     ) -> None:
         self.n_frames = n_frames

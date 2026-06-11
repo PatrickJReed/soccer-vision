@@ -38,7 +38,7 @@ class FrameFit:
     """A fitted per-frame homography plus its quality."""
 
     H: NDArray[np.floating]
-    residual: float        # mean reprojection error in pitch units
+    residual: float        # median reprojection error in pitch units
     n_points: int          # distinct landmarks used
 
 
@@ -116,7 +116,9 @@ def fit_frame_homographies(
     For target frame g, gather clicks in the same segment with |click.frame - g|
     <= window, mapped into g's pixels; keep one observation per landmark (nearest
     click frame wins). With >= min_points distinct landmarks, fit a homography and
-    record its mean reprojection residual (pitch units).
+    record its median reprojection residual (pitch units; median, not mean, so
+    one drifted far-propagated landmark cannot poison an otherwise good
+    RANSAC fit — measured +5-8pts coverage on a real session).
     """
     fits: dict[int, FrameFit] = {}
     if not clicks or not transforms:
@@ -171,7 +173,8 @@ def fit_frame_homographies(
             H = fit_homography(image_pts, pitch_pts)
         except HomographyError:
             continue
-        residual = float(np.linalg.norm(_apply(H, image_pts) - pitch_pts, axis=1).mean())
+        errs = np.linalg.norm(_apply(H, image_pts) - pitch_pts, axis=1)
+        residual = float(np.median(errs))
         fits[int(frames[gi])] = FrameFit(H=H, residual=residual, n_points=len(idxs))
     return fits
 

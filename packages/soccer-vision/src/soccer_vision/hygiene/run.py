@@ -24,7 +24,6 @@ from soccer_vision.hygiene.core import (
     stitch_tracks,
 )
 from soccer_vision.pipeline import homographies_from_parquet
-from soccer_vision.pitch.filter import filter_outside_pitch
 from soccer_vision.pitch.mapper import PitchMapper
 
 _CROPS_PER_TRACK = 10
@@ -174,15 +173,18 @@ def run_hygiene(
     # Step 1: on-pitch filter for player/GK rows; keep-but-flag no-homography rows.
     is_person = mapped["class"].isin(["player", "goalkeeper"])
     has_pitch = mapped["x_pitch"].notna()
-    on_pitch_idx = filter_outside_pitch(mapped[is_person], margin).index
-    mapped["on_pitch"] = mapped.index.isin(on_pitch_idx)
+    person = mapped[is_person]
+    lo, hi = -margin, 1.0 + margin
+    on_mask = person["x_pitch"].between(lo, hi) & person["y_pitch"].between(lo, hi)
+    mapped["on_pitch"] = False
+    mapped.loc[person.index[on_mask], "on_pitch"] = True
     drop = is_person & has_pitch & ~mapped["on_pitch"]
     n_dropped = int(drop.sum())
     kept = mapped[~drop].copy()
 
     # Step 2: stitch fragments in pitch space.
-    person = kept["class"].isin(["player", "goalkeeper"])
-    n_tracks_before = int(kept.loc[person, "track_id"].nunique())
+    is_person_kept = kept["class"].isin(["player", "goalkeeper"])
+    n_tracks_before = int(kept.loc[is_person_kept, "track_id"].nunique())
     stitched = stitch_tracks(kept, fps=fps, max_gap_s=max_gap_s,
                              max_speed_ms=max_speed_ms)
     n_tracks_after = int(
@@ -239,7 +241,7 @@ def run_hygiene(
             if len(person_clean) else 0.0
         ),
         "cluster_centroids_lab": centroid_list,
-        "balance": {"own_opp_ratio": ratio, "passed": passed},
+        "balance": {"ratio": ratio, "passed": passed},
         "warning": warning,
         "params": {"own_kit": own_kit, "max_gap_s": max_gap_s,
                    "max_speed_ms": max_speed_ms, "margin": margin, "fps": fps},

@@ -37,6 +37,22 @@ def _write_video(path: Path) -> None:
 def _traj() -> pd.DataFrame:
     rows = []
     for f in range(_N):
+        # ball and referee rows first (low indices) — this was the layout that
+        # broke the old reset-index on_pitch logic.
+        rows.append({
+            "frame": f, "t_seconds": f / 30.0, "track_id": -1,
+            "x_px": 160.0, "y_px": 120.0,
+            "bbox_x1": 150.0, "bbox_y1": 110.0,
+            "bbox_x2": 170.0, "bbox_y2": 130.0,
+            "class": "ball", "team": "unknown", "conf": 0.9,
+        })
+        rows.append({
+            "frame": f, "t_seconds": f / 30.0, "track_id": 50,
+            "x_px": 100.0, "y_px": 125.0,
+            "bbox_x1": 90.0, "bbox_y1": 100.0,
+            "bbox_x2": 110.0, "bbox_y2": 150.0,
+            "class": "referee", "team": "referee", "conf": 0.9,
+        })
         for tid, (_, _, x) in _KITS.items():
             rows.append({
                 "frame": f, "t_seconds": f / 30.0, "track_id": tid,
@@ -66,16 +82,20 @@ def test_run_hygiene_end_to_end(tmp_path: Path) -> None:
 
     clean = pd.read_parquet(out / "trajectories_px_clean.parquet")
     assert "orig_track_id" in clean.columns
-    teams = clean.groupby("track_id")["team"].first()
+    players_clean = clean[clean["class"] == "player"]
+    teams = players_clean.groupby("track_id")["team"].first()
     assert set(teams.values) == {"own", "opp"}
     assert teams[1] == "own"   # white-shirt track
     assert (out / "hygiene_report.json").exists()
     saved = json.loads((out / "hygiene_report.json").read_text())
+    assert abs(saved["balance"]["ratio"] - 1.0) < 0.5
     assert saved["balance"]["passed"] is True
     sheets = list(out.glob("team_cluster_*.png"))
     assert len(sheets) == 2
     assert any("_OWN" in s.name for s in sheets)
     assert report["balance"]["passed"] is True
+    assert (clean.loc[clean["class"] == "ball", "team"] == "unknown").all()
+    assert set(clean.loc[clean["class"] == "player", "team"]) == {"own", "opp"}
 
 
 def test_run_hygiene_wrong_video_raises(tmp_path: Path) -> None:

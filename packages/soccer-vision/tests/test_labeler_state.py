@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from pathlib import Path
 
 import numpy as np
@@ -101,3 +102,78 @@ def test_export_homography_maps_pixels_to_pitch(tmp_path: Path) -> None:
     out = h @ np.array([1920.0, 1080.0, 1.0])
     out = out[:2] / out[2]
     assert np.allclose(out, PITCH_LANDMARKS[3], atol=1e-6)
+
+
+def _full_recompute_reference(st: LabelerState) -> LabelerState:
+    """Fresh state replaying st's clicks via bulk load (full recompute)."""
+    ref = LabelerState(
+        interframe={i: np.eye(3) for i in range(st.n_frames - 1)},
+        n_frames=st.n_frames, size=st.size, window=st.window,
+    )
+    ref.add_clicks(list(st.clicks))
+    return ref
+
+
+def _assert_fits_equal(a: LabelerState, b: LabelerState) -> None:
+    fa = {f: a.frame_homography(f) for f in range(a.n_frames)}
+    fb = {f: b.frame_homography(f) for f in range(b.n_frames)}
+    keys_a = {f for f, v in fa.items() if v is not None}
+    keys_b = {f for f, v in fb.items() if v is not None}
+    assert keys_a == keys_b
+    for f in keys_a:
+        va, vb = fa[f], fb[f]
+        assert va is not None and vb is not None
+        assert np.allclose(va.H, vb.H)
+        assert np.isclose(va.residual, vb.residual)
+
+
+def test_incremental_equals_full_after_mutation_sequence() -> None:
+    rng = random.Random(0)
+    st = _state(n=40)
+    for _step in range(30):
+        action = rng.random()
+        if action < 0.6 or not st.clicks:
+            idx = rng.choice(_IDXS)
+            px, py = PITCH_LANDMARKS[idx] * _SCALE
+            st.add_click(frame=rng.randrange(40), kp_idx=idx,
+                         x=float(px) + rng.random(), y=float(py) + rng.random())
+        elif action < 0.8:
+            st.remove_last()
+        else:
+            c = st.clicks[rng.randrange(len(st.clicks))]
+            st.nudge_click(c.frame, c.kp_idx, c.x + 0.5, c.y + 0.5)
+    _assert_fits_equal(st, _full_recompute_reference(st))
+
+
+def test_remove_last_clears_lost_fits() -> None:
+    st = _state()
+    for f, idx in enumerate(_IDXS):
+        px, py = PITCH_LANDMARKS[idx] * _SCALE
+        st.add_click(frame=f, kp_idx=idx, x=float(px), y=float(py))
+    assert st.frame_homography(3) is not None
+    for _ in range(3):
+        st.remove_last()
+    # only 3 landmarks remain -> no frame can fit
+    assert all(st.frame_homography(f) is None for f in range(st.n_frames))
+
+
+def test_bulk_add_chunked_matches_unchunked() -> None:
+    st_small_chunk = _state(n=20)
+    st_default = _state(n=20)
+    clicks = []
+    for f, idx in enumerate(_IDXS):
+        px, py = PITCH_LANDMARKS[idx] * _SCALE
+        clicks.append(Click(frame=f * 3, kp_idx=idx, x=float(px), y=float(py)))
+    st_small_chunk.add_clicks(clicks, chunk=4)
+    st_default.add_clicks(clicks)
+    _assert_fits_equal(st_small_chunk, st_default)
+
+
+def test_nudge_click_moves_most_recent_match() -> None:
+    st = _state()
+    st.add_click(0, 0, 0.1, 0.1)
+    st.add_click(0, 0, 0.2, 0.2)   # duplicate (frame, kp_idx)
+    assert st.nudge_click(0, 0, 0.9, 0.9) is True
+    assert np.isclose(st.clicks[1].x, 0.9)   # most recent moved
+    assert np.isclose(st.clicks[0].x, 0.1)   # older untouched
+    assert st.nudge_click(5, 7, 0.5, 0.5) is False

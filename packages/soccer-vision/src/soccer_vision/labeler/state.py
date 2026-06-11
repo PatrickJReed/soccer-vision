@@ -51,25 +51,65 @@ class LabelerState:
         self.clicks: list[Click] = []
         self._fits: dict[int, FrameFit] = {}
 
-    def _recompute(self) -> None:
-        self._fits = fit_frame_homographies(
+    def _refit(self, frames: list[int]) -> None:
+        """Refit exactly `frames`, replacing/removing their cached fits."""
+        sub = fit_frame_homographies(
             self.clicks, self._transforms, self._segment_of,
-            PITCH_LANDMARKS, window=self.window,
+            PITCH_LANDMARKS, window=self.window, frames=frames,
         )
+        for f in frames:
+            if f in sub:
+                self._fits[f] = sub[f]
+            else:
+                self._fits.pop(f, None)
+
+    def _affected(self, frame: int) -> list[int]:
+        """Frames whose fit can change when a click at `frame` mutates."""
+        seg = self._segment_of.get(frame)
+        lo = max(0, frame - self.window)
+        hi = min(self.n_frames - 1, frame + self.window)
+        return [f for f in range(lo, hi + 1) if self._segment_of.get(f) == seg]
+
+    def _recompute_chunked(self, chunk: int = 5000) -> None:
+        self._fits = {}
+        all_frames = sorted(self._transforms)
+        for i in range(0, len(all_frames), chunk):
+            part = all_frames[i:i + chunk]
+            self._fits.update(fit_frame_homographies(
+                self.clicks, self._transforms, self._segment_of,
+                PITCH_LANDMARKS, window=self.window, frames=part,
+            ))
+
+    def _autosave(self) -> None:
+        """Persist clicks to the sidecar (wired up by a later task)."""
 
     def add_click(self, frame: int, kp_idx: int, x: float, y: float) -> None:
         self.clicks.append(Click(frame=frame, kp_idx=kp_idx, x=x, y=y))
-        self._recompute()
+        self._refit(self._affected(frame))
+        self._autosave()
 
-    def add_clicks(self, clicks: Sequence[Click]) -> None:
-        """Bulk-add clicks with a single recompute (used by --resume)."""
+    def add_clicks(self, clicks: Sequence[Click], *, chunk: int = 5000) -> None:
+        """Bulk-add (resume/sidecar load) with one chunked full recompute."""
         self.clicks.extend(clicks)
-        self._recompute()
+        self._recompute_chunked(chunk=chunk)
+        self._autosave()
 
     def remove_last(self) -> None:
         if self.clicks:
-            self.clicks.pop()
-            self._recompute()
+            removed = self.clicks.pop()
+            self._refit(self._affected(removed.frame))
+            self._autosave()
+
+    def nudge_click(self, frame: int, kp_idx: int, x: float, y: float) -> bool:
+        """Move the MOST RECENT click matching (frame, kp_idx). False if none."""
+        for i in range(len(self.clicks) - 1, -1, -1):
+            c = self.clicks[i]
+            if c.frame == frame and c.kp_idx == kp_idx:
+                self.clicks[i] = Click(frame=frame, kp_idx=kp_idx, x=x, y=y)
+                self._refit(self._affected(frame))
+                self._autosave()
+                return True
+        return False
 
     def coverage(self) -> float:
         return coverage_fraction(

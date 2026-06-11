@@ -7,7 +7,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from soccer_vision.labeler.state import LabelerState, clicks_from_keypoints_parquet
+from soccer_vision.labeler.state import (
+    LabelerState,
+    clicks_from_keypoints_parquet,
+    clicks_from_sidecar,
+)
 from soccer_vision.pipeline import homographies_from_parquet
 from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 from soccer_vision.pitch.manual_anchor import Click
@@ -177,3 +181,57 @@ def test_nudge_click_moves_most_recent_match() -> None:
     assert np.isclose(st.clicks[1].x, 0.9)   # most recent moved
     assert np.isclose(st.clicks[0].x, 0.1)   # older untouched
     assert st.nudge_click(5, 7, 0.5, 0.5) is False
+
+
+def test_autosave_writes_and_loads_round_trip(tmp_path: Path) -> None:
+    side = tmp_path / "v.clicks.json"
+    st = LabelerState(
+        interframe={i: np.eye(3) for i in range(5)},
+        n_frames=6, size=(1920, 1080), window=10, autosave_path=side,
+    )
+    st.add_click(0, 0, 0.25, 0.5)
+    st.add_click(1, 3, 0.75, 0.5)
+    assert side.exists()
+    loaded = clicks_from_sidecar(side)
+    assert [(c.frame, c.kp_idx) for c in loaded] == [(0, 0), (1, 3)]
+    assert np.isclose(loaded[0].x, 0.25)
+
+
+def test_autosave_updates_on_undo_and_nudge(tmp_path: Path) -> None:
+    side = tmp_path / "v.clicks.json"
+    st = LabelerState(
+        interframe={i: np.eye(3) for i in range(5)},
+        n_frames=6, size=(1920, 1080), window=10, autosave_path=side,
+    )
+    st.add_click(0, 0, 0.25, 0.5)
+    st.add_click(1, 3, 0.75, 0.5)
+    st.nudge_click(1, 3, 0.8, 0.6)
+    assert np.isclose(clicks_from_sidecar(side)[1].x, 0.8)
+    st.remove_last()
+    assert len(clicks_from_sidecar(side)) == 1
+
+
+def test_status_buckets_worst_status_rule() -> None:
+    st = _state(n=12)
+    for f, idx in enumerate(_IDXS):
+        px, py = PITCH_LANDMARKS[idx] * _SCALE
+        st.add_click(frame=f, kp_idx=idx, x=float(px), y=float(py))
+    buckets, bucket_size = st.status_buckets(n_buckets=4)
+    assert len(buckets) == 4
+    assert bucket_size == 3
+    full = st.status_list()
+    for b in range(4):
+        states = full[b * bucket_size:(b + 1) * bucket_size]
+        if "red" in states:
+            assert buckets[b] == "red"
+        elif "yellow" in states:
+            assert buckets[b] == "yellow"
+        else:
+            assert buckets[b] == "green"
+
+
+def test_status_buckets_passthrough_when_few_frames() -> None:
+    st = _state(n=6)
+    buckets, bucket_size = st.status_buckets(n_buckets=1200)
+    assert bucket_size == 1
+    assert buckets == st.status_list()

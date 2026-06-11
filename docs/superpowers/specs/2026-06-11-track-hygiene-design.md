@@ -80,7 +80,8 @@ Per class (player, goalkeeper separately):
 - Sort fragments by start frame. Greedily chain: fragment B continues chain A if
   B starts within `max_gap_s` (default 2.0 s) after A ends AND B's start pitch
   position is within physical reach of A's end: `dist ≤ max_speed × gap + slack`
-  (defaults: max_speed 8 m/s — youth sprint; slack covers detection jitter).
+  (defaults: max_speed 8 m/s — youth sprint; slack 0.02 pitch-length units
+  covers detection/box-center jitter).
   Distance is computed in length-normalized pitch units, correcting the x-axis
   by the PitchSpec aspect ratio (x is width-normalized).
 - Nearest-in-space wins among time-eligible candidates; each fragment joins at
@@ -96,8 +97,9 @@ Per class (player, goalkeeper separately):
 - Feature per track: robust median Lab color of shirt + shorts regions (6-dim).
   Both are used deliberately — kits are often doubly separable (here:
   white/blue vs dark-blue/yellow).
-- K-means k=2 over track features, tracks weighted by length. Tracks near the
-  decision boundary → `team="unknown"` (better unknown than wrong).
+- K-means k=2 over track features, tracks weighted by length. A track is near the decision
+  boundary when its distances to the two centroids are within 20% of each
+  other (d_near/d_far > 0.8) → `team="unknown"` (better unknown than wrong).
 - `--own-kit <color>`: a small word→Lab anchor table ("white", "blue",
   "dark blue", "yellow", "red", "green", "black", "orange", "purple"); the
   cluster whose shirt centroid is nearest the hint becomes "own".

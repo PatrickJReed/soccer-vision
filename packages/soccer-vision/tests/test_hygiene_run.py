@@ -114,3 +114,25 @@ def test_run_hygiene_wrong_video_raises(tmp_path: Path) -> None:
         assert "wrong video" in str(e)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_report_json_valid_when_one_team_only(tmp_path: Path) -> None:
+    # one player track only -> features < 2 -> all unknown -> n_opp == 0 ->
+    # ratio must serialize as null, not the invalid-JSON token Infinity.
+    video = tmp_path / "v.mp4"
+    _write_video(video)
+    traj = _traj()
+    traj = traj[traj["track_id"].isin([-1, 50, 1])]  # ball, ref, one player
+    traj_path = tmp_path / "traj.parquet"
+    traj.to_parquet(traj_path, index=False)
+    hom_path = tmp_path / "hom.parquet"
+    homographies_to_parquet(
+        {f: HomographyEntry(_H_PX, "manual", 1.0) for f in range(_N)}, hom_path
+    )
+    out = tmp_path / "out"
+    report = run_hygiene(traj_path=traj_path, homographies_path=hom_path,
+                         video_path=video, out_dir=out, own_kit="white")
+    saved = json.loads((out / "hygiene_report.json").read_text())
+    assert saved["balance"]["ratio"] is None
+    assert saved["balance"]["passed"] is False
+    assert report["warning"] is not None

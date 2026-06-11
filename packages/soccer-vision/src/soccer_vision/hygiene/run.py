@@ -7,6 +7,7 @@ trajectories_px_clean.parquet, contact sheets, and hygiene_report.json.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, cast
 
@@ -74,6 +75,9 @@ def extract_track_features(
     Only rows flagged on_pitch contribute (adjacent-field and no-homography rows
     are excluded from features). Reads the video once, sequentially.
     """
+    # Goalkeepers are intentionally excluded: GK jerseys differ from outfield
+    # kit, so they'd pollute the 2-cluster fit. They're assigned positionally
+    # in run_hygiene step 4.
     players = traj[(traj["class"] == "player") & traj["on_pitch"]]
     wanted: dict[int, list[tuple[int, tuple[float, float, float, float]]]] = {}
     for tid, g in players.groupby("track_id", sort=True):
@@ -99,7 +103,8 @@ def extract_track_features(
             if not ok:
                 continue
             for tid, (x1, y1, x2, y2) in wanted[f]:
-                raw = frame[max(0, int(y1)):int(y2), max(0, int(x1)):int(x2)]
+                raw = frame[max(0, int(y1)):max(0, int(y2)),
+                             max(0, int(x1)):max(0, int(x2))]
                 crop: NDArray[np.uint8] = np.asarray(raw, dtype=np.uint8)
                 shirt = _region_lab(crop, 0.15, 0.50)
                 shorts = _region_lab(crop, 0.50, 0.80)
@@ -241,7 +246,8 @@ def run_hygiene(
             if len(person_clean) else 0.0
         ),
         "cluster_centroids_lab": centroid_list,
-        "balance": {"ratio": ratio, "passed": passed},
+        "balance": {"ratio": ratio if math.isfinite(ratio) else None,
+                    "passed": passed},
         "warning": warning,
         "params": {"own_kit": own_kit, "max_gap_s": max_gap_s,
                    "max_speed_ms": max_speed_ms, "margin": margin, "fps": fps},

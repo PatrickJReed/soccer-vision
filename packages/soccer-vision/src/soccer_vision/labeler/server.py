@@ -70,6 +70,11 @@ def make_handler(
                            "application/javascript")
             elif path == "/api/state":
                 self._json(self._state_payload())
+            elif path == "/api/clicks":
+                self._json({"clicks": [
+                    {"frame": c.frame, "kp_idx": c.kp_idx, "x": c.x, "y": c.y}
+                    for c in state.clicks
+                ]})
             elif path.startswith("/api/frame_h/"):
                 idx = int(path.rsplit("/", 1)[1])
                 fit = state.frame_homography(idx)

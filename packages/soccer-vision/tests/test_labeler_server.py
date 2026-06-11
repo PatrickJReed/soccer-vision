@@ -121,3 +121,14 @@ def test_nudge_endpoint_404_when_no_match() -> None:
         raise AssertionError("expected HTTP 404")
     finally:
         httpd.shutdown()
+
+
+def test_clicks_endpoint_returns_session_clicks() -> None:
+    httpd, _ = _serve()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        _post(f"{base}/api/click", {"frame": 2, "kp_idx": 4, "x": 0.3, "y": 0.6})
+        out = _get(f"{base}/api/clicks")
+        assert out["clicks"] == [{"frame": 2, "kp_idx": 4, "x": 0.3, "y": 0.6}]
+    finally:
+        httpd.shutdown()

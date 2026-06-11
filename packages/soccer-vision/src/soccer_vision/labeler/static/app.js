@@ -152,4 +152,10 @@ document.getElementById("nextRed").onclick=()=>jumpRed(1);
 document.getElementById("prevRed").onclick=()=>jumpRed(-1);
 window.onkeydown=(e)=>{ if(e.key>="0"&&e.key<="9"){armed=+e.key; renderPalette();} };
 
-(async()=>{applyState(await api("/api/state")); loadFrame(0);})();
+(async()=>{
+  const cl = await api("/api/clicks");
+  clicks = cl.clicks;
+  placed = new Set(clicks.map(c=>c.kp_idx));
+  applyState(await api("/api/state"));
+  loadFrame(0);
+})();

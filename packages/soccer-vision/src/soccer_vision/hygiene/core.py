@@ -184,7 +184,7 @@ def cluster_teams(
     features: dict[int, NDArray[np.floating]],
     weights: dict[int, float],
     *,
-    boundary_ratio: float = 0.6,
+    boundary_ratio: float = 0.8,
     seed: int = 0,
 ) -> tuple[dict[int, int | None], NDArray[np.float64]]:
     """Cluster per-track kit features into 2 teams.

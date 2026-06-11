@@ -128,13 +128,15 @@ def test_weighted_kmeans2_is_deterministic() -> None:
 
 
 def test_cluster_teams_boundary_tracks_are_unknown() -> None:
-    # two tight blobs + one feature exactly between them -> None (unknown).
+    # two tight blobs + one feature midway between them. The midpoint gets a
+    # tiny weight so it cannot drag its cluster's centroid (mirrors real data,
+    # where dozens of tracks anchor each centroid) -> ratio ~1 -> unknown.
     feats = {
         1: np.zeros(6), 2: np.zeros(6) + 0.1,
         3: np.full(6, 10.0), 4: np.full(6, 10.1),
-        5: np.full(6, 5.0),  # equidistant
+        5: np.full(6, 5.0),  # equidistant midpoint
     }
-    weights = {k: 1.0 for k in feats}
+    weights = {1: 10.0, 2: 10.0, 3: 10.0, 4: 10.0, 5: 0.01}
     teams, _centroids = cluster_teams(feats, weights, seed=0)
     assert teams[5] is None
     assert teams[1] is not None and teams[3] is not None

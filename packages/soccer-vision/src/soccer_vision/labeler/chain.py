@@ -190,6 +190,8 @@ def compute_chain(
             for i in range(n_workers)
             if bounds[i] < bounds[i + 1]
         ]
+        # A worker exception aborts the whole precompute (no partial cache is
+        # written) — rerun after fixing the video; completed chunks are not kept.
         with Pool(processes=len(jobs)) as pool:
             for part in pool.imap_unordered(_chain_worker, jobs):
                 interframe_px.update(part)

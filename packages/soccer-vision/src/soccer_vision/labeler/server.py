@@ -148,6 +148,10 @@ def run(
         autosave_path=sidecar,
     )
     if resume is not None:
+        if sidecar.exists():
+            backup = sidecar.parent / (sidecar.name + ".bak")
+            sidecar.replace(backup)
+            print(f"existing autosave backed up to {backup}")
         state.add_clicks(clicks_from_keypoints_parquet(resume, size))
         print(f"resumed {len(state.clicks)} clicks from {resume}")
     elif sidecar.exists():

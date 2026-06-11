@@ -99,7 +99,8 @@ function canvasNorm(e){
 canvas.onmousedown = (e) => {
   const [x, y] = canvasNorm(e);
   dragging = null;
-  for (const c of clicks) {
+  for (let i = clicks.length - 1; i >= 0; i--) {
+    const c = clicks[i];
     if (c.frame !== cur) continue;
     const dx = (c.x - x) * canvas.width;
     const dy = (c.y - y) * canvas.height;

@@ -235,3 +235,23 @@ def test_status_buckets_passthrough_when_few_frames() -> None:
     buckets, bucket_size = st.status_buckets(n_buckets=1200)
     assert bucket_size == 1
     assert buckets == st.status_list()
+
+
+def test_status_buckets_mixed_colors() -> None:
+    # window=1 so only frames 0 and 1 (adjacent to the click) can get fits ->
+    # frames 2-11 remain red; sanity: both green and red must appear.
+    st = LabelerState(
+        interframe={i: np.eye(3) for i in range(11)},
+        n_frames=12, size=(1920, 1080), window=1,
+    )
+    for idx in _IDXS:
+        px, py = PITCH_LANDMARKS[idx] * _SCALE
+        st.add_click(frame=0, kp_idx=idx, x=float(px), y=float(py))
+    full = st.status_list()
+    assert "green" in full and "red" in full   # fixture sanity
+    buckets, bucket_size = st.status_buckets(n_buckets=4)
+    assert "red" in buckets
+    for b, chunk_start in enumerate(range(0, 12, bucket_size)):
+        chunk = full[chunk_start:chunk_start + bucket_size]
+        expected = "red" if "red" in chunk else ("yellow" if "yellow" in chunk else "green")
+        assert buckets[b] == expected

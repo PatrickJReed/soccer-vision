@@ -320,3 +320,16 @@ def test_possession_agreement_pair_change_opens_new_span() -> None:
     res = possession_agreement(gt, phases)
     assert res.n_compared == 2
     assert res.disagreements == [(0.0, 0.0, "own", "opp"), (1.0, 1.0, "opp", "own")]
+
+
+def test_expand_ground_truth_before_first_row_is_none() -> None:
+    gt = pd.DataFrame({"t_seconds": [5.0], "possession": ["own"]})
+    t = pd.Series([0.0, 4.9, 5.0])
+    assert expand_ground_truth(gt, t).tolist() == ["none", "none", "own"]
+
+
+def test_balance_gate_no_opp_returns_inf_false() -> None:
+    df = pd.DataFrame([{"class": "player", "team": "own"}])
+    ratio, passed = balance_gate(df)
+    assert ratio == float("inf")
+    assert not passed

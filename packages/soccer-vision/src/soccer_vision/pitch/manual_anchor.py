@@ -110,6 +110,7 @@ def fit_frame_homographies(
     *,
     window: int,
     min_points: int = 4,
+    frames: Sequence[int] | None = None,
 ) -> dict[int, FrameFit]:
     """Fit each frame's image->pitch homography from clicks propagated into it.
 
@@ -119,6 +120,9 @@ def fit_frame_homographies(
     record its median reprojection residual (pitch units; median, not mean, so
     one drifted far-propagated landmark cannot poison an otherwise good
     RANSAC fit — measured +5-8pts coverage on a real session).
+
+    frames: restrict fitting to these target frames (candidate clicks still come
+        from anywhere within the window); None = all frames.
     """
     fits: dict[int, FrameFit] = {}
     if not clicks or not transforms:
@@ -128,12 +132,17 @@ def fit_frame_homographies(
     # nearest usable click per (landmark, frame). Semantics match the original
     # per-frame loop: |click.frame - g| <= window, same segment, nearest click
     # frame wins (first in click order on ties).
-    frames = np.array(sorted(transforms), dtype=np.int64)
-    n = len(frames)
-    m_stack = np.stack([np.asarray(transforms[int(f)], dtype=np.float64) for f in frames])
+    if frames is None:
+        target = sorted(transforms)
+    else:
+        target = sorted(set(transforms) & {int(f) for f in frames})
+    if not target:
+        return fits
+    frame_arr = np.array(target, dtype=np.int64)
+    n = len(frame_arr)
+    m_stack = np.stack([np.asarray(transforms[int(f)], dtype=np.float64) for f in frame_arr])
     m_inv = np.linalg.inv(m_stack)
-    frame_seg = np.array([segment_of[int(f)] for f in frames], dtype=np.int64)
-    index_of = {int(f): i for i, f in enumerate(frames)}
+    frame_seg = np.array([segment_of[int(f)] for f in frame_arr], dtype=np.int64)
 
     k = len(clicks)
     click_frame = np.array([c.frame for c in clicks], dtype=np.int64)
@@ -142,14 +151,14 @@ def fit_frame_homographies(
 
     pos = np.full((k, n, 2), np.nan)  # pos[j, g] = click j's pixel in frame g
     for j, c in enumerate(clicks):
-        src = index_of.get(c.frame)
-        if src is None:
+        src_m = transforms.get(c.frame)
+        if src_m is None:
             continue
-        ref = m_stack[src] @ np.array([c.x, c.y, 1.0])
+        ref = np.asarray(src_m, dtype=np.float64) @ np.array([c.x, c.y, 1.0])
         dst = m_inv @ ref
         pos[j] = dst[:, :2] / dst[:, 2:3]
 
-    dist = np.abs(click_frame[:, None] - frames[None, :])  # (k, n)
+    dist = np.abs(click_frame[:, None] - frame_arr[None, :])  # (k, n)
     usable = (click_seg[:, None] == frame_seg[None, :]) & (dist <= window)
     usable &= ~np.isnan(pos[:, :, 0])
 
@@ -175,7 +184,7 @@ def fit_frame_homographies(
             continue
         errs = np.linalg.norm(_apply(H, image_pts) - pitch_pts, axis=1)
         residual = float(np.median(errs))
-        fits[int(frames[gi])] = FrameFit(H=H, residual=residual, n_points=len(idxs))
+        fits[int(frame_arr[gi])] = FrameFit(H=H, residual=residual, n_points=len(idxs))
     return fits
 
 

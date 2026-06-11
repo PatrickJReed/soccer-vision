@@ -104,15 +104,27 @@ def run(
     port: int = 8000,
     downscale_display: float = 0.5,
     export_dir: Path | None = None,
+    window: int = 600,
+    resume: Path | None = None,
 ) -> None:  # pragma: no cover - launches a blocking server
-    """Precompute the chain, open the video, and serve the labeler UI."""
+    """Precompute the chain, open the video, and serve the labeler UI.
+
+    resume: a previously exported keypoints.parquet — its clicks are loaded
+    into the session (converted back from full-pixel to normalized coords).
+    """
     import cv2
 
     from soccer_vision.labeler.chain import compute_chain
+    from soccer_vision.labeler.state import clicks_from_keypoints_parquet
     from soccer_vision.pitch.landmarks import LANDMARK_NAMES, PITCH_LANDMARKS
 
     interframe, n_frames, size = compute_chain(video_path)
-    state = LabelerState(interframe=interframe, n_frames=n_frames, size=size)
+    state = LabelerState(
+        interframe=interframe, n_frames=n_frames, size=size, window=window
+    )
+    if resume is not None:
+        state.add_clicks(clicks_from_keypoints_parquet(resume, size))
+        print(f"resumed {len(state.clicks)} clicks from {resume}")
     cap = cv2.VideoCapture(str(video_path))
 
     def frame_jpeg(idx: int) -> bytes:

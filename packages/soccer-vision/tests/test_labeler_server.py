@@ -7,6 +7,7 @@ import threading
 import urllib.request
 from http.server import HTTPServer
 from typing import Any
+from urllib.error import HTTPError
 
 import numpy as np
 from soccer_vision.labeler.server import make_handler
@@ -105,5 +106,18 @@ def test_nudge_endpoint_moves_click() -> None:
         out = _post(f"{base}/api/nudge", {"frame": 0, "kp_idx": 0, "x": 0.4, "y": 0.5})
         assert out["n_clicks"] == 1
         assert np.isclose(state.clicks[0].x, 0.4)
+    finally:
+        httpd.shutdown()
+
+
+def test_nudge_endpoint_404_when_no_match() -> None:
+    httpd, _ = _serve()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        _post(f"{base}/api/nudge", {"frame": 9, "kp_idx": 9, "x": 0.1, "y": 0.1})
+    except HTTPError as e:
+        assert e.code == 404
+    else:
+        raise AssertionError("expected HTTP 404")
     finally:
         httpd.shutdown()

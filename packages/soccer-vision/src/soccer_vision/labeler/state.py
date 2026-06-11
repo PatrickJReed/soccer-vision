@@ -88,6 +88,7 @@ class LabelerState:
         """Atomically persist normalized clicks to the sidecar (if configured)."""
         if self.autosave_path is None:
             return
+        self.autosave_path.parent.mkdir(parents=True, exist_ok=True)
         payload = [
             {"frame": c.frame, "kp_idx": c.kp_idx, "x": c.x, "y": c.y}
             for c in self.clicks

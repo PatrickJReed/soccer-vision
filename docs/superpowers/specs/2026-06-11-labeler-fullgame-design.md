@@ -101,8 +101,8 @@ frame of the next/previous red bucket. Scrubbing remains frame-accurate.
   by the status color.
 - **Point nudge:** mousedown within ~10 px (canvas space) of a dot placed ON
   the current frame arms a drag; mouseup POSTs `/api/nudge {frame, kp_idx, x,
-  y}` (normalized coords); the server updates that click in place (the click
-  matching frame + kp_idx), autosaves, incrementally refits ±window, and
+  y}` (normalized coords); the server updates that click in place (the MOST RECENT click
+  matching frame + kp_idx, if duplicates exist), autosaves, incrementally refits ±window, and
   returns the state payload. Propagated (dashed/other-frame) dots are not
   draggable.
 

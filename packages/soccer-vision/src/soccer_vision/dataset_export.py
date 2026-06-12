@@ -55,8 +55,9 @@ def select_frames(
 def build_data_yaml(out_dir: Path) -> None:
     """Write a complete YOLOv8-pose data.yaml (kpt_shape + flip_idx included)."""
     flip = ", ".join(str(i) for i in FLIP_IDX)
+    # No "path:" key: ultralytics then anchors train/val to the yaml's own
+    # directory. ("path: ." resolves against the process CWD — broke on Colab.)
     text = (
-        "path: .\n"
         "train: images/train\n"
         "val: images/val\n"
         "nc: 1\n"

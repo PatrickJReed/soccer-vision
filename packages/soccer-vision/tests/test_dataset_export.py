@@ -61,7 +61,7 @@ def test_build_data_yaml_contents(tmp_path: Path) -> None:
     assert cfg["flip_idx"] == list(FLIP_IDX)
     assert cfg["train"] == "images/train"
     assert cfg["val"] == "images/val"
-    assert cfg["path"] == "."
+    assert "path" not in cfg
 
 
 _W, _H, _N = 320, 240, 60

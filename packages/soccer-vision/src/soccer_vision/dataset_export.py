@@ -71,12 +71,18 @@ def _draw_keypoints(
     frame: NDArray[np.uint8], kpts: NDArray[np.floating]
 ) -> NDArray[np.uint8]:
     out = frame.copy()
+    # markers sized relative to frame width so they survive contact-sheet downscale
+    radius = max(5, frame.shape[1] // 100)
+    font_scale = max(0.45, frame.shape[1] / 1100)
+    thickness = max(1, frame.shape[1] // 640)
     for idx, (x, y, v) in enumerate(kpts):
         if v <= 0:
             continue
-        cv2.circle(out, (int(x), int(y)), 5, (60, 220, 120), -1)
-        cv2.putText(out, str(idx), (int(x) + 6, int(y) - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        cv2.circle(out, (int(x), int(y)), radius, (60, 220, 120), -1)
+        cv2.circle(out, (int(x), int(y)), radius, (0, 0, 0), 2)
+        cv2.putText(out, str(idx), (int(x) + radius + 2, int(y) - radius - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255),
+                    thickness)
     return out
 
 

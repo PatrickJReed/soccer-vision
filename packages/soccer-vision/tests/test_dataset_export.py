@@ -148,3 +148,20 @@ def test_main_end_to_end_with_zip(tmp_path: Path) -> None:
     main(["--game", str(video), str(homs), "--out-dir", str(out), "--zip"])
     assert (out / "data.yaml").exists()
     assert (tmp_path / "ds.zip").exists()
+
+
+def test_qa_sheet_dots_survive_downscale(tmp_path: Path) -> None:
+    # dots drawn on a hi-res frame must remain detectable after the sheet's
+    # 480px-cell downscale (the acceptance run caught them vanishing).
+    from soccer_vision.dataset_export import _draw_keypoints, _write_qa_sheet
+
+    frame = np.full((1080, 1920, 3), (40, 120, 40), dtype=np.uint8)
+    kpts = np.zeros((21, 3))
+    kpts[0] = [960.0, 540.0, 2.0]
+    kpts[3] = [400.0, 300.0, 2.0]
+    cell = _draw_keypoints(frame, kpts)
+    _write_qa_sheet([cell], tmp_path / "qa.jpg")
+    sheet = cv2.imread(str(tmp_path / "qa.jpg"))
+    assert sheet is not None, "qa.jpg was not written"
+    mask = (np.abs(sheet.astype(int) - np.array([60, 220, 120])).sum(axis=2) < 90)
+    assert int(mask.sum()) > 10   # green markers detectable post-downscale

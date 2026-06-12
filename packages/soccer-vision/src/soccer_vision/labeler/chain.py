@@ -8,7 +8,9 @@ video is instant.
 from __future__ import annotations
 
 import hashlib
+import os
 from collections.abc import Mapping
+from multiprocessing import Pool
 from pathlib import Path
 
 import cv2
@@ -87,24 +89,12 @@ def _video_hash(video_path: Path) -> str:
     return hashlib.sha1(key.encode()).hexdigest()[:16]
 
 
-def compute_chain(
-    video_path: Path,
-    *,
-    cache_dir: Path | None = None,
-    downscale: float = 1.0,
-    player_boxes: pd.DataFrame | None = None,
-) -> tuple[dict[int, NDArray[np.float64]], int, tuple[int, int]]:
-    """Inter-frame chain for the whole video (cached). Returns (interframe, n, (w,h))."""
-    cache_dir = Path(cache_dir or (Path(video_path).parent / ".sv_labeler_cache"))
-    cache_path = cache_dir / f"{_video_hash(video_path)}.npz"
-    cached = load_chain(cache_path)
-    if cached is not None:
-        return cached
-
-    cap = cv2.VideoCapture(str(video_path))
-    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+def _chain_worker(
+    args: tuple[str, int, int, float],
+) -> dict[int, NDArray[np.float64]]:
+    """Register pairs [start, end) of one video chunk (runs in a subprocess)."""
+    video_path, start, end, downscale = args
+    cap = cv2.VideoCapture(video_path)
     pos = 0
 
     def read_frame(idx: int) -> NDArray[np.uint8] | None:
@@ -120,16 +110,92 @@ def compute_chain(
         pos += 1
         return frame if ok else None  # type: ignore[return-value]
 
-    boxes = player_boxes if player_boxes is not None else pd.DataFrame(
+    boxes = pd.DataFrame(
         columns=["frame", "class", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2"]
     )
-    needed = set(range(n_frames - 1))
     try:
-        interframe_px = compute_interframe_homographies(
-            read_frame, needed, boxes, downscale=downscale
+        result: dict[int, NDArray[np.floating]] = compute_interframe_homographies(
+            read_frame, set(range(start, end)), boxes, downscale=downscale
         )
+        return {k: np.asarray(v, dtype=np.float64) for k, v in result.items()}
     finally:
         cap.release()
+
+
+def compute_chain(
+    video_path: Path,
+    *,
+    cache_dir: Path | None = None,
+    downscale: float = 1.0,
+    player_boxes: pd.DataFrame | None = None,
+    workers: int | None = None,
+) -> tuple[dict[int, NDArray[np.float64]], int, tuple[int, int]]:
+    """Inter-frame chain for the whole video (cached). Returns (interframe, n, (w,h)).
+
+    workers: parallel chunked registration; None = cpu_count()-1; forced to 1
+    when player_boxes is given (masking data is not carried into workers).
+    """
+    cache_dir = Path(cache_dir or (Path(video_path).parent / ".sv_labeler_cache"))
+    cache_path = cache_dir / f"{_video_hash(video_path)}.npz"
+    cached = load_chain(cache_path)
+    if cached is not None:
+        return cached
+
+    # Probe the video for metadata, then release.
+    probe = cv2.VideoCapture(str(video_path))
+    n_frames = int(probe.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+    height = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+    probe.release()
+
+    n_workers = workers if workers is not None else max(1, (os.cpu_count() or 2) - 1)
+    if player_boxes is not None:
+        n_workers = 1
+
+    interframe_px: dict[int, NDArray[np.floating]] = {}
+
+    if n_workers <= 1:
+        # Serial path — identical to original code.
+        cap = cv2.VideoCapture(str(video_path))
+        pos = 0
+
+        def read_frame(idx: int) -> NDArray[np.uint8] | None:
+            nonlocal pos
+            if idx < pos:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                pos = idx
+            while pos < idx:
+                if not cap.grab():
+                    return None
+                pos += 1
+            ok, frame = cap.read()
+            pos += 1
+            return frame if ok else None  # type: ignore[return-value]
+
+        boxes = player_boxes if player_boxes is not None else pd.DataFrame(
+            columns=["frame", "class", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2"]
+        )
+        needed = set(range(n_frames - 1))
+        try:
+            interframe_px = compute_interframe_homographies(
+                read_frame, needed, boxes, downscale=downscale
+            )
+        finally:
+            cap.release()
+    else:
+        n_pairs = n_frames - 1
+        bounds = np.linspace(0, n_pairs, n_workers + 1).astype(int)
+        jobs = [
+            (str(video_path), int(bounds[i]), int(bounds[i + 1]), downscale)
+            for i in range(n_workers)
+            if bounds[i] < bounds[i + 1]
+        ]
+        # A worker exception aborts the whole precompute (no partial cache is
+        # written) — rerun after fixing the video; completed chunks are not kept.
+        with Pool(processes=len(jobs)) as pool:
+            for part in pool.imap_unordered(_chain_worker, jobs):
+                interframe_px.update(part)
+                print(f"chain: {len(interframe_px)}/{n_pairs} pairs registered")
 
     interframe = {
         i: normalize_homography(g, (width, height)) for i, g in interframe_px.items()

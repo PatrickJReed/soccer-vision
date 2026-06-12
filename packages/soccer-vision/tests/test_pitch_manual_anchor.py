@@ -203,3 +203,32 @@ def test_clicks_to_keypoints_df_schema() -> None:
     assert df.iloc[0].to_dict() == {
         "frame": 2, "kp_idx": 0, "x_px": 10.0, "y_px": 20.0, "conf": 1.0
     }
+
+
+def test_fit_frames_subset_matches_full() -> None:
+    n = 6
+    interframe = _identity_chain(n)
+    seg = build_segments(interframe, n)
+    transforms = cumulative_transforms(interframe, seg)
+    clicks = _clicks_one_per_frame()
+    full = fit_frame_homographies(clicks, transforms, seg, PITCH_LANDMARKS, window=10)
+    subset = fit_frame_homographies(
+        clicks, transforms, seg, PITCH_LANDMARKS, window=10, frames=[2, 3]
+    )
+    assert set(subset) == {2, 3}
+    for f in (2, 3):
+        assert np.allclose(subset[f].H, full[f].H)
+        assert subset[f].n_points == full[f].n_points
+        assert np.isclose(subset[f].residual, full[f].residual)
+
+
+def test_fit_frames_subset_ignores_unknown_frames() -> None:
+    n = 3
+    interframe = _identity_chain(n)
+    seg = build_segments(interframe, n)
+    transforms = cumulative_transforms(interframe, seg)
+    out = fit_frame_homographies(
+        _clicks_one_per_frame()[:4], transforms, seg, PITCH_LANDMARKS,
+        window=10, frames=[1, 99],
+    )
+    assert set(out) <= {1}

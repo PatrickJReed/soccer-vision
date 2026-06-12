@@ -50,10 +50,12 @@ def make_handler(
             self._send(code, json.dumps(obj).encode(), "application/json")
 
         def _state_payload(self) -> dict[str, Any]:
+            buckets, bucket_size = state.status_buckets()
             return {
                 "n_frames": state.n_frames,
                 "coverage": state.coverage(),
-                "status": state.status_list(),
+                "status_buckets": buckets,
+                "bucket_size": bucket_size,
                 "n_clicks": len(state.clicks),
                 "landmark_names": landmark_names,
                 "landmark_xy": xy,
@@ -68,11 +70,20 @@ def make_handler(
                            "application/javascript")
             elif path == "/api/state":
                 self._json(self._state_payload())
+            elif path == "/api/clicks":
+                self._json({"clicks": [
+                    {"frame": c.frame, "kp_idx": c.kp_idx, "x": c.x, "y": c.y}
+                    for c in state.clicks
+                ]})
             elif path.startswith("/api/frame_h/"):
                 idx = int(path.rsplit("/", 1)[1])
                 fit = state.frame_homography(idx)
-                self._json({"h": None if fit is None
-                            else [float(v) for v in np.asarray(fit.H).reshape(9)]})
+                self._json({
+                    "h": None if fit is None
+                    else [float(v) for v in np.asarray(fit.H).reshape(9)],
+                    "residual": None if fit is None else fit.residual,
+                    "n_points": None if fit is None else fit.n_points,
+                })
             elif path.startswith("/api/frame/"):
                 idx = int(path.rsplit("/", 1)[1])
                 self._send(200, frame_jpeg(idx), "image/jpeg")
@@ -92,6 +103,15 @@ def make_handler(
             elif self.path == "/api/export":
                 state.export(export_dir or Path.cwd())
                 self._json({"exported_to": str(export_dir or Path.cwd())})
+            elif self.path == "/api/nudge":
+                found = state.nudge_click(
+                    int(payload["frame"]), int(payload["kp_idx"]),
+                    float(payload["x"]), float(payload["y"]),
+                )
+                if found:
+                    self._json(self._state_payload())
+                else:
+                    self._json({"error": "no click at frame/kp_idx"}, code=404)
             else:
                 self._send(404, b"not found", "text/plain")
 
@@ -106,25 +126,37 @@ def run(
     export_dir: Path | None = None,
     window: int = 360,
     resume: Path | None = None,
+    workers: int | None = None,
 ) -> None:  # pragma: no cover - launches a blocking server
     """Precompute the chain, open the video, and serve the labeler UI.
 
     resume: a previously exported keypoints.parquet — its clicks are loaded
     into the session (converted back from full-pixel to normalized coords).
+    workers: parallel workers for chain precompute (default: cores-1).
     """
     import cv2
 
     from soccer_vision.labeler.chain import compute_chain
-    from soccer_vision.labeler.state import clicks_from_keypoints_parquet
+    from soccer_vision.labeler.state import clicks_from_keypoints_parquet, clicks_from_sidecar
     from soccer_vision.pitch.landmarks import LANDMARK_NAMES, PITCH_LANDMARKS
 
-    interframe, n_frames, size = compute_chain(video_path)
+    interframe, n_frames, size = compute_chain(video_path, workers=workers)
+    cache_dir = Path(video_path).parent / ".sv_labeler_cache"
+    sidecar = cache_dir / f"{Path(video_path).stem}.clicks.json"
     state = LabelerState(
-        interframe=interframe, n_frames=n_frames, size=size, window=window
+        interframe=interframe, n_frames=n_frames, size=size, window=window,
+        autosave_path=sidecar,
     )
     if resume is not None:
+        if sidecar.exists():
+            backup = sidecar.parent / (sidecar.name + ".bak")
+            sidecar.replace(backup)
+            print(f"existing autosave backed up to {backup}")
         state.add_clicks(clicks_from_keypoints_parquet(resume, size))
         print(f"resumed {len(state.clicks)} clicks from {resume}")
+    elif sidecar.exists():
+        state.add_clicks(clicks_from_sidecar(sidecar))
+        print(f"restored {len(state.clicks)} clicks from autosave {sidecar}")
     cap = cv2.VideoCapture(str(video_path))
 
     def frame_jpeg(idx: int) -> bytes:

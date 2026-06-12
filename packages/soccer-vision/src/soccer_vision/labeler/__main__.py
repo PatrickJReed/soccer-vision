@@ -20,9 +20,11 @@ def main() -> None:
                          "the measured accuracy knee)")
     ap.add_argument("--resume", type=Path, default=None,
                     help="previously exported keypoints.parquet to load as clicks")
+    ap.add_argument("--workers", type=int, default=None,
+                    help="parallel chain precompute workers (default: cores-1)")
     args = ap.parse_args()
     run(args.video, port=args.port, export_dir=args.export_dir,
-        window=args.window, resume=args.resume)
+        window=args.window, resume=args.resume, workers=args.workers)
 
 
 if __name__ == "__main__":

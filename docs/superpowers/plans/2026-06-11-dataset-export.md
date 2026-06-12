@@ -1,0 +1,549 @@
+# Training-Dataset Export Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** A CLI that converts N games' labeler exports (`video + homographies.parquet`) into one ready-to-train YOLOv8-pose dataset with QA contact sheets, plus a local-dataset path in `finetune_pitch.ipynb`.
+
+**Architecture:** One new module `soccer_vision/dataset_export.py`: pure helpers (frame selection / split / yaml) + an impure per-game exporter (sequential video pass, JPEG+label writes, QA sheet) + `main()`. Reuses `homographies_from_parquet`, `autolabel.propose_labels` / `to_yolo_pose_line`, `landmarks.FLIP_IDX`.
+
+**Tech Stack:** Python 3.11, numpy, OpenCV, pandas (via pipeline io). pytest, mypy strict (bare `uv run mypy` from REPO ROOT), ruff.
+
+---
+
+## CRITICAL conventions for every task
+
+- **GIT (ABSOLUTE):** commit only on the current branch (`feat/dataset-export`) via `git add <paths> && git commit`. NEVER checkout/switch/reset/stash/rebase. Read-only git is fine.
+- **mypy:** bare `uv run mypy` from the REPO ROOT only (inside `packages/soccer-vision` gives bogus duplicate-module errors). Zero new errors; annotate test helpers; `tmp_path: Path`.
+- **ruff:** imports at top (sorted), no `;`-joined statements; lint changed src AND tests.
+- Existing APIs (read the files):
+  - `soccer_vision.pipeline.homographies_from_parquet(path) -> dict[int, HomographyEntry]` (labeler exports are FULL-PIXEL→pitch; `.confidence` is residual-derived).
+  - `soccer_vision.pitch.autolabel.propose_labels(homographies, landmarks, frame_size, *, min_confidence=0.5) -> dict[int, NDArray (21,3)]`; `to_yolo_pose_line(kpts, frame_size, *, class_id=0) -> str` (68 tokens).
+  - `soccer_vision.pitch.landmarks.PITCH_LANDMARKS`, `FLIP_IDX`, `NEAR_HALFWAY_IDX == 5`.
+
+## File Structure
+
+| File | Responsibility | Action |
+|---|---|---|
+| `src/soccer_vision/dataset_export.py` | selection/split/yaml helpers, per-game exporter, QA sheet, main() | Create |
+| `tests/test_dataset_export.py` | pure + end-to-end synthetic tests | Create |
+| `examples/finetune_pitch.ipynb` | "Option B — local dataset" cell | Modify |
+
+---
+
+## Task 1: Pure helpers — selection, split, data.yaml
+
+**Files:**
+- Create: `packages/soccer-vision/src/soccer_vision/dataset_export.py`
+- Test: `packages/soccer-vision/tests/test_dataset_export.py`
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `packages/soccer-vision/tests/test_dataset_export.py`:
+
+```python
+"""Tests for the YOLO-pose training-dataset exporter."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import yaml
+from soccer_vision.dataset_export import build_data_yaml, select_frames
+from soccer_vision.pitch.landmarks import FLIP_IDX
+
+
+def test_select_frames_stride_and_temporal_split() -> None:
+    covered = list(range(0, 100))
+    train, val = select_frames(covered, stride=5, val_frac=0.10)
+    assert train + val == list(range(0, 100, 5))   # stride-5, order preserved
+    assert len(val) == 2                            # 20 sampled * 0.10 = 2
+    assert val == [90, 95]                          # temporally LAST
+    assert set(train).isdisjoint(val)
+
+
+def test_select_frames_small_input() -> None:
+    train, val = select_frames([3, 9], stride=1, val_frac=0.10)
+    assert train == [3, 9]
+    assert val == []                                # floor(2*0.1)=0
+
+
+def test_select_frames_empty() -> None:
+    assert select_frames([], stride=5, val_frac=0.1) == ([], [])
+
+
+def test_build_data_yaml_contents(tmp_path: Path) -> None:
+    build_data_yaml(tmp_path)
+    cfg = yaml.safe_load((tmp_path / "data.yaml").read_text())
+    assert cfg["nc"] == 1
+    assert cfg["names"] == ["pitch"]
+    assert cfg["kpt_shape"] == [21, 3]
+    assert cfg["flip_idx"] == list(FLIP_IDX)
+    assert cfg["train"] == "images/train"
+    assert cfg["val"] == "images/val"
+    assert cfg["path"] == "."
+```
+
+NOTE: `yaml` is importable (pyyaml ships with ultralytics-adjacent deps; verify
+with `uv run python -c "import yaml"` — if it is NOT available in the dev env,
+write the data.yaml by hand-formatted string instead and parse it in the test
+with a minimal parser; report which path you took).
+
+- [ ] **Step 2: Run to verify fail**
+
+Run: `cd packages/soccer-vision && uv run pytest tests/test_dataset_export.py -v`
+Expected: FAIL — `ModuleNotFoundError: soccer_vision.dataset_export`
+
+- [ ] **Step 3: Implement**
+
+Create `packages/soccer-vision/src/soccer_vision/dataset_export.py`:
+
+```python
+"""Export labeler-generated homographies into a YOLOv8-pose training dataset.
+
+Converts N games' (video, homographies.parquet) pairs into one combined
+dataset: images/{train,val}, labels/{train,val}, a complete data.yaml
+(kpt_shape + flip_idx from pitch.landmarks), and per-game QA contact sheets
+for a human eyeball before any GPU time is spent.
+
+Labels are machine-generated by projecting the canonical landmarks through the
+labeler's per-frame homographies (pitch/autolabel.py). The QA sheet is the
+correction step — there is no Roboflow round-trip.
+"""
+
+from __future__ import annotations
+
+import argparse
+import random
+import shutil
+import zipfile
+from pathlib import Path
+from typing import Any
+
+import cv2
+import numpy as np
+from numpy.typing import NDArray
+
+from soccer_vision.pipeline import homographies_from_parquet
+from soccer_vision.pitch.autolabel import propose_labels, to_yolo_pose_line
+from soccer_vision.pitch.landmarks import (
+    FLIP_IDX,
+    NEAR_HALFWAY_IDX,
+    PITCH_LANDMARKS,
+)
+
+_QA_CELLS = 12
+_QA_COLS = 4
+_JPEG_QUALITY = 90
+
+
+def select_frames(
+    covered: list[int], *, stride: int, val_frac: float
+) -> tuple[list[int], list[int]]:
+    """Stride-sample covered frames; the temporally LAST val_frac become val.
+
+    Temporal (not random) split: random would put near-duplicate neighbours in
+    both sets and inflate validation metrics.
+    """
+    sampled = sorted(covered)[::stride]
+    n_val = int(len(sampled) * val_frac)
+    if n_val == 0:
+        return sampled, []
+    return sampled[:-n_val], sampled[-n_val:]
+
+
+def build_data_yaml(out_dir: Path) -> None:
+    """Write a complete YOLOv8-pose data.yaml (kpt_shape + flip_idx included)."""
+    flip = ", ".join(str(i) for i in FLIP_IDX)
+    text = (
+        "path: .\n"
+        "train: images/train\n"
+        "val: images/val\n"
+        "nc: 1\n"
+        "names: [pitch]\n"
+        "kpt_shape: [21, 3]\n"
+        f"flip_idx: [{flip}]\n"
+    )
+    (Path(out_dir) / "data.yaml").write_text(text)
+```
+
+- [ ] **Step 4: Run to verify pass**
+
+Run: `cd packages/soccer-vision && uv run pytest tests/test_dataset_export.py -v`
+Expected: PASS (4 tests)
+
+- [ ] **Step 5: Gate + commit**
+
+REPO ROOT `uv run mypy 2>&1 | tail -1` → Success; ruff both files → clean.
+
+```bash
+git add packages/soccer-vision/src/soccer_vision/dataset_export.py packages/soccer-vision/tests/test_dataset_export.py
+git commit -m "feat(dataset): frame selection, temporal split, data.yaml builder"
+```
+
+---
+
+## Task 2: Per-game exporter + QA sheet + CLI
+
+**Files:**
+- Modify: `packages/soccer-vision/src/soccer_vision/dataset_export.py`
+- Test: `packages/soccer-vision/tests/test_dataset_export.py`
+
+- [ ] **Step 1: Write the failing end-to-end test**
+
+Append to the test file (top imports: add `import cv2`, `import numpy as np`,
+`from soccer_vision.dataset_export import export_game, main`,
+`from soccer_vision.pipeline import homographies_to_parquet`,
+`from soccer_vision.pitch.propagation import HomographyEntry` — merged/sorted):
+
+```python
+_W, _H, _N = 320, 240, 60
+# full-pixel -> pitch: x_pitch = x_px / W, y_pitch = y_px / H
+_H_PX = np.diag([1.0 / _W, 1.0 / _H, 1.0])
+
+
+def _write_video(path: Path) -> None:
+    vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30, (_W, _H))  # type: ignore[attr-defined]
+    for i in range(_N):
+        frame = np.full((_H, _W, 3), (40, 120, 40), dtype=np.uint8)
+        cv2.putText(frame, str(i), (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                    (255, 255, 255), 2)
+        vw.write(frame)
+    vw.release()
+
+
+def _write_homs(path: Path, frames: range) -> None:
+    homographies_to_parquet(
+        {f: HomographyEntry(_H_PX, "manual", 1.0) for f in frames}, path
+    )
+
+
+def test_export_game_end_to_end(tmp_path: Path) -> None:
+    video = tmp_path / "g1.mp4"
+    _write_video(video)
+    homs = tmp_path / "h1.parquet"
+    _write_homs(homs, range(_N))
+    out = tmp_path / "ds"
+
+    stats = export_game(video, homs, out, "g1", stride=5, min_confidence=0.5,
+                        val_frac=0.10, qa_seed=0)
+
+    train_imgs = sorted((out / "images/train").glob("g1_f*.jpg"))
+    val_imgs = sorted((out / "images/val").glob("g1_f*.jpg"))
+    assert len(train_imgs) + len(val_imgs) == 12          # 60/5
+    assert len(val_imgs) == 1                              # floor(12*0.1)
+    for img in train_imgs + val_imgs:
+        lbl = out / "labels" / img.parent.name / (img.stem + ".txt")
+        assert lbl.exists()
+        tokens = lbl.read_text().split()
+        assert len(tokens) == 1 + 4 + 21 * 3
+    assert (out / f"qa_g1.jpg").exists()
+    assert stats["n_train"] == 11 and stats["n_val"] == 1
+    assert len(stats["per_landmark"]) == 21
+    assert stats["per_landmark"][5] == 0                   # never-visible idx 5
+
+
+def test_export_game_wrong_video_raises(tmp_path: Path) -> None:
+    video = tmp_path / "g1.mp4"
+    _write_video(video)                                    # 60 frames
+    homs = tmp_path / "h1.parquet"
+    _write_homs(homs, range(400, 410))                     # beyond the video
+    try:
+        export_game(video, homs, tmp_path / "ds", "g1", stride=5,
+                    min_confidence=0.5, val_frac=0.1, qa_seed=0)
+    except ValueError as e:
+        assert "wrong video" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_main_duplicate_stems_rejected(tmp_path: Path) -> None:
+    video = tmp_path / "g1.mp4"
+    _write_video(video)
+    homs = tmp_path / "h1.parquet"
+    _write_homs(homs, range(_N))
+    argv = ["--game", str(video), str(homs), "--game", str(video), str(homs),
+            "--out-dir", str(tmp_path / "ds")]
+    try:
+        main(argv)
+    except ValueError as e:
+        assert "duplicate" in str(e).lower()
+    else:
+        raise AssertionError("expected rejection of duplicate game stems")
+
+
+def test_main_end_to_end_with_zip(tmp_path: Path) -> None:
+    video = tmp_path / "g1.mp4"
+    _write_video(video)
+    homs = tmp_path / "h1.parquet"
+    _write_homs(homs, range(_N))
+    out = tmp_path / "ds"
+    main(["--game", str(video), str(homs), "--out-dir", str(out), "--zip"])
+    assert (out / "data.yaml").exists()
+    assert (tmp_path / "ds.zip").exists()
+```
+
+- [ ] **Step 2: Run to verify fail**
+
+Run: `cd packages/soccer-vision && uv run pytest tests/test_dataset_export.py -k "export_game or main" -v`
+Expected: FAIL — ImportError.
+
+- [ ] **Step 3: Implement**
+
+Append to `dataset_export.py`:
+
+```python
+def _draw_keypoints(
+    frame: NDArray[np.uint8], kpts: NDArray[np.floating]
+) -> NDArray[np.uint8]:
+    out = frame.copy()
+    for idx, (x, y, v) in enumerate(kpts):
+        if v <= 0:
+            continue
+        cv2.circle(out, (int(x), int(y)), 5, (60, 220, 120), -1)
+        cv2.putText(out, str(idx), (int(x) + 6, int(y) - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    return out
+
+
+def _write_qa_sheet(
+    cells: list[NDArray[np.uint8]], path: Path, *, cell_width: int = 480
+) -> None:
+    if not cells:
+        return
+    resized = []
+    for c in cells:
+        scale = cell_width / c.shape[1]
+        resized.append(cv2.resize(c, (cell_width, int(c.shape[0] * scale))))
+    rows = []
+    for i in range(0, len(resized), _QA_COLS):
+        row = resized[i:i + _QA_COLS]
+        row += [np.zeros_like(resized[0])] * (_QA_COLS - len(row))
+        rows.append(np.hstack(row))
+    cv2.imwrite(str(path), np.vstack(rows))
+
+
+def export_game(
+    video_path: Path,
+    homographies_path: Path,
+    out_dir: Path,
+    game_name: str,
+    *,
+    stride: int,
+    min_confidence: float,
+    val_frac: float,
+    qa_seed: int = 0,
+) -> dict[str, Any]:
+    """Export one game's frames + labels into the combined dataset tree."""
+    out = Path(out_dir)
+    entries = homographies_from_parquet(Path(homographies_path))
+
+    cap = cv2.VideoCapture(str(video_path))
+    n_video = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if entries and n_video <= max(entries):
+        cap.release()
+        raise ValueError(
+            f"video has {n_video} frames but homographies reference frame "
+            f"{max(entries)} — wrong video?"
+        )
+
+    proposals = propose_labels(
+        entries, PITCH_LANDMARKS, (width, height), min_confidence=min_confidence
+    )
+    train_frames, val_frames = select_frames(
+        sorted(proposals), stride=stride, val_frac=val_frac
+    )
+    if not train_frames and not val_frames:
+        cap.release()
+        print(f"WARNING: {game_name}: no covered frames above confidence "
+              f"{min_confidence}; game skipped")
+        return {"game": game_name, "skipped": True, "n_train": 0, "n_val": 0,
+                "n_annotations": 0, "per_landmark": [0] * len(PITCH_LANDMARKS)}
+
+    for sub in ("images/train", "images/val", "labels/train", "labels/val"):
+        (out / sub).mkdir(parents=True, exist_ok=True)
+
+    split_of = {f: "train" for f in train_frames}
+    split_of.update({f: "val" for f in val_frames})
+    qa_pool = train_frames + val_frames
+    qa_frames = set(random.Random(qa_seed).sample(
+        qa_pool, min(_QA_CELLS, len(qa_pool))
+    ))
+
+    per_landmark = [0] * len(PITCH_LANDMARKS)
+    n_annotations = 0
+    qa_cells: list[NDArray[np.uint8]] = []
+    pos = 0
+    try:
+        for f in sorted(split_of):
+            while pos < f:
+                if not cap.grab():
+                    break
+                pos += 1
+            ok, frame = cap.read()
+            pos += 1
+            if not ok:
+                continue
+            # idx 5 (under-camera, never labeled) has no ground truth ever:
+            # force not-visible so machine labels never assert it.
+            kpts = proposals[f].copy()
+            kpts[NEAR_HALFWAY_IDX] = 0.0
+            split = split_of[f]
+            stem = f"{game_name}_f{f:06d}"
+            cv2.imwrite(str(out / "images" / split / f"{stem}.jpg"), frame,
+                        [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY])
+            (out / "labels" / split / f"{stem}.txt").write_text(
+                to_yolo_pose_line(kpts, (width, height))
+            )
+            visible = kpts[:, 2] > 0
+            n_annotations += int(visible.sum())
+            for idx in np.where(visible)[0]:
+                per_landmark[int(idx)] += 1
+            if f in qa_frames:
+                qa_cells.append(_draw_keypoints(
+                    np.asarray(frame, dtype=np.uint8), kpts
+                ))
+    finally:
+        cap.release()
+
+    _write_qa_sheet(qa_cells, out / f"qa_{game_name}.jpg")
+    return {"game": game_name, "skipped": False,
+            "n_train": len(train_frames), "n_val": len(val_frames),
+            "n_annotations": n_annotations, "per_landmark": per_landmark}
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(
+        description="Export labeler homographies into a YOLOv8-pose dataset"
+    )
+    ap.add_argument("--game", nargs=2, action="append", required=True,
+                    metavar=("VIDEO", "HOMOGRAPHIES"),
+                    help="a video and its labeler homographies.parquet")
+    ap.add_argument("--out-dir", required=True, type=Path)
+    ap.add_argument("--stride", type=int, default=5)
+    ap.add_argument("--min-confidence", type=float, default=0.5)
+    ap.add_argument("--val-frac", type=float, default=0.10)
+    ap.add_argument("--zip", action="store_true", dest="make_zip")
+    args = ap.parse_args(argv)
+
+    stems = [Path(v).stem for v, _ in args.game]
+    if len(set(stems)) != len(stems):
+        raise ValueError(f"duplicate game stems: {stems} — rename the videos")
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    build_data_yaml(args.out_dir)
+    totals = {"n_train": 0, "n_val": 0, "n_annotations": 0}
+    for (video, homs), stem in zip(args.game, stems, strict=True):
+        stats = export_game(Path(video), Path(homs), args.out_dir, stem,
+                            stride=args.stride,
+                            min_confidence=args.min_confidence,
+                            val_frac=args.val_frac)
+        print(f"{stem}: train {stats['n_train']}  val {stats['n_val']}  "
+              f"annotations {stats['n_annotations']}")
+        print(f"  per-landmark counts: {stats['per_landmark']}")
+        for key in totals:
+            totals[key] += stats[key]
+    print(f"TOTAL: train {totals['n_train']}  val {totals['n_val']}  "
+          f"annotations {totals['n_annotations']}")
+    if args.make_zip:
+        zip_path = shutil.make_archive(str(args.out_dir), "zip",
+                                       str(args.out_dir))
+        print(f"zip: {zip_path}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+(`zipfile` import is unused if `shutil.make_archive` is used — remove the
+`zipfile` import. Keep ruff clean.)
+
+- [ ] **Step 4: Run all dataset tests**
+
+Run: `cd packages/soccer-vision && uv run pytest tests/test_dataset_export.py -v`
+Expected: PASS (8).
+
+- [ ] **Step 5: Gate + commit**
+
+REPO ROOT mypy → Success; ruff → clean; full suite `uv run pytest -q | tail -1`.
+
+```bash
+git add packages/soccer-vision/src/soccer_vision/dataset_export.py packages/soccer-vision/tests/test_dataset_export.py
+git commit -m "feat(dataset): per-game exporter, QA contact sheets, CLI"
+```
+
+---
+
+## Task 3: finetune_pitch.ipynb — local-dataset path
+
+**Files:**
+- Modify: `examples/finetune_pitch.ipynb`
+
+- [ ] **Step 1: Add the Option B cell**
+
+Edit the notebook JSON with a throwaway python script (DELETE it after; don't
+commit it). Insert ONE new markdown+code cell pair AFTER the Roboflow download
+cell (cell index 1) and BEFORE the flip_idx markdown note:
+
+Markdown cell:
+```
+## Option B — local dataset (no Roboflow)
+If you built the dataset with `python -m soccer_vision.dataset_export`, upload
+`dataset.zip` to Colab (or Drive) and run the next cell INSTEAD of the Roboflow
+download above. The zip's data.yaml already carries kpt_shape and flip_idx.
+```
+
+Code cell:
+```python
+import zipfile
+from pathlib import Path
+from types import SimpleNamespace
+
+ZIP = Path("/content/dataset.zip")   # upload it first (Files panel or Drive copy)
+if ZIP.exists():
+    target = Path("/content/dataset")
+    with zipfile.ZipFile(ZIP) as zf:
+        zf.extractall(target)
+    dataset = SimpleNamespace(location=str(target))
+    print("Using local dataset at", dataset.location)
+```
+
+(The later cells reference `dataset.location` — the SimpleNamespace keeps them
+working for both paths. The existing data.yaml patch cell stays: it re-asserts
+kpt_shape/flip_idx, which is a no-op consistency check for Option B.)
+
+- [ ] **Step 2: Validate + commit**
+
+Run: `python3 -c "import json; nb=json.load(open('examples/finetune_pitch.ipynb')); assert nb['nbformat']==4; print('cells:', len(nb['cells']))"`
+Expected: `cells: 8` (was 6).
+
+```bash
+git add examples/finetune_pitch.ipynb
+git commit -m "docs(examples): finetune_pitch Option B — local dataset zip"
+```
+
+---
+
+## Task 4: Real-data acceptance (controller)
+
+Not a subagent task. Run on the bake-off export:
+
+```bash
+cd packages/soccer-vision
+uv run python -m soccer_vision.dataset_export \
+  --game ~/sv-labeler/clip.mp4 ~/sv-labeler/out/homographies.parquet \
+  --out-dir ~/sv-labeler/dataset --zip
+```
+
+Checks: ~360 train + ~40 val images (1,832 covered / stride 5); 68-token
+labels; per-landmark counts sane (idx 5 == 0); `qa_clip.jpg` produced → Patrick
+eyeballs it (dots on intersections; near-touchline drift is the known suspect).
+
+---
+
+## Final verification
+
+- [ ] `cd packages/soccer-vision && uv run pytest -q` — all pass.
+- [ ] REPO ROOT `uv run mypy 2>&1 | tail -1` — Success.
+- [ ] `uv run ruff check src/ tests/` — clean.

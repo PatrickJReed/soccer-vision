@@ -103,3 +103,40 @@ def test_pitch_weights_path_override_accepted(tmp_path: Path) -> None:
     w.write_bytes(b"stub")
     backend = RoboflowBackend(pitch_weights_path=w, detect_pitch=True)
     assert backend.pitch_weights_path == w
+
+
+def test_download_weights_skips_pitch_when_override_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A local pitch override must not trigger a fetch of the (unpublished,
+    404-ing) canonical pitch asset — only player/ball get downloaded."""
+    import sys
+    import urllib.request
+
+    import soccer_vision.tracking.roboflow as rf
+
+    fetched: list[str] = []
+
+    def _fake_urlretrieve(url: str, dest: str) -> None:
+        fetched.append(f"url:{url}")
+        Path(dest).write_bytes(b"stub")
+
+    class _FakeGdown:
+        @staticmethod
+        def download(url: str, dest: str, quiet: bool = False) -> None:
+            fetched.append(f"gdrive:{url}")
+            Path(dest).write_bytes(b"stub")
+
+    monkeypatch.setattr(urllib.request, "urlretrieve", _fake_urlretrieve)
+    monkeypatch.setitem(sys.modules, "gdown", _FakeGdown)
+
+    pitch = tmp_path / "custom_pitch.pt"
+    pitch.write_bytes(b"stub")
+    backend = rf.RoboflowBackend(
+        pitch_weights_path=pitch, detect_pitch=True, weights_cache_dir=tmp_path
+    )
+    paths = backend._download_weights()
+
+    assert "pitch" not in paths  # skipped entirely
+    assert "player" in paths and "ball" in paths
+    assert not any("pitch" in f for f in fetched)  # no pitch URL/gdrive hit

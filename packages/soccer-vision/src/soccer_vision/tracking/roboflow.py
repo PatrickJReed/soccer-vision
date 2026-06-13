@@ -328,6 +328,13 @@ class RoboflowBackend:
         for role, (kind, locator, filename) in WEIGHTS.items():
             if role == "pitch" and not self.detect_pitch:
                 continue
+            # A caller-supplied local override is loaded directly in
+            # _run_pipeline; never fetch the canonical asset for that role
+            # (the pitch asset in particular is unpublished and 404s).
+            if role == "pitch" and self.pitch_weights_path is not None:
+                continue
+            if role == "ball" and self.ball_weights_path is not None:
+                continue
             dest = self._weights_dir / filename
             if not dest.exists():
                 if kind == "gdrive":

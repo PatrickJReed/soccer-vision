@@ -8,6 +8,7 @@ from soccer_vision.eval.pitch_metrics import (
     DEFAULT_PITCH_LENGTH_FT,
     canonical_to_feet,
     keypoint_errors_feet,
+    reproj_error_feet,
 )
 from soccer_vision.pitch.autolabel import project_landmarks
 from soccer_vision.pitch.homography import fit_homography
@@ -69,3 +70,18 @@ def test_keypoint_errors_feet_skips_hidden_and_lowconf() -> None:
     errs = keypoint_errors_feet(h_gt, gt, model, conf_thr=0.5)
     assert 5 not in errs  # hidden idx never scored
     assert 7 not in errs  # low confidence excluded
+
+
+def test_reproj_error_zero_when_model_h_equals_gt() -> None:
+    h_gt = _gt_homography()
+    gt = project_landmarks(h_gt, PITCH_LANDMARKS, (_W, _H))
+    err = reproj_error_feet(h_gt, h_gt, gt)
+    assert err is not None and err < 1e-6  # identical H -> ~0 ft
+
+
+def test_reproj_error_none_when_no_visible() -> None:
+    h_gt = _gt_homography()
+    gt = project_landmarks(h_gt, PITCH_LANDMARKS, (_W, _H))
+    gt = gt.copy()
+    gt[:, 2] = 0.0  # nothing visible
+    assert reproj_error_feet(h_gt, h_gt, gt) is None

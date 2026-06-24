@@ -58,3 +58,24 @@ def keypoint_errors_feet(
         d = float(np.hypot(*(pitch_pred - PITCH_LANDMARKS[i])))
         out[i] = float(canonical_to_feet(d, length_ft))
     return out
+
+
+def reproj_error_feet(
+    h_gt: NDArray[np.floating],
+    model_h: NDArray[np.floating],
+    gt_kpts: NDArray[np.floating],
+    *,
+    length_ft: float = DEFAULT_PITCH_LENGTH_FT,
+) -> float | None:
+    """End-to-end check: at each GT-visible landmark's pixel, how far (feet) does
+    the MODEL homography place it from the canonical truth? Median over visible
+    landmarks. None if no GT-visible landmarks. Catches outlier keypoints that
+    wreck the fitted homography even when average keypoint error looks fine.
+    """
+    idx = [i for i in range(len(PITCH_LANDMARKS)) if i != HIDDEN_IDX and gt_kpts[i, 2] > 0]
+    if not idx:
+        return None
+    px = gt_kpts[idx, :2]
+    pitch_via_model = _apply_h(model_h, px)
+    d = np.hypot(*(pitch_via_model - PITCH_LANDMARKS[idx]).T)
+    return float(canonical_to_feet(float(np.median(d)), length_ft))

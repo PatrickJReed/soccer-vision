@@ -16,6 +16,7 @@ class BenchmarkField:
     field: str               # human label, e.g. "chula_vista"
     game_id: str             # source game identifier
     homographies: str        # path to the labeler homographies.parquet (relative)
+    keypoints: str           # path to the labeler keypoints.parquet (relative)
     frame_indices: list[int]  # the sampled frames scored for this field
 
 
@@ -33,7 +34,8 @@ def load_manifest(path: Path) -> BenchmarkManifest:
     return BenchmarkManifest(fields=[
         BenchmarkField(
             field=f["field"], game_id=f["game_id"],
-            homographies=f["homographies"], frame_indices=list(f["frame_indices"]),
+            homographies=f["homographies"], keypoints=f["keypoints"],
+            frame_indices=list(f["frame_indices"]),
         )
         for f in data["fields"]
     ])

@@ -143,6 +143,19 @@ def test_score_benchmark_accurate_coverage_and_exclusions() -> None:
     assert rep.per_landmark[0]["detect_rate"] <= 1.0
 
 
+def test_score_frame_few_keypoints_does_not_match() -> None:
+    h_gt = _gt_homography()
+    gt = project_landmarks(h_gt, PITCH_LANDMARKS, (_W, _H))
+    model = np.zeros_like(gt)  # nothing confident...
+    # ...make exactly 2 GT-visible landmarks perfect & confident
+    vis = [i for i in range(len(PITCH_LANDMARKS)) if i != 5 and gt[i, 2] > 0][:2]
+    for i in vis:
+        model[i] = [gt[i, 0], gt[i, 1], 2.0]
+    fs = score_frame(0, h_gt, model, frame_size=(_W, _H), match_threshold_feet=2.0)
+    assert fs.median_feet is not None and fs.median_feet < 0.01  # accurate where present
+    assert fs.matches is False  # but too few keypoints -> not accurately covered
+
+
 def test_score_benchmark_excludes_degenerate_gt() -> None:
     h_gt = _gt_homography()
     degenerate = np.full((3, 3), 1e-9)

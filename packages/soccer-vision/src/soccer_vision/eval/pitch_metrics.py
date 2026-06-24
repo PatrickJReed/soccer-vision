@@ -14,13 +14,13 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
+from soccer_vision.pitch.landmarks import NEAR_HALFWAY_IDX as HIDDEN_IDX
 from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 
 # Nominal US Soccer 9v9 pitch length: ~68.5 m. Youth fields vary; this is a fixed
 # nominal scale so feet errors are interpretable and comparable across retrains.
 DEFAULT_PITCH_LENGTH_FT: float = 224.7
 DEFAULT_ASPECT_RATIO: float = 1.5  # 9v9 length/width; x is a fraction of width, y of length
-HIDDEN_IDX: int = 5  # under-camera landmark, never ground-truth-visible
 
 
 def displacement_to_feet(
@@ -146,6 +146,7 @@ def score_frame(
     *,
     frame_size: tuple[int, int],
     match_threshold_feet: float,
+    min_match_keypoints: int = 4,
     conf_thr: float = 0.5,
     length_ft: float = DEFAULT_PITCH_LENGTH_FT,
     aspect_ratio: float = DEFAULT_ASPECT_RATIO,
@@ -179,7 +180,8 @@ def score_frame(
         except HomographyError:
             reproj_feet = None
 
-    matches = median_feet is not None and median_feet <= match_threshold_feet
+    matches = (median_feet is not None and len(errs) >= min_match_keypoints
+               and median_feet <= match_threshold_feet)
     return FrameScore(frame, errs, median_feet, reproj_feet, gt_visible, predicted, matches)
 
 
@@ -193,6 +195,7 @@ def score_benchmark(
     *,
     frame_size: tuple[int, int],
     match_threshold_feet: float,
+    min_match_keypoints: int = 4,
     conf_thr: float = 0.5,
     length_ft: float = DEFAULT_PITCH_LENGTH_FT,
     aspect_ratio: float = DEFAULT_ASPECT_RATIO,
@@ -209,8 +212,9 @@ def score_benchmark(
             continue
         scores.append(score_frame(
             frame, h_gt, model_predictions.get(frame), frame_size=frame_size,
-            match_threshold_feet=match_threshold_feet, conf_thr=conf_thr,
-            length_ft=length_ft, aspect_ratio=aspect_ratio))
+            match_threshold_feet=match_threshold_feet,
+            min_match_keypoints=min_match_keypoints,
+            conf_thr=conf_thr, length_ft=length_ft, aspect_ratio=aspect_ratio))
 
     n = len(scores)
     n_matched = sum(s.matches for s in scores)

@@ -11,9 +11,11 @@ def test_manifest_round_trip(tmp_path: Path) -> None:
     m = BenchmarkManifest(fields=[
         BenchmarkField(field="chula_vista", game_id="game8",
                        homographies="chula/homographies.parquet",
+                       keypoints="chula/keypoints.parquet",
                        frame_indices=[100, 200, 300]),
         BenchmarkField(field="carlsbad", game_id="game3",
                        homographies="carlsbad/homographies.parquet",
+                       keypoints="carlsbad/keypoints.parquet",
                        frame_indices=[50, 60]),
     ])
     p = tmp_path / "benchmark.json"

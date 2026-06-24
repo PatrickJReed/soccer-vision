@@ -79,3 +79,21 @@ def reproj_error_feet(
     pitch_via_model = _apply_h(model_h, px)
     d = np.hypot(*(pitch_via_model - PITCH_LANDMARKS[idx]).T)
     return float(canonical_to_feet(float(np.median(d)), length_ft))
+
+
+def labeler_fit_residual_feet(
+    h_gt: NDArray[np.floating],
+    clicked_px: NDArray[np.floating],
+    kp_indices: NDArray[np.integer],
+    *,
+    length_ft: float = DEFAULT_PITCH_LENGTH_FT,
+) -> float:
+    """Labeler self-consistency: median feet error of its homography on its OWN
+    clicked anchors. This is the noise-floor proxy that defines the
+    match-the-labeler bar. (clicked_px: (k,2) image pixels; kp_indices: (k,)
+    landmark ids for each click.)
+    """
+    idx = np.asarray(kp_indices)
+    pitch_pred = _apply_h(h_gt, np.asarray(clicked_px, dtype=np.float64))
+    d = np.hypot(*(pitch_pred - PITCH_LANDMARKS[idx]).T)
+    return float(canonical_to_feet(float(np.median(d)), length_ft))

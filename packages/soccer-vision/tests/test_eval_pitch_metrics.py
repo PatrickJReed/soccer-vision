@@ -8,6 +8,7 @@ from soccer_vision.eval.pitch_metrics import (
     DEFAULT_PITCH_LENGTH_FT,
     canonical_to_feet,
     keypoint_errors_feet,
+    labeler_fit_residual_feet,
     reproj_error_feet,
 )
 from soccer_vision.pitch.autolabel import project_landmarks
@@ -85,3 +86,22 @@ def test_reproj_error_none_when_no_visible() -> None:
     gt = gt.copy()
     gt[:, 2] = 0.0  # nothing visible
     assert reproj_error_feet(h_gt, h_gt, gt) is None
+
+
+def test_labeler_fit_residual_zero_for_exact_clicks() -> None:
+    h_gt = _gt_homography()
+    # clicks placed exactly where the GT homography says the landmarks are.
+    idx = np.array([0, 3, 13, 16, 19, 20])
+    clicks_px = np.array([_pitch_to_px(h_gt, PITCH_LANDMARKS[i]) for i in idx])
+    r = labeler_fit_residual_feet(h_gt, clicks_px, idx)
+    assert r < 0.05  # perfectly consistent -> ~0 ft
+
+
+def test_labeler_fit_residual_known_error() -> None:
+    h_gt = _gt_homography()
+    idx = np.array([0, 3, 13, 16])
+    clicks_px = np.array([_pitch_to_px(h_gt, PITCH_LANDMARKS[i]) for i in idx])
+    # nudge one click so it maps 0.03 canonical off -> 0.03*224.7 ft, median of [0,0,0,that]
+    clicks_px[1] = _pitch_to_px(h_gt, PITCH_LANDMARKS[idx[1]] + np.array([0.03, 0.0]))
+    r = labeler_fit_residual_feet(h_gt, clicks_px, idx)
+    assert 0.0 <= r <= 0.03 * 224.7 + 0.5

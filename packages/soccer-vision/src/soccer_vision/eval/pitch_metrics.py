@@ -185,6 +185,33 @@ def score_frame(
     return FrameScore(frame, errs, median_feet, reproj_feet, gt_visible, predicted, matches)
 
 
+def score_by_split(
+    gt_homographies: dict[int, NDArray[np.floating]],
+    model_predictions: dict[int, NDArray[np.floating]],
+    split_of: dict[int, str],
+    *,
+    frame_size: tuple[int, int],
+    match_threshold_feet: float,
+    conf_thr: float = 0.5,
+    length_ft: float = DEFAULT_PITCH_LENGTH_FT,
+    aspect_ratio: float = DEFAULT_ASPECT_RATIO,
+    min_match_keypoints: int = 4,
+    degenerate_cond: float = 1e8,
+) -> dict[str, EvalReport]:
+    """One EvalReport per split label. split_of maps frame-key -> split string."""
+    out: dict[str, EvalReport] = {}
+    for sp in sorted(set(split_of.values())):
+        keys = {k for k, v in split_of.items() if v == sp}
+        gt_sub = {k: v for k, v in gt_homographies.items() if k in keys}
+        pred_sub = {k: v for k, v in model_predictions.items() if k in keys}
+        out[sp] = score_benchmark(
+            gt_sub, pred_sub, frame_size=frame_size,
+            match_threshold_feet=match_threshold_feet, conf_thr=conf_thr,
+            length_ft=length_ft, aspect_ratio=aspect_ratio,
+            min_match_keypoints=min_match_keypoints, degenerate_cond=degenerate_cond)
+    return out
+
+
 def _cond(h: NDArray[np.floating]) -> float:
     return float(np.linalg.cond(np.asarray(h, dtype=np.float64)))
 

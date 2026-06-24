@@ -166,3 +166,18 @@ def test_score_benchmark_excludes_degenerate_gt() -> None:
                                       match_threshold_feet=2.0, degenerate_cond=1e8)
     assert rep.n_excluded_degenerate == 1
     assert rep.n_frames == 1  # the degenerate GT frame is not scored
+
+
+def test_score_by_split_groups() -> None:
+    from soccer_vision.eval.pitch_metrics import score_by_split
+    h = _gt_homography()
+    perfect = _perfect_model(h)
+    bad = perfect.copy()
+    bad[:, :2] += 500.0
+    gt = {0: h, 1: h}
+    preds = {0: perfect, 1: bad}
+    split_of = {0: "unseen_time", 1: "unseen_field"}
+    reps = score_by_split(gt, preds, split_of, frame_size=(_W, _H), match_threshold_feet=2.0)
+    assert set(reps) == {"unseen_field", "unseen_time"}
+    assert reps["unseen_time"].accurate_coverage == 1.0   # perfect frame
+    assert reps["unseen_field"].accurate_coverage == 0.0   # bad frame

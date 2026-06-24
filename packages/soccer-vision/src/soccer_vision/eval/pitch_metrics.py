@@ -8,6 +8,8 @@ pitch length, so a canonical Euclidean distance scales by one constant.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 from numpy.typing import NDArray
 
@@ -97,3 +99,133 @@ def labeler_fit_residual_feet(
     pitch_pred = _apply_h(h_gt, np.asarray(clicked_px, dtype=np.float64))
     d = np.hypot(*(pitch_pred - PITCH_LANDMARKS[idx]).T)
     return float(canonical_to_feet(float(np.median(d)), length_ft))
+
+
+@dataclass
+class FrameScore:
+    frame: int
+    per_kp_feet: dict[int, float]
+    median_feet: float | None      # None if model produced no scorable keypoints
+    reproj_feet: float | None      # None if model H not fittable / no GT-visible
+    gt_visible: list[int]
+    predicted: list[int]
+    matches: bool
+
+
+@dataclass
+class EvalReport:
+    n_frames: int                  # scored frames (excludes degenerate GT)
+    n_matched: int
+    accurate_coverage: float       # n_matched / n_frames  (the headline)
+    keypoint_feet_median: float | None
+    keypoint_feet_p90: float | None
+    reproj_feet_median: float | None
+    reproj_feet_p90: float | None
+    per_landmark: dict[int, dict[str, float]]  # idx -> {median, p90, detect_rate}
+    n_excluded_degenerate: int
+
+
+def score_frame(
+    frame: int,
+    h_gt: NDArray[np.floating],
+    model_kpts: NDArray[np.floating] | None,
+    *,
+    frame_size: tuple[int, int],
+    match_threshold_feet: float,
+    conf_thr: float = 0.5,
+    length_ft: float = DEFAULT_PITCH_LENGTH_FT,
+) -> FrameScore:
+    """Score one benchmark frame. A None / <4-confident model prediction yields a
+    not-covered (non-matching) frame, never a skip."""
+    from soccer_vision.pitch.autolabel import project_landmarks
+    from soccer_vision.pitch.homography import HomographyError, fit_homography
+
+    gt_kpts = project_landmarks(h_gt, PITCH_LANDMARKS, frame_size)
+    gt_visible = [i for i in range(len(PITCH_LANDMARKS))
+                  if i != HIDDEN_IDX and gt_kpts[i, 2] > 0]
+
+    if model_kpts is None:
+        return FrameScore(frame, {}, None, None, gt_visible, [], False)
+
+    errs = keypoint_errors_feet(h_gt, gt_kpts, model_kpts, conf_thr=conf_thr,
+                                length_ft=length_ft)
+    predicted = sorted(errs)
+    median_feet = float(np.median(list(errs.values()))) if errs else None
+
+    # fit the model homography from its confident keypoints for the reproj check
+    reproj_feet: float | None = None
+    conf_mask = model_kpts[:, 2] >= conf_thr
+    conf_idx = [i for i in np.nonzero(conf_mask)[0] if i != HIDDEN_IDX]
+    if len(conf_idx) >= 4:
+        try:
+            model_h = fit_homography(model_kpts[conf_idx, :2], PITCH_LANDMARKS[conf_idx])
+            reproj_feet = reproj_error_feet(h_gt, model_h, gt_kpts, length_ft=length_ft)
+        except HomographyError:
+            reproj_feet = None
+
+    matches = median_feet is not None and median_feet <= match_threshold_feet
+    return FrameScore(frame, errs, median_feet, reproj_feet, gt_visible, predicted, matches)
+
+
+def _cond(h: NDArray[np.floating]) -> float:
+    return float(np.linalg.cond(np.asarray(h, dtype=np.float64)))
+
+
+def score_benchmark(
+    gt_homographies: dict[int, NDArray[np.floating]],
+    model_predictions: dict[int, NDArray[np.floating]],
+    *,
+    frame_size: tuple[int, int],
+    match_threshold_feet: float,
+    conf_thr: float = 0.5,
+    length_ft: float = DEFAULT_PITCH_LENGTH_FT,
+    degenerate_cond: float = 1e8,
+) -> EvalReport:
+    """Score the model over the whole frozen benchmark. Degenerate-GT frames are
+    excluded with a count; missing predictions count as not-covered."""
+    scores: list[FrameScore] = []
+    n_excluded = 0
+    for frame in sorted(gt_homographies):
+        h_gt = gt_homographies[frame]
+        if _cond(h_gt) > degenerate_cond:
+            n_excluded += 1
+            continue
+        scores.append(score_frame(
+            frame, h_gt, model_predictions.get(frame), frame_size=frame_size,
+            match_threshold_feet=match_threshold_feet, conf_thr=conf_thr,
+            length_ft=length_ft))
+
+    n = len(scores)
+    n_matched = sum(s.matches for s in scores)
+    kp_all = [v for s in scores for v in s.per_kp_feet.values()]
+    reproj_all = [s.reproj_feet for s in scores if s.reproj_feet is not None]
+
+    per_landmark: dict[int, dict[str, float]] = {}
+    for i in range(len(PITCH_LANDMARKS)):
+        if i == HIDDEN_IDX:
+            continue
+        vals = [s.per_kp_feet[i] for s in scores if i in s.per_kp_feet]
+        gt_vis = sum(i in s.gt_visible for s in scores)
+        per_landmark[i] = {
+            "median": float(np.median(vals)) if vals else float("nan"),
+            "p90": float(np.percentile(vals, 90)) if vals else float("nan"),
+            "detect_rate": (len(vals) / gt_vis) if gt_vis else float("nan"),
+        }
+
+    def _med(x: list[float]) -> float | None:
+        return float(np.median(x)) if x else None
+
+    def _p90(x: list[float]) -> float | None:
+        return float(np.percentile(x, 90)) if x else None
+
+    return EvalReport(
+        n_frames=n,
+        n_matched=n_matched,
+        accurate_coverage=(n_matched / n) if n else 0.0,
+        keypoint_feet_median=_med(kp_all),
+        keypoint_feet_p90=_p90(kp_all),
+        reproj_feet_median=_med(reproj_all),
+        reproj_feet_p90=_p90(reproj_all),
+        per_landmark=per_landmark,
+        n_excluded_degenerate=n_excluded,
+    )

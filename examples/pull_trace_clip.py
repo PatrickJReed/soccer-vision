@@ -14,31 +14,52 @@ corpus tool, not a one-off:
   grab a WHOLE game (for labeling -> more training data):
       python pull_trace_clip.py PLAYLIST_URL --game 3 --out game3.mp4
 
-Requires yt-dlp (pip install yt-dlp) and ffmpeg on PATH.
+Requires yt-dlp and ffmpeg on PATH, plus a JS runtime (deno) for YouTube's
+"n challenge" — without it most videos resolve to 360p or "not available":
+    pip install yt-dlp ; brew/apt install ffmpeg
+    curl -fsSL https://deno.land/install.sh | sh   # -> ~/.deno/bin (auto-found)
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
 
+# YouTube now gates full-resolution formats behind a JS "n challenge"; yt-dlp
+# solves it with a JS runtime (deno) + a remote solver script it fetches once.
+_YT_ARGS = ["--remote-components", "ejs:github"]
+
+
+def _ensure_deno_on_path() -> None:
+    deno_bin = os.path.expanduser("~/.deno/bin")
+    if os.path.isdir(deno_bin) and deno_bin not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = deno_bin + os.pathsep + os.environ.get("PATH", "")
+
 
 def _require_tools() -> None:
+    _ensure_deno_on_path()
     for tool in ("yt-dlp", "ffmpeg"):
         if shutil.which(tool) is None:
             sys.exit(
                 f"missing '{tool}' on PATH — install it "
                 f"(pip install yt-dlp; brew/apt install ffmpeg)"
             )
+    if shutil.which("deno") is None:
+        print(
+            "WARNING: no deno JS runtime found — YouTube may only yield 360p or "
+            "fail. Install: curl -fsSL https://deno.land/install.sh | sh",
+            file=sys.stderr,
+        )
 
 
 def list_games(playlist: str) -> list[tuple[int, str, str]]:
     """Return (index, video_id, title) for every entry, without downloading."""
     out = subprocess.run(
-        ["yt-dlp", "--flat-playlist", "-J", playlist],
+        ["yt-dlp", *_YT_ARGS, "--flat-playlist", "-J", playlist],
         capture_output=True, text=True, check=True,
     ).stdout
     data = json.loads(out)
@@ -70,7 +91,7 @@ def pull(url: str, out: str, start: str | None, duration: int | None) -> None:
     # native resolution up to 1080p (Trace is 1080p/30) so the clip matches
     # what the model trained on; remux to mp4.
     cmd = [
-        "yt-dlp",
+        "yt-dlp", *_YT_ARGS,
         "-f", "bv*[height<=1080]+ba/b[height<=1080]",
         "--merge-output-format", "mp4",
         "-o", out, url,

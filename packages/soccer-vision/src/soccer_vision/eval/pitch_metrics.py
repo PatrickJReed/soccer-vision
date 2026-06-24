@@ -2,8 +2,9 @@
 
 Everything here is numpy in / dataclass out, no I/O — so the eval logic itself is
 unit-testable (the lesson of anchor_cov, which shipped untested and gave a false
-pass). Errors are reported in real-world FEET: both pitch axes are fractions of
-pitch length, so a canonical Euclidean distance scales by one constant.
+pass). Errors are reported in real-world FEET: x and y are each normalized to [0,1]
+independently (x = fraction of width, y = fraction of length), so each axis must be
+scaled separately before computing the Euclidean norm.
 """
 
 from __future__ import annotations
@@ -18,15 +19,23 @@ from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 # Nominal US Soccer 9v9 pitch length: ~68.5 m. Youth fields vary; this is a fixed
 # nominal scale so feet errors are interpretable and comparable across retrains.
 DEFAULT_PITCH_LENGTH_FT: float = 224.7
+DEFAULT_ASPECT_RATIO: float = 1.5  # 9v9 length/width; x is a fraction of width, y of length
 HIDDEN_IDX: int = 5  # under-camera landmark, never ground-truth-visible
 
 
-def canonical_to_feet(
-    distance: float | NDArray[np.floating],
+def displacement_to_feet(
+    disp: NDArray[np.floating],
+    *,
     length_ft: float = DEFAULT_PITCH_LENGTH_FT,
-) -> float | NDArray[np.floating]:
-    """Convert a canonical-pitch distance (fraction of length) to feet."""
-    return distance * length_ft
+    aspect_ratio: float = DEFAULT_ASPECT_RATIO,
+) -> NDArray[np.float64]:
+    """Canonical (dx, dy) displacement(s) -> feet magnitude, scaling x by width
+    and y by length (the two pitch axes are independently normalized to [0,1]).
+    Accepts shape (2,) or (N, 2); returns scalar-array or (N,) feet."""
+    d = np.asarray(disp, dtype=np.float64)
+    width_ft = length_ft / aspect_ratio
+    scaled = d * np.array([width_ft, length_ft])
+    return np.asarray(np.hypot(scaled[..., 0], scaled[..., 1]), dtype=np.float64)
 
 
 def _apply_h(h: NDArray[np.floating], pts_px: NDArray[np.floating]) -> NDArray[np.float64]:
@@ -44,6 +53,7 @@ def keypoint_errors_feet(
     *,
     conf_thr: float = 0.5,
     length_ft: float = DEFAULT_PITCH_LENGTH_FT,
+    aspect_ratio: float = DEFAULT_ASPECT_RATIO,
 ) -> dict[int, float]:
     """Per-landmark feet error: map the model's predicted pixel through the GT
     homography into pitch space, compare to the canonical landmark.
@@ -57,8 +67,8 @@ def keypoint_errors_feet(
         if i == HIDDEN_IDX or gt_kpts[i, 2] <= 0 or model_kpts[i, 2] < conf_thr:
             continue
         pitch_pred = _apply_h(h_gt, model_kpts[i:i + 1, :2])[0]
-        d = float(np.hypot(*(pitch_pred - PITCH_LANDMARKS[i])))
-        out[i] = float(canonical_to_feet(d, length_ft))
+        disp = pitch_pred - PITCH_LANDMARKS[i]
+        out[i] = float(displacement_to_feet(disp, length_ft=length_ft, aspect_ratio=aspect_ratio))
     return out
 
 
@@ -68,6 +78,7 @@ def reproj_error_feet(
     gt_kpts: NDArray[np.floating],
     *,
     length_ft: float = DEFAULT_PITCH_LENGTH_FT,
+    aspect_ratio: float = DEFAULT_ASPECT_RATIO,
 ) -> float | None:
     """End-to-end check: at each GT-visible landmark's pixel, how far (feet) does
     the MODEL homography place it from the canonical truth? Median over visible
@@ -79,8 +90,9 @@ def reproj_error_feet(
         return None
     px = gt_kpts[idx, :2]
     pitch_via_model = _apply_h(model_h, px)
-    d = np.hypot(*(pitch_via_model - PITCH_LANDMARKS[idx]).T)
-    return float(canonical_to_feet(float(np.median(d)), length_ft))
+    disp = pitch_via_model - PITCH_LANDMARKS[idx]
+    feet = displacement_to_feet(disp, length_ft=length_ft, aspect_ratio=aspect_ratio)
+    return float(np.median(feet))
 
 
 def labeler_fit_residual_feet(
@@ -89,6 +101,7 @@ def labeler_fit_residual_feet(
     kp_indices: NDArray[np.integer],
     *,
     length_ft: float = DEFAULT_PITCH_LENGTH_FT,
+    aspect_ratio: float = DEFAULT_ASPECT_RATIO,
 ) -> float:
     """Labeler self-consistency: median feet error of its homography on its OWN
     clicked anchors. This is the noise-floor proxy that defines the
@@ -97,8 +110,9 @@ def labeler_fit_residual_feet(
     """
     idx = np.asarray(kp_indices)
     pitch_pred = _apply_h(h_gt, np.asarray(clicked_px, dtype=np.float64))
-    d = np.hypot(*(pitch_pred - PITCH_LANDMARKS[idx]).T)
-    return float(canonical_to_feet(float(np.median(d)), length_ft))
+    disp = pitch_pred - PITCH_LANDMARKS[idx]
+    feet = displacement_to_feet(disp, length_ft=length_ft, aspect_ratio=aspect_ratio)
+    return float(np.median(feet))
 
 
 @dataclass
@@ -134,6 +148,7 @@ def score_frame(
     match_threshold_feet: float,
     conf_thr: float = 0.5,
     length_ft: float = DEFAULT_PITCH_LENGTH_FT,
+    aspect_ratio: float = DEFAULT_ASPECT_RATIO,
 ) -> FrameScore:
     """Score one benchmark frame. A None / <4-confident model prediction yields a
     not-covered (non-matching) frame, never a skip."""
@@ -148,7 +163,7 @@ def score_frame(
         return FrameScore(frame, {}, None, None, gt_visible, [], False)
 
     errs = keypoint_errors_feet(h_gt, gt_kpts, model_kpts, conf_thr=conf_thr,
-                                length_ft=length_ft)
+                                length_ft=length_ft, aspect_ratio=aspect_ratio)
     predicted = sorted(errs)
     median_feet = float(np.median(list(errs.values()))) if errs else None
 
@@ -159,7 +174,8 @@ def score_frame(
     if len(conf_idx) >= 4:
         try:
             model_h = fit_homography(model_kpts[conf_idx, :2], PITCH_LANDMARKS[conf_idx])
-            reproj_feet = reproj_error_feet(h_gt, model_h, gt_kpts, length_ft=length_ft)
+            reproj_feet = reproj_error_feet(h_gt, model_h, gt_kpts, length_ft=length_ft,
+                                            aspect_ratio=aspect_ratio)
         except HomographyError:
             reproj_feet = None
 
@@ -179,6 +195,7 @@ def score_benchmark(
     match_threshold_feet: float,
     conf_thr: float = 0.5,
     length_ft: float = DEFAULT_PITCH_LENGTH_FT,
+    aspect_ratio: float = DEFAULT_ASPECT_RATIO,
     degenerate_cond: float = 1e8,
 ) -> EvalReport:
     """Score the model over the whole frozen benchmark. Degenerate-GT frames are
@@ -193,7 +210,7 @@ def score_benchmark(
         scores.append(score_frame(
             frame, h_gt, model_predictions.get(frame), frame_size=frame_size,
             match_threshold_feet=match_threshold_feet, conf_thr=conf_thr,
-            length_ft=length_ft))
+            length_ft=length_ft, aspect_ratio=aspect_ratio))
 
     n = len(scores)
     n_matched = sum(s.matches for s in scores)

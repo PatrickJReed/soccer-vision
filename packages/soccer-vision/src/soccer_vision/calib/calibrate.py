@@ -8,6 +8,7 @@ registration drift.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import cv2
@@ -30,6 +31,42 @@ def pitch_homography(h_world: NDArray[np.floating]) -> NDArray[np.float64]:
     """Convert a world-metres->pixel homography to canonical-[0,1]^2 -> pixel."""
     return np.asarray(np.asarray(h_world, dtype=np.float64) @ np.diag([WIDTH_M, LENGTH_M, 1.0]),
                       dtype=np.float64)
+
+
+def line_residual(
+    h_world: NDArray[np.floating],
+    p1_3d: NDArray[np.floating],
+    p2_3d: NDArray[np.floating],
+    clicked_px: tuple[float, float],
+) -> float:
+    """Perpendicular pixel distance from clicked_px to the image line through the
+    projections of the two world-metre line endpoints under h_world.
+
+    p1_3d / p2_3d are 3D world-metre endpoints on the Z=0 ground plane: only X, Y
+    are used (h_world is the ground-plane homography mapping (X, Y, 1) -> pixel),
+    so any Z component is ignored.
+
+    Returns 0.0 if the projected line is degenerate (endpoints coincide or project
+    at infinity) so a least-squares residual vector keeps a constant length.
+    """
+    h = np.asarray(h_world, dtype=np.float64)
+
+    def _project(p: NDArray[np.floating]) -> NDArray[np.float64] | None:
+        v = h @ np.array([float(p[0]), float(p[1]), 1.0])
+        if abs(v[2]) < 1e-9:
+            return None
+        return np.asarray(v[:2] / v[2], dtype=np.float64)
+
+    a = _project(p1_3d)
+    b = _project(p2_3d)
+    if a is None or b is None:
+        return 0.0
+    ell = np.cross([a[0], a[1], 1.0], [b[0], b[1], 1.0])
+    norm = math.hypot(float(ell[0]), float(ell[1]))
+    if norm < 1e-9:
+        return 0.0
+    u, v = clicked_px
+    return float(abs(ell[0] * u + ell[1] * v + ell[2]) / norm)
 
 
 class CalibError(Exception):

@@ -102,6 +102,70 @@ def _apply(H: NDArray[np.floating], pts: NDArray[np.floating]) -> NDArray[np.flo
     return out[:, :2] / out[:, 2:3]
 
 
+def propagate_clicks(
+    clicks: Sequence[Click],
+    transforms: Mapping[int, NDArray[np.floating]],
+    segment_of: Mapping[int, int],
+    *,
+    window: int,
+    frames: Sequence[int] | None = None,
+) -> dict[int, dict[int, tuple[float, float]]]:
+    """For each target frame, the propagated pixel of each landmark.
+
+    A click maps into a target frame g iff they share a segment and
+    |click.frame - g| <= window; for each landmark the nearest such click wins
+    (first in click order on ties). Returns {frame: {kp_idx: (x, y)}} in the same
+    (normalized) image space as the clicks/transforms.
+
+    frames: restrict the TARGET frames in the output (None = all frames in
+        transforms); candidate clicks are still drawn from the full click list.
+    """
+    out: dict[int, dict[int, tuple[float, float]]] = {}
+    if not clicks or not transforms:
+        return out
+    if frames is None:
+        target = sorted(transforms)
+    else:
+        target = sorted(set(transforms) & {int(f) for f in frames})
+    if not target:
+        return out
+    frame_arr = np.array(target, dtype=np.int64)
+    n = len(frame_arr)
+    m_stack = np.stack([np.asarray(transforms[int(f)], dtype=np.float64) for f in frame_arr])
+    m_inv = np.linalg.inv(m_stack)
+    frame_seg = np.array([segment_of[int(f)] for f in frame_arr], dtype=np.int64)
+
+    k = len(clicks)
+    click_frame = np.array([c.frame for c in clicks], dtype=np.int64)
+    click_seg = np.array([segment_of.get(c.frame, -1) for c in clicks], dtype=np.int64)
+    click_kp = np.array([c.kp_idx for c in clicks], dtype=np.int64)
+
+    pos = np.full((k, n, 2), np.nan)  # pos[j, g] = click j's pixel in frame g
+    for j, c in enumerate(clicks):
+        src_m = transforms.get(c.frame)
+        if src_m is None:
+            continue
+        ref = np.asarray(src_m, dtype=np.float64) @ np.array([c.x, c.y, 1.0])
+        dst = m_inv @ ref
+        pos[j] = dst[:, :2] / dst[:, 2:3]
+
+    dist = np.abs(click_frame[:, None] - frame_arr[None, :])
+    usable = (click_seg[:, None] == frame_seg[None, :]) & (dist <= window)
+    usable &= ~np.isnan(pos[:, :, 0])
+
+    big = np.iinfo(np.int64).max
+    for kp in sorted({int(v) for v in click_kp}):
+        rows = np.where(click_kp == kp)[0]
+        d = np.where(usable[rows], dist[rows], big)
+        choice = d.argmin(axis=0)  # first minimal row wins ties (click order)
+        ok = d[choice, np.arange(n)] != big
+        chosen = pos[rows[choice], np.arange(n)]
+        for gi in np.where(ok)[0]:
+            out.setdefault(int(frame_arr[gi]), {})[kp] = (
+                float(chosen[gi, 0]), float(chosen[gi, 1]))
+    return out
+
+
 def fit_frame_homographies(
     clicks: Sequence[Click],
     transforms: Mapping[int, NDArray[np.floating]],
@@ -125,66 +189,21 @@ def fit_frame_homographies(
         from anywhere within the window); None = all frames.
     """
     fits: dict[int, FrameFit] = {}
-    if not clicks or not transforms:
-        return fits
-
-    # Vectorized: project every click into every frame once, then pick the
-    # nearest usable click per (landmark, frame). Semantics match the original
-    # per-frame loop: |click.frame - g| <= window, same segment, nearest click
-    # frame wins (first in click order on ties).
-    if frames is None:
-        target = sorted(transforms)
-    else:
-        target = sorted(set(transforms) & {int(f) for f in frames})
-    if not target:
-        return fits
-    frame_arr = np.array(target, dtype=np.int64)
-    n = len(frame_arr)
-    m_stack = np.stack([np.asarray(transforms[int(f)], dtype=np.float64) for f in frame_arr])
-    m_inv = np.linalg.inv(m_stack)
-    frame_seg = np.array([segment_of[int(f)] for f in frame_arr], dtype=np.int64)
-
-    k = len(clicks)
-    click_frame = np.array([c.frame for c in clicks], dtype=np.int64)
-    click_seg = np.array([segment_of.get(c.frame, -1) for c in clicks], dtype=np.int64)
-    click_kp = np.array([c.kp_idx for c in clicks], dtype=np.int64)
-
-    pos = np.full((k, n, 2), np.nan)  # pos[j, g] = click j's pixel in frame g
-    for j, c in enumerate(clicks):
-        src_m = transforms.get(c.frame)
-        if src_m is None:
+    propagated = propagate_clicks(
+        clicks, transforms, segment_of, window=window, frames=frames)
+    lm = np.asarray(landmarks, dtype=np.float64)
+    for f, kpmap in propagated.items():
+        if len(kpmap) < min_points:
             continue
-        ref = np.asarray(src_m, dtype=np.float64) @ np.array([c.x, c.y, 1.0])
-        dst = m_inv @ ref
-        pos[j] = dst[:, :2] / dst[:, 2:3]
-
-    dist = np.abs(click_frame[:, None] - frame_arr[None, :])  # (k, n)
-    usable = (click_seg[:, None] == frame_seg[None, :]) & (dist <= window)
-    usable &= ~np.isnan(pos[:, :, 0])
-
-    big = np.iinfo(np.int64).max
-    sel_pos: dict[int, NDArray[np.float64]] = {}
-    sel_ok: dict[int, NDArray[np.bool_]] = {}
-    for kp in sorted({int(v) for v in click_kp}):
-        rows = np.where(click_kp == kp)[0]
-        d = np.where(usable[rows], dist[rows], big)
-        choice = d.argmin(axis=0)  # first minimal row wins ties (click order)
-        sel_ok[kp] = d[choice, np.arange(n)] != big
-        sel_pos[kp] = pos[rows[choice], np.arange(n)]
-
-    kps = sorted(sel_ok)
-    counts = np.stack([sel_ok[kp] for kp in kps]).sum(axis=0)
-    for gi in np.where(counts >= min_points)[0]:
-        idxs = [kp for kp in kps if sel_ok[kp][gi]]
-        image_pts = np.array([sel_pos[kp][gi] for kp in idxs], dtype=np.float64)
-        pitch_pts = np.asarray(landmarks, dtype=np.float64)[idxs]
+        idxs = sorted(kpmap)
+        image_pts = np.array([kpmap[i] for i in idxs], dtype=np.float64)
+        pitch_pts = lm[idxs]
         try:
             H = fit_homography(image_pts, pitch_pts)
         except HomographyError:
             continue
         errs = np.linalg.norm(_apply(H, image_pts) - pitch_pts, axis=1)
-        residual = float(np.median(errs))
-        fits[int(frame_arr[gi])] = FrameFit(H=H, residual=residual, n_points=len(idxs))
+        fits[f] = FrameFit(H=H, residual=float(np.median(errs)), n_points=len(idxs))
     return fits
 
 

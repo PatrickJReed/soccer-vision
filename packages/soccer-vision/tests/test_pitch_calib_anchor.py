@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+
 import cv2
 import numpy as np
 from soccer_vision.calib.calibrate import homography_from_pose, pitch_homography
 from soccer_vision.calib.field_model import field_points_3d
+from soccer_vision.labeler.chain import normalize_homography
 from soccer_vision.pitch.calib_anchor import (
     FramePose,
     _reproj_rms_px,
     calibrate_clicked_frames,
     frame_homography,
+    poses_by_click_propagation,
 )
 from soccer_vision.pitch.manual_anchor import (
     Click,
@@ -113,3 +117,78 @@ def test_reproj_rms_px_zero_for_exact_and_nan_for_empty() -> None:
     point_obs = [(i, float(px[n, 0]), float(px[n, 1])) for n, i in enumerate(ids)]
     assert _reproj_rms_px(_K, rvec, tvec, point_obs) < 1e-6  # exact projection -> ~0
     assert math.isnan(_reproj_rms_px(_K, rvec, tvec, []))    # no points -> nan
+
+
+def _pan_sequence(
+    n: int = 13,
+) -> tuple[dict[int, tuple[np.ndarray, np.ndarray]], dict[int, np.ndarray]]:
+    """A fixed-centre camera panning across n frames (the Trace motion model).
+
+    Returns ({frame: (rvec, tvec)}, {i: normalized inter-frame homography}); the
+    chain is the physically-correct pan homography G = K R_{i+1} R_i^-1 K^-1, so
+    clicks/poses propagate consistently (unlike an identity chain over different
+    views).
+    """
+    center = (-8.0, 34.0, 9.0)
+    poses: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for f, dy in enumerate(np.linspace(-10.0, 10.0, n)):
+        poses[f] = _look_at(center, (22.85, 34.0 + float(dy), 0.0))
+    interframe: dict[int, np.ndarray] = {}
+    for i in range(n - 1):
+        ri, _ = cv2.Rodrigues(poses[i][0])
+        rj, _ = cv2.Rodrigues(poses[i + 1][0])
+        g_px = _K @ rj @ np.linalg.inv(ri) @ np.linalg.inv(_K)
+        interframe[i] = normalize_homography(g_px, (1920, 1080))
+    return poses, interframe
+
+
+def _clicks_at(
+    poses: Mapping[int, tuple[np.ndarray, np.ndarray]],
+    frames: Sequence[int],
+    size: tuple[int, int] = (1920, 1080),
+) -> list[Click]:
+    """Normalized clicks at the given frames from their true poses."""
+    w, h = size
+    fp = field_points_3d()
+    clicks: list[Click] = []
+    for f in frames:
+        rvec, tvec = poses[f]
+        px = cv2.projectPoints(fp, rvec, tvec, _K, np.zeros(5))[0].reshape(-1, 2)
+        for j in range(21):
+            if j != 5 and 0 < px[j, 0] < w and 0 < px[j, 1] < h:  # 5 = hidden landmark
+                clicks.append(Click(f, j, float(px[j, 0]) / w, float(px[j, 1]) / h))
+    return clicks
+
+
+def test_engine_a_recovers_clicked_and_propagated_frames() -> None:
+    # Realistic fixed-camera pan: a VALID chain links all frames. Clicks at a few
+    # frames calibrate the focal; Engine A propagates to recover EVERY frame's pose
+    # (clicked AND unclicked) against the field -- no fold, no drift.
+    poses, interframe = _pan_sequence(13)
+    clicks = _clicks_at(poses, [0, 4, 8, 12])
+    seg = build_segments(interframe, 13)
+    transforms = cumulative_transforms(interframe, seg)
+    k, _kp = calibrate_clicked_frames(clicks, (1920, 1080), min_points=6)
+    out = poses_by_click_propagation(clicks, transforms, seg, k, (1920, 1080),
+                                     window=360, min_points=4)
+    assert len(out) == 13  # every frame covered (clicked + propagated)
+    fp = field_points_3d()
+    for f in range(13):
+        truth = cv2.projectPoints(fp, poses[f][0], poses[f][1], _K, np.zeros(5))[0].reshape(-1, 2)
+        rec = cv2.projectPoints(fp, out[f].rvec, out[f].tvec, _K, np.zeros(5))[0].reshape(-1, 2)
+        assert np.median(np.linalg.norm(truth - rec, axis=1)) < 1.0  # recovered ~= truth
+        assert out[f].fold_count < 21  # not a fold
+
+
+def test_engine_a_line_obs_path_runs() -> None:
+    # an extra line observation at a frame still solves (refine_pose line path
+    # exercised; real line propagation is Phase 3b).
+    poses, interframe = _pan_sequence(9)
+    clicks = _clicks_at(poses, [0, 4, 8])
+    seg = build_segments(interframe, 9)
+    transforms = cumulative_transforms(interframe, seg)
+    k, _kp = calibrate_clicked_frames(clicks, (1920, 1080), min_points=6)
+    line_obs = {0: [("midline", 960.0, 540.0)]}
+    out = poses_by_click_propagation(clicks, transforms, seg, k, (1920, 1080),
+                                     window=360, min_points=4, line_obs=line_obs)
+    assert 0 in out

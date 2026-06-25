@@ -57,3 +57,12 @@ def test_leave_one_out_feet_perfect_projection() -> None:
     errs = leave_one_out_feet(obs, _K, (1920, 1080), min_other=4)
     allv = [v for vals in errs.values() for v in vals]
     assert allv and max(allv) < 1.0  # perfect data -> sub-foot held-out error
+
+
+def test_fold_count_sideline_view_excludes_far_field() -> None:
+    # camera low behind the near touchline (x<0) near the OWN goal end (y small),
+    # looking at the own-goal area -> the opp-goal end is off-screen/behind.
+    rvec, tvec = _look_at((-6.0, 8, 5), (22.85, 6, 0))
+    Hp = pitch_homography(homography_from_pose(_K, rvec, tvec))
+    fc = fold_count(Hp, (1920, 1080))
+    assert fc < 14, f"sideline one-goal view should see a slice, not whole field; got {fc}/21"

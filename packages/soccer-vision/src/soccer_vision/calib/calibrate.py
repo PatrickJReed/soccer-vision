@@ -111,6 +111,7 @@ def calibrate_camera(
     """
     w, h = frame_size
     frames, objp, imgp = _build_views(observations, min_points)
+    sparse_dropped = len(observations) - len(frames)
     if len(frames) < 3:
         raise CalibError(
             f"need >= 3 calibratable views (>= {min_points} landmarks each); got {len(frames)}")
@@ -141,8 +142,8 @@ def calibrate_camera(
     rms = _per_view_rms(objp, imgp, k, dist, rvecs, tvecs)
 
     keep = [i for i, r in enumerate(rms) if r <= rms_reject_px]
-    n_excluded = len(frames) - len(keep)
-    if 0 < n_excluded <= len(frames) - 3:
+    n_excluded = sparse_dropped + (len(frames) - len(keep))
+    if 0 < (len(frames) - len(keep)) <= len(frames) - 3:
         frames = [frames[i] for i in keep]
         objp = [objp[i] for i in keep]
         imgp = [imgp[i] for i in keep]

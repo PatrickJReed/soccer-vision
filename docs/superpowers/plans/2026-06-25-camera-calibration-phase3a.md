@@ -1001,7 +1001,7 @@ git commit -m "feat(pitch): compare_engines harness (free-fit vs A vs B) + noteb
 ## Done criteria
 - `propagate_clicks` extracted; `fit_frame_homographies` unchanged in behavior (existing suite green).
 - `calib_anchor`: `FramePose`, `frame_homography` (px→pitch export form), `calibrate_clicked_frames`, Engine A (`poses_by_click_propagation`, SQPNP+refine, line_obs path wired), Engine B (`poses_by_pose_propagation` + `_rotation_from_chain`, recovers panned poses, degenerate-safe).
-- `compare_engines` returns the three-way `EngineMetrics` (coverage / folds / held-out feet).
+- `compare_engines` returns the three-way `EngineMetrics` (coverage / folds / reprojection feet + per-frame drift).
 - A thin notebook for the user's real full-game run.
 - Full suite + ruff + root mypy green for touched files. No `labeler/` integration (Phase 3b).
 

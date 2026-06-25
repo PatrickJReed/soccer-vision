@@ -97,6 +97,86 @@ def _fold_for_pose(
     return fold_count(pitch_homography(homography_from_pose(k, rvec, tvec)), size)
 
 
+def _rotation_from_chain(
+    g_px: NDArray[np.floating], k: NDArray[np.floating]
+) -> NDArray[np.float64]:
+    """Relative camera rotation from an inter-frame PIXEL homography G = K R_rel K^-1.
+
+    M = K^-1 G K equals R_rel up to scale; the nearest rotation (SVD U V^T, with the
+    sign fix for a proper rotation) is returned, so a noisy / non-rotation transform
+    degrades gracefully to the closest valid rotation.
+    """
+    k64 = np.asarray(k, dtype=np.float64)
+    m = np.linalg.inv(k64) @ np.asarray(g_px, dtype=np.float64) @ k64
+    u, _s, vt = np.linalg.svd(m)
+    r = u @ vt
+    if np.linalg.det(r) < 0:
+        u = u.copy()
+        u[:, -1] *= -1
+        r = u @ vt
+    return np.asarray(r, dtype=np.float64)
+
+
+def poses_by_pose_propagation(
+    transforms: Mapping[int, NDArray[np.floating]],
+    segment_of: Mapping[int, int],
+    k: NDArray[np.floating],
+    clicked_poses: Mapping[int, tuple[NDArray[np.floating], NDArray[np.floating]]],
+    size: tuple[int, int],
+    *,
+    frames: Sequence[int] | None = None,
+) -> dict[int, FramePose]:
+    """Engine B: propagate each clicked frame's pose to neighbours via the chain.
+
+    For a target frame f, take the nearest clicked frame c in the same segment, the
+    chain transform G_{c->f} = inv(M[f]) @ M[c] (converted normalized->pixel), recover
+    the relative camera rotation, and compose it onto c's pose, keeping the (fixed)
+    optical centre. A frame with no clicked frame in its segment is left uncovered.
+    Returns {frame: FramePose} (n_points=0; residual_px=nan -- no obs at f).
+
+    Precondition: clicked_poses keys are frames present in `transforms` (clicked
+    frames are video frames, so the labeler always satisfies this).
+    """
+    w, h = size
+    d_mat = np.diag([float(w), float(h), 1.0])
+    d_inv = np.diag([1.0 / w, 1.0 / h, 1.0])
+    k_arr = np.asarray(k, dtype=np.float64)
+    clicked = sorted(clicked_poses)
+    clicked_seg = {c: segment_of.get(c) for c in clicked}
+    targets = sorted(transforms) if frames is None else [
+        int(f) for f in frames if int(f) in transforms]
+    out: dict[int, FramePose] = {}
+    for f in targets:
+        seg = segment_of.get(f)
+        cands = [c for c in clicked if clicked_seg[c] == seg]
+        if not cands:
+            continue
+        c = min(cands, key=lambda cc: abs(cc - f))
+        rc, _ = cv2.Rodrigues(np.asarray(clicked_poses[c][0], dtype=np.float64))
+        tc = np.asarray(clicked_poses[c][1], dtype=np.float64).reshape(3)
+        if c == f:
+            r_f, t_f = rc, tc.reshape(3, 1)
+        else:
+            g_norm = np.linalg.inv(np.asarray(transforms[f], dtype=np.float64)) \
+                @ np.asarray(transforms[c], dtype=np.float64)
+            g_px = d_mat @ g_norm @ d_inv
+            r_rel = _rotation_from_chain(g_px, k_arr)
+            r_f = r_rel @ rc
+            center = -rc.T @ tc                 # fixed optical centre
+            t_f = (-r_f @ center).reshape(3, 1)
+        rvec_f, _ = cv2.Rodrigues(r_f)
+        rvec_f_arr = np.asarray(rvec_f, dtype=np.float64)
+        t_f_arr = np.asarray(t_f, dtype=np.float64)
+        out[f] = FramePose(
+            rvec=rvec_f_arr,
+            tvec=t_f_arr,
+            residual_px=float("nan"),
+            n_points=0,
+            fold_count=_fold_for_pose(k_arr, rvec_f_arr, t_f_arr, size),
+        )
+    return out
+
+
 def poses_by_click_propagation(
     clicks: Sequence[Click],
     transforms: Mapping[int, NDArray[np.floating]],

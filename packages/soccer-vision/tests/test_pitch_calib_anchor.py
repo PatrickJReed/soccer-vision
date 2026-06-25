@@ -12,9 +12,11 @@ from soccer_vision.labeler.chain import normalize_homography
 from soccer_vision.pitch.calib_anchor import (
     FramePose,
     _reproj_rms_px,
+    _rotation_from_chain,
     calibrate_clicked_frames,
     frame_homography,
     poses_by_click_propagation,
+    poses_by_pose_propagation,
 )
 from soccer_vision.pitch.manual_anchor import (
     Click,
@@ -192,3 +194,48 @@ def test_engine_a_line_obs_path_runs() -> None:
     out = poses_by_click_propagation(clicks, transforms, seg, k, (1920, 1080),
                                      window=360, min_points=4, line_obs=line_obs)
     assert 0 in out
+
+
+def test_engine_b_recovers_panned_poses_from_one_clicked_frame() -> None:
+    poses, interframe = _pan_sequence(7)
+    seg = build_segments(interframe, 7)
+    transforms = cumulative_transforms(interframe, seg)
+    # only frame 0 is "clicked" (calibrated); propagate its pose to all others
+    clicked_poses = {0: poses[0]}
+    out = poses_by_pose_propagation(transforms, seg, _K, clicked_poses, (1920, 1080))
+    fp = field_points_3d()
+    for f in range(7):
+        assert f in out
+        truth = cv2.projectPoints(fp, poses[f][0], poses[f][1], _K, np.zeros(5))[0].reshape(-1, 2)
+        rec = cv2.projectPoints(fp, out[f].rvec, out[f].tvec, _K, np.zeros(5))[0].reshape(-1, 2)
+        assert np.max(np.linalg.norm(truth - rec, axis=1)) < 0.5  # prototype: ~1e-11
+        assert out[f].n_points == 0
+
+
+def test_rotation_from_chain_clamps_reflection_to_proper_rotation() -> None:
+    # a reflection (det -1) must be clamped to a PROPER rotation in SO(3) (det +1) --
+    # this exercises the det-sign-flip branch of _rotation_from_chain.
+    g_px = _K @ np.diag([-1.0, 1.0, 1.0]) @ np.linalg.inv(_K)
+    r = _rotation_from_chain(g_px, _K)
+    assert abs(np.linalg.det(r) - 1.0) < 1e-9          # proper rotation
+    assert np.allclose(r @ r.T, np.eye(3), atol=1e-9)  # orthonormal
+
+
+def test_engine_b_uncovered_without_clicked_neighbor() -> None:
+    _poses, interframe = _pan_sequence(5)
+    seg = build_segments(interframe, 5)
+    transforms = cumulative_transforms(interframe, seg)
+    # no clicked frames at all -> nothing covered
+    out = poses_by_pose_propagation(transforms, seg, _K, {}, (1920, 1080))
+    assert out == {}
+
+
+def test_engine_b_nonrotation_chain_does_not_crash() -> None:
+    # a degenerate inter-frame transform -> SVD nearest-rotation, still returns a pose
+    poses, interframe = _pan_sequence(3)
+    interframe[1] = normalize_homography(
+        np.array([[1.0, 0.3, 5.0], [0.0, 1.2, 2.0], [1e-4, 0.0, 1.0]]), (1920, 1080))
+    seg = build_segments(interframe, 3)
+    transforms = cumulative_transforms(interframe, seg)
+    out = poses_by_pose_propagation(transforms, seg, _K, {0: poses[0]}, (1920, 1080))
+    assert all(np.all(np.isfinite(p.rvec)) and np.all(np.isfinite(p.tvec)) for p in out.values())

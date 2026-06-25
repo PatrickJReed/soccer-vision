@@ -5,7 +5,12 @@ from __future__ import annotations
 import cv2
 import numpy as np
 import pytest
-from soccer_vision.calib.calibrate import homography_from_pose, line_residual
+from soccer_vision.calib.calibrate import (
+    CalibError,
+    homography_from_pose,
+    line_residual,
+    refine_pose,
+)
 from soccer_vision.calib.field_model import (
     FIELD_LINES,
     LENGTH_M,
@@ -118,3 +123,109 @@ def test_line_residual_degenerate_endpoints_returns_zero() -> None:
     h = np.array([[0.0, 0.0, 100.0], [0.0, 0.0, 200.0], [0.0, 0.0, 1.0]])  # maps everything to (100,200)
     d = line_residual(h, p1, p2, (300.0, 400.0))
     assert d == 0.0
+
+
+def _project_ids(
+    rvec: np.ndarray, tvec: np.ndarray, ids: list[int], k: np.ndarray = _K
+) -> dict[int, tuple[float, float]]:
+    fp = field_points_3d()
+    px = cv2.projectPoints(fp[ids], rvec, tvec, k, np.zeros(5))[0].reshape(-1, 2)
+    return {i: (float(px[n, 0]), float(px[n, 1])) for n, i in enumerate(ids)}
+
+
+def test_refine_pose_too_few_constraints_raises() -> None:
+    rvec, tvec = _look_at((-8.0, 34.0, 8.0), (22.85, 34.0, 0.0))
+    # 2 points (4 residuals) + 1 line (1 residual) = 5 < 6
+    pts = _project_ids(rvec, tvec, [1, 3])
+    point_obs = [(i, x, y) for i, (x, y) in pts.items()]
+    line_obs = [("near_touchline", 500.0, 500.0)]
+    with pytest.raises(CalibError):
+        refine_pose(_K, rvec, tvec, point_obs, line_obs)
+
+
+def test_refine_pose_bad_point_index_raises() -> None:
+    rvec, tvec = _look_at((-8.0, 34.0, 8.0), (22.85, 34.0, 0.0))
+    # 3 points (6 residuals >= min) but kp_idx 99 is out of range -> CalibError, not IndexError
+    point_obs = [(1, 100.0, 100.0), (3, 200.0, 200.0), (99, 300.0, 300.0)]
+    with pytest.raises(CalibError):
+        refine_pose(_K, rvec, tvec, point_obs, [])
+
+
+def _inframe(px: np.ndarray, w: int = 1920, h: int = 1080) -> bool:
+    return bool(0 < px[0] < w and 0 < px[1] < h)
+
+
+def test_refine_pose_roundtrip_recovers_true_pose() -> None:
+    # Noiseless full obs from a known pose; seed a perturbed pose; refine must return
+    # to the truth (point reprojection residual ~0).
+    rvec, tvec = _look_at((-8.0, 34.0, 8.0), (22.85, 34.0, 0.0))
+    ids = [1, 3, 4, 6, 7, 8, 10, 12, 14, 16]
+    pts = _project_ids(rvec, tvec, ids)
+    point_obs = [(i, x, y) for i, (x, y) in pts.items()]
+    # one midline line click: a pixel on the midline (y=L/2), in frame
+    on_line = cv2.projectPoints(
+        np.array([[22.0, 34.25, 0.0]]), rvec, tvec, _K, np.zeros(5))[0].reshape(2)
+    line_obs = [("midline", float(on_line[0]), float(on_line[1]))]
+    rvec0 = rvec + np.array([[0.03], [-0.02], [0.01]])
+    tvec0 = tvec + np.array([[1.5], [-1.0], [0.8]])
+    rr, tt = refine_pose(_K, rvec0, tvec0, point_obs, line_obs)
+    # reprojection of the clicked points under the recovered pose is ~exact
+    proj = cv2.projectPoints(field_points_3d()[ids], rr, tt, _K, np.zeros(5))[0].reshape(-1, 2)
+    truth = np.array([pts[i] for i in ids])
+    assert np.max(np.linalg.norm(proj - truth, axis=1)) < 0.5
+
+
+def test_line_constraint_tightens_underconstrained_midline() -> None:
+    # THE GATE (Patrick's complaint #1: the midline's NEAR part is never labeled,
+    # only the far end). A Trace-like midfield sideline view. Every clickable point
+    # landmark in view sits at x >= ~22 m (centre line and the far half) -- the NEAR
+    # half of the visible midline (x ~ 3..20 m) has NO point support, so points-only
+    # must EXTRAPOLATE it. Under click noise that extrapolation swings; a single
+    # midline line click in the near region pins it. Averaged over fixed noise draws,
+    # points+line beats points-only on a held-out near-midline point. All clicks are
+    # IN FRAME (a realistic labeler click), unlike the near touchline which projects
+    # below the frame bottom in this geometry.
+    rvec, tvec = _look_at((-8.0, 34.0, 8.0), (22.85, 40.0, 0.0))
+    fp = field_points_3d()
+    allpx = cv2.projectPoints(fp, rvec, tvec, _K, np.zeros(5))[0].reshape(-1, 2)
+    # realistic: click EVERY in-frame landmark (idx 5 is hidden under the camera)
+    ids = [i for i in range(21) if i != 5 and _inframe(allpx[i])]
+    clean = {i: (float(allpx[i, 0]), float(allpx[i, 1])) for i in ids}
+    # visible span of the midline (y = L/2); held-out + line-click both in its NEAR,
+    # point-free region, at DIFFERENT points (so the line must generalise, not memo)
+    y_mid = 34.25
+    xs = np.linspace(0.0, 45.7, 80)
+    mlpx = cv2.projectPoints(
+        np.column_stack([xs, np.full(80, y_mid), np.zeros(80)]), rvec, tvec, _K, np.zeros(5)
+    )[0].reshape(-1, 2)
+    vis_x = sorted(float(x) for x, px in zip(xs, mlpx, strict=True) if _inframe(px))
+    x_held, x_click = vis_x[0] + 3.0, vis_x[0] + 8.0
+    held_world = np.array([[x_held, y_mid, 0.0]])
+    held_px = cv2.projectPoints(held_world, rvec, tvec, _K, np.zeros(5))[0].reshape(2)
+    line_px = cv2.projectPoints(
+        np.array([[x_click, y_mid, 0.0]]), rvec, tvec, _K, np.zeros(5))[0].reshape(2)
+    assert _inframe(held_px) and _inframe(line_px)  # realistic in-frame clicks
+
+    rng = np.random.default_rng(2)
+    err_points_only: list[float] = []
+    err_points_line: list[float] = []
+    for _ in range(10):
+        noisy = {i: (x + rng.normal(0, 2.0), y + rng.normal(0, 2.0)) for i, (x, y) in clean.items()}
+        point_obs = [(i, x, y) for i, (x, y) in noisy.items()]
+        line_obs = [("midline", float(line_px[0]), float(line_px[1]))]
+        # Both arms seed from the TRUE pose, so the test isolates the line
+        # constraint's benefit from any seed-recovery confound (if anything this
+        # favours the points-only arm).
+        ra, ta = refine_pose(_K, rvec, tvec, point_obs, [])
+        rb, tb = refine_pose(_K, rvec, tvec, point_obs, line_obs)
+        pa = cv2.projectPoints(held_world, ra, ta, _K, np.zeros(5))[0].reshape(2)
+        pb = cv2.projectPoints(held_world, rb, tb, _K, np.zeros(5))[0].reshape(2)
+        err_points_only.append(float(np.linalg.norm(pa - held_px)))
+        err_points_line.append(float(np.linalg.norm(pb - held_px)))
+
+    mean_only = float(np.mean(err_points_only))
+    mean_line = float(np.mean(err_points_line))
+    # the line constraint must MATERIALLY tighten the under-constrained near midline.
+    # Prototyped value with this seed: ratio ~0.77 (≈23% lower held-out error).
+    assert mean_line < mean_only, f"line did not help: only={mean_only:.1f} line={mean_line:.1f}"
+    assert mean_line < 0.85 * mean_only, f"line gain too small: only={mean_only:.1f} line={mean_line:.1f}"

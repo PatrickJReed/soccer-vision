@@ -14,8 +14,9 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 from numpy.typing import NDArray
+from scipy.optimize import least_squares  # type: ignore[import-untyped]
 
-from soccer_vision.calib.field_model import LENGTH_M, WIDTH_M, field_points_3d
+from soccer_vision.calib.field_model import LENGTH_M, WIDTH_M, field_line_3d, field_points_3d
 
 
 def homography_from_pose(
@@ -200,3 +201,59 @@ def calibrate_camera(
         frames=frames,
         n_excluded=n_excluded,
     )
+
+
+def refine_pose(
+    k: NDArray[np.floating],
+    rvec0: NDArray[np.floating],
+    tvec0: NDArray[np.floating],
+    point_obs: list[tuple[int, float, float]],
+    line_obs: list[tuple[str, float, float]],
+    *,
+    min_constraints: int = 6,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Refine a camera pose (rvec, tvec) against point + line observations.
+
+    Minimizes, via scipy least-squares over the 6 pose DOF (focal `k` held fixed):
+    per point, the 2 reprojection-error components; per line click, the 1
+    point-to-projected-line distance. Seeded at (rvec0, tvec0) — e.g. a Phase-1
+    `calibrate_camera` pose. Raises CalibError if the constraint count
+    (`2*len(point_obs) + len(line_obs)`) is below `min_constraints` (a 6-DOF pose
+    needs >= 6 residuals) or the solve does not converge to a finite pose.
+    """
+    n_constraints = 2 * len(point_obs) + len(line_obs)
+    if n_constraints < min_constraints:
+        raise CalibError(
+            f"need >= {min_constraints} constraints to refine a 6-DOF pose; "
+            f"got {n_constraints} ({len(point_obs)} points + {len(line_obs)} lines)")
+
+    k_arr = np.asarray(k, dtype=np.float64)
+    dist0 = np.zeros(5, dtype=np.float64)
+    fp = field_points_3d()
+    point_ids = [int(kp) for kp, _, _ in point_obs]
+    if any(not 0 <= i < len(fp) for i in point_ids):
+        raise CalibError(f"point landmark index out of range [0, {len(fp)}): {point_ids}")
+    obj = fp[point_ids].astype(np.float64) if point_ids else np.zeros((0, 3))
+    img = np.array([[x, y] for _, x, y in point_obs], dtype=np.float64).reshape(-1, 2)
+    lines = [(field_line_3d(lid), (float(x), float(y))) for lid, x, y in line_obs]
+
+    def residuals(params: NDArray[np.float64]) -> NDArray[np.float64]:
+        rvec = params[:3].reshape(3, 1)
+        tvec = params[3:].reshape(3, 1)
+        parts: list[NDArray[np.float64]] = []
+        if len(point_ids):
+            proj = cv2.projectPoints(obj, rvec, tvec, k_arr, dist0)[0].reshape(-1, 2)
+            parts.append((proj - img).ravel())
+        if lines:
+            h = homography_from_pose(k_arr, rvec, tvec)
+            parts.append(np.array([line_residual(h, p1, p2, px) for (p1, p2), px in lines]))
+        return np.concatenate(parts) if parts else np.zeros(0)
+
+    x0 = np.concatenate(
+        [np.asarray(rvec0, dtype=np.float64).ravel(), np.asarray(tvec0, dtype=np.float64).ravel()])
+    sol = least_squares(residuals, x0, method="trf")
+    if sol.status < 1 or not np.all(np.isfinite(sol.x)):
+        raise CalibError(
+            f"pose refinement did not converge (status {sol.status}); "
+            "the refined pose is not returned — the caller must handle this")
+    return sol.x[:3].reshape(3, 1).copy(), sol.x[3:].reshape(3, 1).copy()

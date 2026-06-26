@@ -100,6 +100,41 @@ def test_solve_global_recovers_homography_and_projects_unclicked_end() -> None:
         assert np.allclose(proj, PITCH_LANDMARKS[kp], atol=1e-6)
 
 
+def test_solve_global_rejects_grossly_mislabeled_click() -> None:
+    # cv2.findHomography's default ransacReprojThreshold (3.0) is in the DESTINATION
+    # space, which here is pitch [0,1] — so 3.0 makes EVERY click an inlier and no
+    # outlier is ever rejected. solve_global must pass a pitch-unit threshold so that
+    # one grossly-mislabeled click does not corrupt the whole segment's global H.
+    from soccer_vision.eval.pitch_metrics import displacement_to_feet
+
+    clicks, transforms, segment_of, H_ref_to_pitch, own_end, opp_end = _build_session()
+    H_pitch_to_ref = np.linalg.inv(H_ref_to_pitch)
+
+    # Corrupt exactly ONE existing frame-0 click by ~0.25 in normalized image space.
+    bad = list(clicks)
+    corrupted = False
+    for i, c in enumerate(bad):
+        if c.frame == 0:
+            bad[i] = Click(c.frame, c.kp_idx, c.x + 0.25, c.y + 0.25)
+            corrupted = True
+            break
+    assert corrupted
+
+    dirty = solve_global(bad, transforms, segment_of, SIZE)
+    h_dirty = dirty.h_by_segment[0]  # reference-image-norm -> pitch[0,1]
+
+    # Every true landmark's reference pixel must STILL map to its canonical pitch
+    # coord within a few feet -> the one gross outlier was rejected by the RANSAC fit.
+    # Without the pitch-unit threshold the bad click pulls the fit and this blows up.
+    for kp in own_end + opp_end:
+        ref = H_pitch_to_ref @ np.array([*PITCH_LANDMARKS[kp], 1.0])
+        ref = ref[:2] / ref[2]
+        proj = h_dirty @ np.array([ref[0], ref[1], 1.0])
+        proj = proj[:2] / proj[2]
+        ft = float(displacement_to_feet(proj - PITCH_LANDMARKS[kp]))
+        assert ft < 3.0, f"kp {kp}: {ft:.2f} ft off -> outlier not rejected"
+
+
 def test_two_ended_segments_detects_both_ends() -> None:
     clicks, _transforms, segment_of, *_ = _build_session()
     assert two_ended_segments(clicks, segment_of) == {0}

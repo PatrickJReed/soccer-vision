@@ -16,6 +16,8 @@ class HomographyError(ValueError):
 def fit_homography(
     image_points: NDArray[np.floating],
     pitch_points: NDArray[np.floating],
+    *,
+    ransac_thresh: float | None = None,
 ) -> NDArray[np.floating]:
     """Fit a 3x3 homography mapping image_points -> pitch_points.
 
@@ -25,6 +27,12 @@ def fit_homography(
         Nx2 array of pixel coords from the source frame.
     pitch_points
         Nx2 array of corresponding canonical-pitch coords (in [0, 1]^2 typically).
+    ransac_thresh
+        RANSAC reprojection threshold measured in the DESTINATION (pitch) space.
+        When None (default) the call is identical to before — cv2.findHomography uses
+        its built-in default of 3.0, which in pitch [0,1] units makes every point an
+        inlier (no rejection). Set it to a small pitch-unit value to actually reject
+        gross outliers.
 
     Returns
     -------
@@ -46,7 +54,13 @@ def fit_homography(
         raise HomographyError(
             f"Need at least 4 corresponding points; got {image_points.shape[0]}"
         )
-    H, _ = cv2.findHomography(image_points, pitch_points, method=cv2.RANSAC)
+    if ransac_thresh is None:
+        H, _ = cv2.findHomography(image_points, pitch_points, method=cv2.RANSAC)
+    else:
+        H, _ = cv2.findHomography(
+            image_points, pitch_points, method=cv2.RANSAC,
+            ransacReprojThreshold=ransac_thresh,
+        )
     if H is None:
         raise HomographyError("cv2.findHomography returned None — degenerate input")
     return H.astype(np.float64)

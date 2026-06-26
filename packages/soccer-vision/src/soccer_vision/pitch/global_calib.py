@@ -87,12 +87,21 @@ def solve_global(
     size: tuple[int, int],
     *,
     min_points: int = 4,
+    outlier_thresh: float = 0.05,
 ) -> GlobalCalib:
     """Fit one image_ref -> pitch homography per segment from all clicks pooled.
 
     Each click is lifted to its segment's reference frame via the cumulative
     transform reduced to a 2D translation, then cv2.findHomography (RANSAC) fits
     the segment's homography over the union of its clicks (RANSAC rejects outliers).
+
+    outlier_thresh is the RANSAC reprojection threshold in PITCH [0,1] units
+    (~0.05 ≈ 3.4 m on a 68.5 m-wide pitch): large enough to keep legitimate clicks
+    including mild chain-offset drift, small enough to reject a grossly-mislabeled
+    click that would otherwise corrupt the whole segment's global homography. (The
+    default findHomography threshold of 3.0 is in this same pitch space, so it would
+    make every click an inlier — no rejection at all.) Task 6's cross-end validation
+    is what tunes this value against real sessions.
     """
     offsets = {f: _translation_of(m) for f, m in transforms.items()}
     img_by_seg: dict[int, list[list[float]]] = {}
@@ -116,7 +125,7 @@ def solve_global(
         img = np.asarray(img_list, dtype=np.float64)
         pitch = np.asarray(pitch_by_seg[seg], dtype=np.float64)
         try:
-            h = fit_homography(img, pitch)
+            h = fit_homography(img, pitch, ransac_thresh=outlier_thresh)
         except HomographyError:
             continue
         proj = _apply_h(h, img)

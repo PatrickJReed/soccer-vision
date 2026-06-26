@@ -63,6 +63,7 @@ def make_handler(
                 "landmark_xy": xy,
                 "line_names": lines,
                 "pending": state.pending(),
+                "residual_px_threshold": state.residual_px_threshold,
             }
 
         def do_GET(self) -> None:

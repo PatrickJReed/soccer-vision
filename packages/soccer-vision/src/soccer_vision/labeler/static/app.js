@@ -2,6 +2,7 @@ const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
 const NAMES = []; let LXY = []; let N = 0; let armed = 0; let cur = 0; let showGrid = true;
 let status = []; let bucketSize = 1; let nFrames = 0; let placed = new Set(); let clicks = []; let curH = null;
+let residualThreshold = 60.0;   // per-frame readout colour cutoff; set from /api/state
 let LINE_NAMES = []; let armedLine = null; let lineClicks = [];
 let pendingPoll = null;   // setInterval handle while a background refit is in flight
 const LINE_COLORS = {near_touchline:"#ff5ca8", far_touchline:"#5cc8ff",
@@ -92,7 +93,7 @@ async function loadFrame(i){
   if (fh.residual == null) { resEl.textContent = "—"; resEl.style.color = ""; }
   else {
     resEl.textContent = fh.residual.toFixed(3) + " (" + fh.n_points + " pts)";
-    resEl.style.color = fh.residual <= 0.05 ? "#39d98a" : "#ffb454";
+    resEl.style.color = fh.residual <= residualThreshold ? "#39d98a" : "#ffb454";
   }
   img.onload=drawFrame; img.src=`/api/frame/${i}?t=${Date.now()}`;
 }
@@ -104,6 +105,7 @@ function applyState(st){
   status = st.status_buckets;
   bucketSize = st.bucket_size;
   nFrames = st.n_frames;
+  residualThreshold = st.residual_px_threshold || 60.0;
   maybePoll(st.pending || 0);
   document.getElementById("cov").textContent=Math.round(st.coverage*100)+"%";
   document.getElementById("nclicks").textContent=st.n_clicks;

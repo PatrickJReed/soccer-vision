@@ -132,3 +132,49 @@ def test_line_obs_scoped_to_line_band() -> None:
     obs = st._line_obs(list(range(9)))
     carrying = sorted(f for f, lst in obs.items() if lst)
     assert carrying == [3, 4, 5]
+
+
+def test_add_click_fits_current_frame_synchronously() -> None:
+    interframe, _poses, clicks = _pan_session(40)
+    st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080), window=360)
+    try:
+        # bootstrap on all but the last click, synchronously (bulk)
+        st.add_clicks(clicks[:-1])
+        last = clicks[-1]
+        st.add_click(last.frame, last.kp_idx, last.x, last.y)
+        # the clicked frame is fit on return, BEFORE the background worker drains
+        assert st.frame_homography(last.frame) is not None
+    finally:
+        st.stop_worker()
+
+
+def test_async_refit_matches_synchronous_full_recompute() -> None:
+    interframe, _poses, clicks = _pan_session(40)
+    st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080),
+                      window=360, line_band=60)
+    try:
+        for c in clicks:
+            st.add_click(c.frame, c.kp_idx, c.x, c.y)
+        st.wait_idle(timeout=10)
+        fits_async = {f: cf.H.copy() for f, cf in st._fits.items()}
+        # synchronous full recompute on the SAME calibrated state (same K)
+        ref = st._compute_dirty(sorted(st._transforms), lambda: False)
+        assert ref is not None
+        expected = {f: st._calib_frame(p).H for f, p in ref.items() if p is not None}
+        assert set(fits_async) == set(expected)
+        for f in expected:  # np is imported at module top (used by _pan_session/_K)
+            np.testing.assert_allclose(fits_async[f], expected[f], atol=1e-6)
+    finally:
+        st.stop_worker()
+
+
+def test_pending_drains_to_zero() -> None:
+    interframe, _poses, clicks = _pan_session(40)
+    st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080), window=360)
+    try:
+        for c in clicks:
+            st.add_click(c.frame, c.kp_idx, c.x, c.y)
+        st.wait_idle(timeout=10)
+        assert st.pending() == 0
+    finally:
+        st.stop_worker()

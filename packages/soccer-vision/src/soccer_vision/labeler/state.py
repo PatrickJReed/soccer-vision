@@ -19,6 +19,7 @@ from numpy.typing import NDArray
 
 from soccer_vision.calib.calibrate import CalibError
 from soccer_vision.labeler.chain import denormalize_homography
+from soccer_vision.labeler.refit_worker import RefitWorker
 from soccer_vision.pipeline import homographies_to_parquet
 from soccer_vision.pitch.calib_anchor import (
     FramePose,
@@ -87,6 +88,9 @@ class LabelerState:
         self._outliers: dict[int, list[int]] = {}
         w, h = size
         self._to_norm = np.diag([float(w), float(h), 1.0])  # H_norm = H_px @ this
+        self._worker: RefitWorker[FramePose | None] = RefitWorker(
+            self._compute_dirty, self._apply_fits)
+        self._worker.start()
 
     def _active_clicks(self) -> list[Click]:
         """Clicks with the flagged outliers removed (used for fitting)."""
@@ -165,15 +169,20 @@ class LabelerState:
                 else:
                     self._fits[f] = self._calib_frame(pose)
 
-    def _refit(self, frames: list[int]) -> None:
-        if not self._calibrated or self._K is None:
-            with self._lock:
-                for f in frames:
-                    self._fits.pop(f, None)
-            return
-        result = self._compute_dirty(frames, lambda: False)
-        assert result is not None  # never cancelled with a constant-False predicate
+    def _refit_one(self, frame: int) -> None:
+        """Synchronously fit just `frame` (instant overlay for the clicked frame)."""
+        result = self._compute_dirty([frame], lambda: False)
+        assert result is not None
         self._apply_fits(result)
+
+    def wait_idle(self, timeout: float | None = None) -> None:
+        self._worker.wait_idle(timeout)
+
+    def pending(self) -> int:
+        return self._worker.pending()
+
+    def stop_worker(self) -> None:
+        self._worker.stop()
 
     def _recompute_all(self) -> None:  # chunking is governed by self._refit_chunk
         with self._lock:
@@ -206,12 +215,15 @@ class LabelerState:
         return [f for f in range(lo, hi + 1) if self._segment_of.get(f) == seg]
 
     def add_click(self, frame: int, kp_idx: int, x: float, y: float) -> None:
-        self.clicks.append(Click(frame=frame, kp_idx=kp_idx, x=x, y=y))
-        self._seq.append("pt")
+        with self._lock:
+            self.clicks.append(Click(frame=frame, kp_idx=kp_idx, x=x, y=y))
+            self._seq.append("pt")
         if not self._calibrated and self._try_bootstrap():
-            self._recompute_all()
+            self._refit_one(frame)                       # clicked frame instant
+            self._worker.mark_dirty(range(self.n_frames))  # everything else in background
         elif self._calibrated:
-            self._refit(self._affected(frame))
+            self._refit_one(frame)
+            self._worker.mark_dirty(self._affected(frame))
         self._autosave()
 
     def add_clicks(self, clicks: Sequence[Click]) -> None:
@@ -222,10 +234,12 @@ class LabelerState:
         self._autosave()
 
     def add_line_click(self, frame: int, line_id: str, x: float, y: float) -> None:
-        self.line_clicks.append(LineClick(frame=frame, line_id=line_id, x=x, y=y))
-        self._seq.append("ln")
+        with self._lock:
+            self.line_clicks.append(LineClick(frame=frame, line_id=line_id, x=x, y=y))
+            self._seq.append("ln")
         if self._calibrated:
-            self._refit(self._affected(frame))
+            self._refit_one(frame)
+            self._worker.mark_dirty(self._affected(frame))
         self._autosave()
 
     def add_line_clicks(self, line_clicks: Sequence[LineClick]) -> None:
@@ -251,7 +265,8 @@ class LabelerState:
             assert self.clicks, "_seq/clicks out of sync"
             removed_frame = self.clicks.pop().frame
         if self._calibrated:
-            self._refit(self._affected(removed_frame))
+            self._refit_one(removed_frame)
+            self._worker.mark_dirty(self._affected(removed_frame))
         self._autosave()
 
     def nudge_click(self, frame: int, kp_idx: int, x: float, y: float) -> bool:
@@ -260,7 +275,8 @@ class LabelerState:
             if c.frame == frame and c.kp_idx == kp_idx:
                 self.clicks[i] = Click(frame=frame, kp_idx=kp_idx, x=x, y=y)
                 if self._calibrated:
-                    self._refit(self._affected(frame))
+                    self._refit_one(frame)
+                    self._worker.mark_dirty(self._affected(frame))
                 self._autosave()
                 return True
         return False
@@ -270,8 +286,12 @@ class LabelerState:
         self._K = None
         self._outliers = {}
         if not self._try_bootstrap():
+            with self._lock:
+                self._fits = {}
             return False
-        self._recompute_all()
+        with self._lock:
+            self._fits = {}
+        self._worker.mark_dirty(range(self.n_frames))
         return True
 
     def _status_of(self, f: int) -> str:
@@ -306,6 +326,7 @@ class LabelerState:
             return self._fits.get(frame)
 
     def export(self, out_dir: Path) -> None:
+        self.wait_idle(timeout=30)
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         w, h = self.size

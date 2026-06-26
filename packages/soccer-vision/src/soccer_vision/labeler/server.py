@@ -83,6 +83,7 @@ def make_handler(
                     else [float(v) for v in np.asarray(fit.H).reshape(9)],
                     "residual": None if fit is None else fit.residual,
                     "n_points": None if fit is None else fit.n_points,
+                    "outliers": list(state._outliers.get(idx, [])),  # flagged mislabel kp_idx
                 })
             elif path.startswith("/api/frame/"):
                 idx = int(path.rsplit("/", 1)[1])
@@ -112,6 +113,9 @@ def make_handler(
                     self._json(self._state_payload())
                 else:
                     self._json({"error": "no click at frame/kp_idx"}, code=404)
+            elif self.path == "/api/recalibrate":
+                ok = state.recalibrate()
+                self._json({"recalibrated": ok, **self._state_payload()})
             else:
                 self._send(404, b"not found", "text/plain")
 

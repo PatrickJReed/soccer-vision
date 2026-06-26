@@ -180,7 +180,7 @@ function jumpRed(dir){
 }
 document.getElementById("nextRed").onclick=()=>jumpRed(1);
 document.getElementById("prevRed").onclick=()=>jumpRed(-1);
-window.onkeydown=(e)=>{ if(e.key>="0"&&e.key<="9"){armed=+e.key; renderPalette();} };
+window.onkeydown=(e)=>{ if(e.key>="0"&&e.key<="9"){armed=+e.key; armedLine=null; renderPalette();} };
 
 (async()=>{
   const cl = await api("/api/clicks");

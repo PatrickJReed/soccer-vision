@@ -12,6 +12,7 @@ from soccer_vision.labeler.chain import normalize_homography
 from soccer_vision.pitch.calib_anchor import (
     FramePose,
     _reproj_rms_px,
+    _robust_sqpnp,
     _rotation_from_chain,
     calibrate_clicked_frames,
     frame_homography,
@@ -239,3 +240,51 @@ def test_engine_b_nonrotation_chain_does_not_crash() -> None:
     transforms = cumulative_transforms(interframe, seg)
     out = poses_by_pose_propagation(transforms, seg, _K, {0: poses[0]}, (1920, 1080))
     assert all(np.all(np.isfinite(p.rvec)) and np.all(np.isfinite(p.tvec)) for p in out.values())
+
+
+def test_robust_sqpnp_drops_a_gross_outlier_click() -> None:
+    # 8 in-frame landmarks from a known pose; corrupt one click by 400px -> the helper
+    # must drop exactly that landmark and return a clean inlier pose.
+    rvec, tvec = _look_at((-8.0, 34.0, 8.0), (22.85, 34.0, 0.0))
+    fp = field_points_3d()
+    ids = [1, 3, 4, 6, 7, 8, 14, 16]
+    img = cv2.projectPoints(fp[ids], rvec, tvec, _K, np.zeros(5))[0].reshape(-1, 2)
+    img[2] = img[2] + np.array([400.0, -300.0])  # gross outlier on ids[2]
+    res = _robust_sqpnp(_K, ids, img, thr=40.0, min_points=4)
+    assert res is not None
+    rv, tv, inliers, outliers = res
+    assert outliers == [ids[2]]          # exactly the corrupted landmark dropped
+    assert set(inliers) == set(ids) - {ids[2]}
+    proj = cv2.projectPoints(fp[inliers], rv, tv, _K, np.zeros(5))[0].reshape(-1, 2)
+    truth = cv2.projectPoints(fp[inliers], rvec, tvec, _K, np.zeros(5))[0].reshape(-1, 2)
+    assert np.max(np.linalg.norm(proj - truth, axis=1)) < 2.0  # clean pose
+
+
+def test_robust_sqpnp_keeps_all_clean_clicks() -> None:
+    # noiseless clicks -> nothing dropped
+    rvec, tvec = _look_at((-8.0, 34.0, 8.0), (22.85, 34.0, 0.0))
+    fp = field_points_3d()
+    ids = [1, 3, 4, 6, 7, 8, 14, 16]
+    img = cv2.projectPoints(fp[ids], rvec, tvec, _K, np.zeros(5))[0].reshape(-1, 2)
+    res = _robust_sqpnp(_K, ids, img, thr=40.0, min_points=4)
+    assert res is not None
+    _rv, _tv, inliers, outliers = res
+    assert outliers == [] and set(inliers) == set(ids)
+
+
+def test_engine_a_propagation_flags_outlier_and_restricts_frames() -> None:
+    # pan sequence; clicks at a few frames; corrupt one landmark at a clicked frame ->
+    # that frame's FramePose.outliers names it; frames= restricts the output.
+    poses, interframe = _pan_sequence(9)
+    clicks = _clicks_at(poses, [0, 4, 8])
+    bad = [c for c in clicks if c.frame == 4 and c.kp_idx == 6]
+    assert bad
+    clicks = [c if not (c.frame == 4 and c.kp_idx == 6)
+              else Click(c.frame, c.kp_idx, c.x + 0.25, c.y) for c in clicks]
+    seg = build_segments(interframe, 9)
+    transforms = cumulative_transforms(interframe, seg)
+    k, _kp = calibrate_clicked_frames(clicks, (1920, 1080), min_points=6)
+    out = poses_by_click_propagation(clicks, transforms, seg, k, (1920, 1080),
+                                     window=360, min_points=4, frames=[4])
+    assert set(out) == {4}                 # frames= restricted the targets
+    assert 6 in out[4].outliers            # the corrupted landmark flagged

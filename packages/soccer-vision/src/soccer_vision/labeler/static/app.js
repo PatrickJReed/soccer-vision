@@ -2,6 +2,9 @@ const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
 const NAMES = []; let LXY = []; let N = 0; let armed = 0; let cur = 0; let showGrid = true;
 let status = []; let bucketSize = 1; let nFrames = 0; let placed = new Set(); let clicks = []; let curH = null;
+let LINE_NAMES = []; let armedLine = null; let lineClicks = [];
+const LINE_COLORS = {near_touchline:"#ff5ca8", far_touchline:"#5cc8ff",
+  own_goal_line:"#ffd95c", opp_goal_line:"#b07cff", midline:"#5cffa8"};
 const img = new Image();
 
 // canonical pitch edges (landmark index pairs) for the reprojected overlay
@@ -32,7 +35,17 @@ function renderPalette(){
     const d=document.createElement("div");
     d.className="kp"+(i===armed?" armed":"")+(placed.has(i)?" placed":"");
     d.textContent=`${i} ${NAMES[i]||""}`+(placed.has(i)?" ✓":"");
-    d.onclick=()=>{armed=i; renderPalette();}; p.appendChild(d); }
+    d.onclick=()=>{armed=i; armedLine=null; renderPalette();}; p.appendChild(d); }
+  const lh=document.createElement("h3");
+  lh.style.cssText="font-size:12px;color:#9aa4b2;margin-top:10px"; lh.textContent="LINES";
+  p.appendChild(lh);
+  for(const name of LINE_NAMES){
+    const d=document.createElement("div");
+    d.className="kp"+(name===armedLine?" armed":"");
+    d.textContent=name; d.style.color=LINE_COLORS[name]||"#dfe7ee";
+    d.onclick=()=>{armedLine=name; armed=-1; renderPalette();};
+    p.appendChild(d);
+  }
 }
 function renderTimeline(){
   const t=document.getElementById("timeline"); t.innerHTML="";
@@ -62,6 +75,13 @@ function drawFrame(){
     ctx.fillStyle="#0f1115"; ctx.font="10px sans-serif";
     ctx.fillText(c.kp_idx, c.x*canvas.width-3, c.y*canvas.height+3);
   }
+  for(const lc of lineClicks) if(lc.line_id && lc.frame===cur){
+    const cx=lc.x*canvas.width, cy=lc.y*canvas.height, r=6;
+    ctx.fillStyle=LINE_COLORS[lc.line_id]||"#5cffa8";
+    ctx.beginPath();
+    ctx.moveTo(cx,cy-r); ctx.lineTo(cx+r,cy); ctx.lineTo(cx,cy+r); ctx.lineTo(cx-r,cy);
+    ctx.closePath(); ctx.fill();
+  }
 }
 
 async function loadFrame(i){
@@ -79,6 +99,7 @@ async function loadFrame(i){
 function applyState(st){
   N=st.landmark_names.length; for(let i=0;i<N;i++) NAMES[i]=st.landmark_names[i];
   LXY=st.landmark_xy;
+  LINE_NAMES=st.line_names||[];
   status = st.status_buckets;
   bucketSize = st.bucket_size;
   nFrames = st.n_frames;
@@ -128,17 +149,25 @@ canvas.onmouseup = async (e) => {
 
 canvas.onclick = async (e) => {
   if (didDrag) { didDrag = false; return; }   // suppress synthetic click after drag
+  if (armed < 0 && !armedLine) return;        // nothing armed — ignore
   const [x, y] = canvasNorm(e);
-  clicks.push({ frame: cur, kp_idx: armed, x, y }); placed.add(armed);
-  applyState(await postJSON("/api/click", { frame: cur, kp_idx: armed, x, y }));
+  if (armedLine) {
+    lineClicks.push({ frame: cur, line_id: armedLine, x, y });
+    applyState(await postJSON("/api/line_click", { frame: cur, line_id: armedLine, x, y }));
+  } else {
+    clicks.push({ frame: cur, kp_idx: armed, x, y }); placed.add(armed);
+    applyState(await postJSON("/api/click", { frame: cur, kp_idx: armed, x, y }));
+  }
   const fh = await api(`/api/frame_h/${cur}`); curH = fh.h; drawFrame();
 };
 
 document.getElementById("scrub").oninput=(e)=>loadFrame(+e.target.value);
-document.getElementById("undo").onclick=async()=>{clicks.pop();
-  placed=new Set(clicks.map(c=>c.kp_idx));   // recompute ✓ set after removal
-  applyState(await postJSON("/api/undo",{})); const fh=await api(`/api/frame_h/${cur}`);
-  curH=fh.h; drawFrame();};
+document.getElementById("undo").onclick=async()=>{
+  applyState(await postJSON("/api/undo",{}));
+  const cl=await api("/api/clicks"); clicks=cl.clicks; lineClicks=cl.line_clicks||[];
+  placed=new Set(clicks.map(c=>c.kp_idx));
+  const fh=await api(`/api/frame_h/${cur}`); curH=fh.h; drawFrame();
+};
 document.getElementById("grid").onclick=()=>{showGrid=!showGrid; drawFrame();};
 document.getElementById("export").onclick=async()=>{
   const r=await postJSON("/api/export",{}); alert("Exported to "+r.exported_to);};
@@ -155,7 +184,7 @@ window.onkeydown=(e)=>{ if(e.key>="0"&&e.key<="9"){armed=+e.key; renderPalette()
 
 (async()=>{
   const cl = await api("/api/clicks");
-  clicks = cl.clicks;
+  clicks = cl.clicks; lineClicks = cl.line_clicks || [];
   placed = new Set(clicks.map(c=>c.kp_idx));
   applyState(await api("/api/state"));
   loadFrame(0);

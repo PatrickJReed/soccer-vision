@@ -46,45 +46,57 @@ and flagged back to the user.
 
 ## Design
 
-### Per-point RANSAC — `pitch/calib_anchor.py` (per-frame fit only)
-Outlier clicks are dropped at the **per-frame fit** (the focal is already robust, so
-there is no robust-bootstrap step — verified: the focal is 1469 px with or without
-the outliers). The per-frame fit uses an **iterative drop-worst SQPNP** — NOT
-`cv2.solvePnPRansac`, which degenerates on the coplanar (Z=0) field points (verified:
-it returned ~10⁵ px garbage). The helper (`_robust_sqpnp`): SQPNP the current point
-set, find the worst reprojection residual; if it exceeds the threshold (≈40 px) drop
-that point and refit; repeat until the worst residual is under threshold or fewer than
-`min_points` remain. Verified on the real data — it drops the gross mislabels (8526
-kp8, 56938 kp7) and the imprecise box clicks (14357/14700/27391 kp14/16) to ~10–18 px
-inlier RMS, and leaves every good frame untouched (drops nothing).
-`poses_by_click_propagation` calls this helper instead of plain `solvePnP`, and also
-gains a `frames=` argument (restrict the targets) so the labeler can recompute just the
-touched window. Per-frame **outlier clicks** (kp_idx of dropped points) are returned
-for UI flagging; the frame's `residual_px` / `fold_count` are computed on the **inlier**
-set. `calibrate_clicked_frames` is unchanged — the 152-frame focal seed is already clean.
+### Outlier-click flagging — a CLICKED-FRAME preprocessing step (`pitch/calib_anchor.py`)
+Outlier clicks are detected **once, per clicked frame, on that frame's own clicks** —
+NOT per-frame across the propagated set (verified why: a per-propagated-frame robust
+fit drops chain-drifted neighbour clicks on 25-80% of the 58k frames — useless flags,
+and the leave-one-out variant takes 140s; the focal is robust 1469px either way).
+
+- `_robust_sqpnp(k, ids, img, *, thr=40, min_points=4)`: planar-safe robust PnP — NOT
+  `cv2.solvePnPRansac`, which degenerates on the coplanar (Z=0) field (verified garbage).
+  SQPNP the set; if the worst reprojection residual exceeds `thr`, drop a point
+  (leave-one-out: try removing each candidate, drop the one whose removal gives the
+  lowest max residual — avoids masking) and refit; repeat until the worst is within
+  `thr` or `< min_points` remain. Returns `(rvec, tvec, inlier_ids, outlier_ids)`.
+- `flag_outlier_clicks(clicks, k, size, *, thr=40, min_points=4) -> (clean_clicks, flagged)`:
+  group by frame; per clicked frame run `_robust_sqpnp` on the OWN clicks; drop the
+  outlier clicks from `clean_clicks` and record `flagged: {frame: [kp_idx]}`. Verified
+  on real data: flags exactly the 2 gross mislabels (8526 circle_near, 56938 circle_far)
+  plus ~38 imprecise clicks across 40 clicked frames (cheap — only ~170 frames).
+
+`poses_by_click_propagation` stays the plain fast 3a engine (SQPNP per frame, ~7s for
+the whole game on cleaned clicks) and only gains a `frames=` argument (restrict the
+targets) for windowed recompute — it does NOT do per-frame outlier rejection. `FramePose`
+is unchanged (no `outliers` field — flags are session-level). `calibrate_clicked_frames`
+is unchanged — the 152-frame focal seed is already clean.
 
 ### Freeze-focal recompute model — `labeler/state.py`
 The Trace camera focal is **physically constant** (fixed lens, no zoom), so:
 - **Bootstrap once.** When ≥ 3 calibratable anchor frames exist, estimate the shared
   focal (robust bootstrap above) and **freeze** it as `LabelerState._K`; set
   `_calibrated = True`.
+- **Outlier preprocessing on (re)calibration.** When the focal is (re)frozen, run
+  `flag_outlier_clicks` on the clicks → a cleaned click list + `self._outliers:
+  {frame: [kp_idx]}`. Engine A runs on the **cleaned** clicks; the flags are surfaced
+  to the UI.
 - **Incremental recompute = windowed re-SQPNP with the frozen K.** `_refit(frames)`
   keeps the existing `_affected(frame)` window machinery but now calls
-  `poses_by_click_propagation(frames=affected, k=self._K, ...)` (per-point RANSAC,
-  fixed focal) instead of `fit_frame_homographies`. Same ~135 ms incremental cost.
-- **`recalibrate()` action** re-estimates and re-freezes the focal (for when early
-  anchors were poor); a full recompute follows.
+  `poses_by_click_propagation(frames=affected, k=self._K, ...)` (plain fast SQPNP,
+  fixed focal, on the cleaned clicks) instead of `fit_frame_homographies`. Same ~135 ms
+  incremental cost.
+- **`recalibrate()` action** re-estimates + re-freezes the focal and re-runs the
+  outlier preprocessing (for when early anchors were poor); a full recompute follows.
 - **Bootstrap gap:** with < 3 anchors, `_calibrated` is False → no calibrated
   homographies yet → the UI shows a "place more anchors" state.
 
 The window default stays **360** (shallow goal-views depend on cross-pan click
-aggregation; per-point RANSAC drops the chain-drifted neighbours the window pulls in
-— window for coverage + RANSAC for robustness).
+aggregation; plain SQPNP averages the chain-noise the window pulls in — robustness is
+the clicked-frame preprocessing, not per-frame).
 
 ### `LabelerState` integration — keep the server/UI/export contract
 - Per-frame record becomes a calibrated pose: store `FramePose` (rvec, tvec,
-  `residual_px`, `n_points`, `fold_count`) per frame in `_fits`, plus a per-frame
-  list of flagged outlier `kp_idx`.
+  `residual_px`, `n_points`, `fold_count`) per frame in `_fits`, plus the session-level
+  `self._outliers: {frame: [kp_idx]}` from the preprocessing step.
 - **Status / coverage:** green = covered (has a pose) AND `residual_px ≤ threshold`;
   red = uncovered. Calibration can't fold, so there's no fold-based red and the green
   rate rises. `frame_status` / `coverage_fraction` / the bucketed timeline adapt to
@@ -103,16 +115,18 @@ change to the labeler's normalized click handling.
 ## Error handling
 - < 3 calibratable anchor frames → `_calibrated = False`, no homographies (bootstrap
   gap), counted; UI prompts for more anchors.
-- A target frame with < `min_points` propagated landmarks, or `solvePnPRansac` finding
-  too few inliers / failing → that frame uncovered, counted (not crashed).
+- A target frame with < `min_points` propagated landmarks, or SQPNP failing → that
+  frame uncovered, counted (not crashed). `_robust_sqpnp` returning None on a clicked
+  frame (preprocessing) → keep that frame's clicks unflagged.
 - `recalibrate()` with an implausible focal (Phase-1 guard) → keep the prior frozen K
   and surface a calibration-failure message.
 - Empty clicks / pre-bootstrap → empty result.
 
 ## Testing
-- **Per-point RANSAC (synthetic):** an anchor frame with one planted gross-outlier
-  click → RANSAC drops it (inlier mask excludes it), the pose is recovered, and the
-  bootstrapped focal matches the no-outlier focal (outlier doesn't poison it).
+- **Outlier flagging (synthetic):** `_robust_sqpnp` on a point set with one planted
+  gross-outlier click drops exactly that landmark and returns a clean pose; on clean
+  clicks it drops nothing. `flag_outlier_clicks` on a session with one planted mislabel
+  at a frame removes that click from `clean_clicks` and records it in `flagged`.
 - **Freeze-focal model:** bootstrap from N diverse synthetic anchors → frozen K within
   tolerance; a subsequent `add_click` triggers windowed re-SQPNP with that K (not a
   re-calibration); `recalibrate()` re-estimates.

@@ -41,7 +41,6 @@ class FramePose:
     residual_px: float   # reprojection RMS over the frame's obs (nan if none)
     n_points: int        # point landmarks used (0 if pose-propagated)
     fold_count: int      # landmarks projecting in-frame (slice size, ~6-12)
-    outliers: tuple[int, ...] = ()  # kp_idx of clicks dropped as outliers by the robust fit
 
 
 def frame_homography(
@@ -253,44 +252,85 @@ def poses_by_click_propagation(
     min_points: int = 4,
     line_obs: Mapping[int, Sequence[tuple[str, float, float]]] | None = None,
     frames: Sequence[int] | None = None,
-    outlier_px: float = 40.0,
 ) -> dict[int, FramePose]:
-    """Engine A: propagate clicks into each frame, then a robust per-frame fit.
+    """Engine A: propagate clicks into each frame, then SQPNP (focal fixed).
 
-    Per target frame: gather window-propagated point landmarks (and any supplied
-    pixel-space line_obs), fit the pose with iterative drop-worst SQPNP (dropping
-    outlier clicks — gross mislabels and chain-drifted propagated neighbours — at
-    `outlier_px`), then, only if line_obs are present for that frame, refine with the
-    line residuals (Phase-2 path). `frames=` restricts the targets (windowed
-    recompute). Dropped clicks are reported as `FramePose.outliers`. Returns
-    {frame: FramePose}.
+    Per target frame: gather window-propagated point landmarks, seed a pose with SQPNP
+    on the propagated points, and (only if line_obs are present for that frame) refine
+    with the line residuals (Phase-2 path). Outlier-click robustness is a separate
+    clicked-frame preprocessing step (`flag_outlier_clicks`), so this engine stays the
+    plain fast per-frame fit. `frames=` restricts the targets (windowed recompute).
+    Returns {frame: FramePose}.
     """
     w, h = size
     k_arr = np.asarray(k, dtype=np.float64)
+    fp = field_points_3d()
     propagated = propagate_clicks(clicks, transforms, segment_of, window=window, frames=frames)
     out: dict[int, FramePose] = {}
     for f, kpmap in propagated.items():
         if len(kpmap) < min_points:
             continue
         idxs = sorted(kpmap)
-        img = np.array([[kpmap[i][0] * w, kpmap[i][1] * h] for i in idxs], dtype=np.float64)
-        fit = _robust_sqpnp(k_arr, idxs, img, thr=outlier_px, min_points=min_points)
-        if fit is None:
-            continue
-        rvec, tvec, inlier_ids, outlier_ids = fit
-        inlier_obs = [(i, float(kpmap[i][0] * w), float(kpmap[i][1] * h)) for i in inlier_ids]
+        point_obs = [(i, kpmap[i][0] * w, kpmap[i][1] * h) for i in idxs]
         lobs = list(line_obs.get(f, [])) if line_obs else []
+        obj = fp[idxs].astype(np.float64)
+        img = np.array([[x, y] for _, x, y in point_obs], dtype=np.float64)
+        ok, rvec0, tvec0 = cv2.solvePnP(obj, img, k_arr, None, flags=cv2.SOLVEPNP_SQPNP)
+        if not ok:
+            continue
+        rvec = np.asarray(rvec0, dtype=np.float64)
+        tvec = np.asarray(tvec0, dtype=np.float64)
         if lobs:
             try:
-                rvec, tvec = refine_pose(k_arr, rvec, tvec, inlier_obs, lobs)
+                rvec, tvec = refine_pose(k_arr, rvec, tvec, point_obs, lobs)
             except CalibError:
-                pass  # keep the robust-SQPNP pose
+                pass  # keep the SQPNP pose
         out[f] = FramePose(
             rvec=rvec,
             tvec=tvec,
-            residual_px=_reproj_rms_px(k_arr, rvec, tvec, inlier_obs),
-            n_points=len(inlier_ids),
+            residual_px=_reproj_rms_px(k_arr, rvec, tvec, point_obs),
+            n_points=len(idxs),
             fold_count=_fold_for_pose(k_arr, rvec, tvec, size),
-            outliers=tuple(outlier_ids),
         )
     return out
+
+
+def flag_outlier_clicks(
+    clicks: Sequence[Click],
+    k: NDArray[np.floating],
+    size: tuple[int, int],
+    *,
+    thr: float = 40.0,
+    min_points: int = 4,
+) -> tuple[list[Click], dict[int, list[int]]]:
+    """Detect outlier clicks PER CLICKED FRAME (on that frame's own clicks).
+
+    For each clicked frame with >= min_points clicks, run `_robust_sqpnp` on its own
+    clicks (pixel = normalized x*w, y*h); any landmark whose reprojection exceeds `thr`
+    is an outlier — removed from the returned `clean_clicks` and recorded in
+    `flagged: {frame: [kp_idx]}`. Cheap (only the clicked frames). Robustness lives
+    here, NOT in the per-propagated-frame fit (which would drop chain-noise everywhere).
+    """
+    w, h = size
+    k_arr = np.asarray(k, dtype=np.float64)
+    by_frame: dict[int, list[Click]] = {}
+    for c in clicks:
+        by_frame.setdefault(c.frame, []).append(c)
+    clean: list[Click] = []
+    flagged: dict[int, list[int]] = {}
+    for f, cs in by_frame.items():
+        if len(cs) < min_points:
+            clean.extend(cs)
+            continue
+        ids = [c.kp_idx for c in cs]
+        img = np.array([[c.x * w, c.y * h] for c in cs], dtype=np.float64)
+        fit = _robust_sqpnp(k_arr, ids, img, thr=thr, min_points=min_points)
+        if fit is None:
+            clean.extend(cs)
+            continue
+        _rvec, _tvec, _inliers, outlier_ids = fit
+        if outlier_ids:
+            flagged[f] = outlier_ids
+        bad = set(outlier_ids)
+        clean.extend(c for c in cs if c.kp_idx not in bad)
+    return clean, flagged

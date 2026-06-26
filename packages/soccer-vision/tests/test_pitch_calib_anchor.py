@@ -272,19 +272,29 @@ def test_robust_sqpnp_keeps_all_clean_clicks() -> None:
     assert outliers == [] and set(inliers) == set(ids)
 
 
-def test_engine_a_propagation_flags_outlier_and_restricts_frames() -> None:
-    # pan sequence; clicks at a few frames; corrupt one landmark at a clicked frame ->
-    # that frame's FramePose.outliers names it; frames= restricts the output.
+def test_engine_a_frames_restricts_targets() -> None:
+    # frames= recomputes only the requested targets (windowed recompute path).
     poses, interframe = _pan_sequence(9)
     clicks = _clicks_at(poses, [0, 4, 8])
-    bad = [c for c in clicks if c.frame == 4 and c.kp_idx == 6]
-    assert bad
-    clicks = [c if not (c.frame == 4 and c.kp_idx == 6)
-              else Click(c.frame, c.kp_idx, c.x + 0.25, c.y) for c in clicks]
     seg = build_segments(interframe, 9)
     transforms = cumulative_transforms(interframe, seg)
     k, _kp = calibrate_clicked_frames(clicks, (1920, 1080), min_points=6)
     out = poses_by_click_propagation(clicks, transforms, seg, k, (1920, 1080),
-                                     window=360, min_points=4, frames=[4])
-    assert set(out) == {4}                 # frames= restricted the targets
-    assert 6 in out[4].outliers            # the corrupted landmark flagged
+                                     window=360, min_points=4, frames=[2, 4])
+    assert set(out) == {2, 4}
+
+
+def test_flag_outlier_clicks_removes_and_flags_a_mislabel() -> None:
+    # one clicked landmark corrupted at frame 4 -> flag_outlier_clicks removes it from
+    # clean_clicks and records it; other frames are untouched.
+    from soccer_vision.pitch.calib_anchor import flag_outlier_clicks
+    poses, _interframe = _pan_sequence(9)
+    clicks = _clicks_at(poses, [0, 4, 8])
+    assert any(c.frame == 4 and c.kp_idx == 6 for c in clicks)
+    clicks = [c if not (c.frame == 4 and c.kp_idx == 6)
+              else Click(c.frame, c.kp_idx, c.x + 0.25, c.y) for c in clicks]
+    k, _kp = calibrate_clicked_frames(clicks, (1920, 1080), min_points=6)
+    clean, flagged = flag_outlier_clicks(clicks, k, (1920, 1080), thr=40.0)
+    assert flagged.get(4) == [6]                                  # mislabel flagged
+    assert not any(c.frame == 4 and c.kp_idx == 6 for c in clean)  # removed from clean
+    assert len(clean) == len(clicks) - 1                          # only that one dropped

@@ -203,3 +203,46 @@ def test_make_handler_accepts_line_names_and_state_exposes_line_clicks() -> None
     handler_cls = make_handler(st, lambda i: b"", [f"kp{i}" for i in range(21)],
                                line_names=sorted(FIELD_LINES))
     assert handler_cls is not None  # make_handler accepts the line_names kwarg
+
+
+def test_line_click_endpoint_stores_and_returns_state() -> None:
+    httpd, state = _serve()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        out = _post(f"{base}/api/line_click",
+                    {"frame": 2, "line_id": "midline", "x": 0.5, "y": 0.5})
+        assert "line_names" in out  # the response is the state payload
+        assert len(state.line_clicks) == 1
+        assert state.line_clicks[0].line_id == "midline"
+    finally:
+        httpd.shutdown()
+
+
+def test_line_click_endpoint_rejects_unknown_line_id() -> None:
+    httpd, state = _serve()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        _post(f"{base}/api/line_click",
+              {"frame": 2, "line_id": "not_a_line", "x": 0.5, "y": 0.5})
+    except HTTPError as e:
+        assert e.code == 400
+    else:
+        raise AssertionError("expected HTTP 400")
+    finally:
+        httpd.shutdown()
+    assert state.line_clicks == []  # nothing stored on a rejected line_id
+
+
+def test_clicks_endpoint_returns_both_point_and_line_clicks() -> None:
+    httpd, _ = _serve()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        _post(f"{base}/api/click", {"frame": 2, "kp_idx": 4, "x": 0.3, "y": 0.6})
+        _post(f"{base}/api/line_click",
+              {"frame": 3, "line_id": "near_touchline", "x": 0.1, "y": 0.9})
+        out = _get(f"{base}/api/clicks")
+        assert out["clicks"] == [{"frame": 2, "kp_idx": 4, "x": 0.3, "y": 0.6}]
+        assert out["line_clicks"] == [
+            {"frame": 3, "line_id": "near_touchline", "x": 0.1, "y": 0.9}]
+    finally:
+        httpd.shutdown()

@@ -29,6 +29,37 @@ root" (the chain)**. The fix is undesigned — that's the next work.
 
 ---
 
+## ⭐ CRITICAL REFRAME (end of session) — read this FIRST
+
+**The camera is FIXED (Trace virtual-PTZ). There is ONE global field↔image homography, and
+every video frame is just a 2D-cropped slice of the whole.** Confirmed by the data: inter-frame
+transforms are pure 2D translations (tx up to ±88 px, ty≈0, scale≈1.000, rotation/shear≈0,
+perspective≈1e-6). No real pan, no rotation, no zoom.
+
+**We drifted from this.** The shipped calibration (Phase-1 onward) solves **per-frame
+INDEPENDENT 6-DOF SQPNP poses**, not one global homography. That independence is the ROOT of
+*both* problems below:
+- single-end "lines in the sky" = each frame constrained only by its own clicks;
+- chain drift = we chain frame-to-frame 2D translations and accumulate error.
+All the per-frame propagation work (incl. gated propagation) was patching symptoms of this
+divergence.
+
+**THE RIGHT FIX (supersedes everything in "Decision/fix directions" below):** return to the
+global model. Build the *whole* — one globally-consistent reference image of the fixed sensor
+(a mosaic/panorama; register each frame to it directly or via a bundle-adjusted, NON-chained
+global alignment so error is bounded, not accumulated) — then solve **ONE global homography
+(whole → field) from ALL clicks at once.** A frame is a known 2D translation within the whole,
+so own-end clicks (frame 0) and opp-end clicks (frame 193) jointly constrain the single
+homography. No per-frame under-constraint, no chain-drift accumulation. Per-frame output
+homography = (frame's 2D offset in the whole) ∘ (global homography), so downstream
+(`assemble_from_homographies`) is unchanged. This is the design basis for the next session.
+
+(Why this also explains old findings: Engine B's "propagate the pose as a camera rotation"
+drifted 100-268 ft because the motion is NOT a rotation — it's a 2D crop; modeling it as a
+rotation was wrong.)
+
+---
+
 ## What shipped this session (all on `master`, unpushed)
 
 ### A. Async refit — responsiveness (commits `034b4bc`..`0b7f41d`)

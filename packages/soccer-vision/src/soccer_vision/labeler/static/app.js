@@ -3,6 +3,7 @@ const ctx = canvas.getContext("2d");
 const NAMES = []; let LXY = []; let N = 0; let armed = 0; let cur = 0; let showGrid = true;
 let status = []; let bucketSize = 1; let nFrames = 0; let placed = new Set(); let clicks = []; let curH = null;
 let LINE_NAMES = []; let armedLine = null; let lineClicks = [];
+let pendingPoll = null;   // setInterval handle while a background refit is in flight
 const LINE_COLORS = {near_touchline:"#ff5ca8", far_touchline:"#5cc8ff",
   own_goal_line:"#ffd95c", opp_goal_line:"#b07cff", midline:"#5cffa8"};
 const img = new Image();
@@ -103,10 +104,24 @@ function applyState(st){
   status = st.status_buckets;
   bucketSize = st.bucket_size;
   nFrames = st.n_frames;
+  maybePoll(st.pending || 0);
   document.getElementById("cov").textContent=Math.round(st.coverage*100)+"%";
   document.getElementById("nclicks").textContent=st.n_clicks;
   document.getElementById("scrub").max=st.n_frames-1;
   renderPalette(); renderTimeline(); drawFrame();
+}
+
+function maybePoll(pending){
+  if(pending > 0 && pendingPoll === null){
+    pendingPoll = setInterval(async () => {
+      const st = await api("/api/state");
+      applyState(st);                                   // refresh timeline/coverage
+      const fh = await api(`/api/frame_h/${cur}`); curH = fh.h; drawFrame();
+      if((st.pending || 0) === 0){ clearInterval(pendingPoll); pendingPoll = null; }
+    }, 750);
+  } else if(pending === 0 && pendingPoll !== null){
+    clearInterval(pendingPoll); pendingPoll = null;
+  }
 }
 
 let dragging = null;  // {kp_idx, c} while dragging an existing same-frame dot

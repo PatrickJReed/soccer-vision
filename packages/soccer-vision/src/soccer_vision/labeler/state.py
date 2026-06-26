@@ -231,6 +231,9 @@ class LabelerState:
         self._autosave()
 
     def add_clicks(self, clicks: Sequence[Click]) -> None:
+        # Bulk boot/resume path: called single-threaded before the server accepts
+        # requests, and finishes with a synchronous _recompute_all (no live worker
+        # pass concurrently iterating the lists), so the unlocked extend is safe.
         self.clicks.extend(clicks)
         self._seq.extend("pt" for _ in clicks)
         self._try_bootstrap()
@@ -247,6 +250,7 @@ class LabelerState:
         self._autosave()
 
     def add_line_clicks(self, line_clicks: Sequence[LineClick]) -> None:
+        # Bulk boot/resume path (see add_clicks): single-threaded, synchronous.
         self.line_clicks.extend(line_clicks)
         self._seq.extend("ln" for _ in line_clicks)
         self._recompute_all()

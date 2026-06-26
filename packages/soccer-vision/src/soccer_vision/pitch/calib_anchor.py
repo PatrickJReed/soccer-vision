@@ -29,7 +29,11 @@ from soccer_vision.calib.calibrate import (
 )
 from soccer_vision.calib.field_model import field_points_3d
 from soccer_vision.calib.validate import fold_count
-from soccer_vision.pitch.manual_anchor import Click, propagate_clicks
+from soccer_vision.pitch.manual_anchor import (
+    Click,
+    propagate_clicks,
+    propagate_clicks_with_distance,
+)
 
 
 @dataclass(frozen=True, eq=False)
@@ -290,6 +294,82 @@ def poses_by_click_propagation(
             tvec=tvec,
             residual_px=_reproj_rms_px(k_arr, rvec, tvec, point_obs),
             n_points=len(idxs),
+            fold_count=_fold_for_pose(k_arr, rvec, tvec, size),
+        )
+    return out
+
+
+def poses_by_gated_propagation(
+    clicks: Sequence[Click],
+    transforms: Mapping[int, NDArray[np.floating]],
+    segment_of: Mapping[int, int],
+    k: NDArray[np.floating],
+    size: tuple[int, int],
+    *,
+    max_reach: int,
+    seed_size: int = 6,
+    gate_px: float = 60.0,
+    gap_dist: int = 180,
+    min_points: int = 4,
+    line_obs: Mapping[int, Sequence[tuple[str, float, float]]] | None = None,
+    frames: Sequence[int] | None = None,
+) -> dict[int, FramePose]:
+    """Reliability-aware Engine A. Per target frame: propagate landmarks (tracking each
+    one's source frame-distance), red if the nearest is past `gap_dist`, seed an SQPNP pose
+    from the nearest `seed_size` landmarks, accept farther landmarks only if they reproject
+    within `gate_px` of the seed, then final SQPNP (+ refine_pose when line_obs present). A
+    far click drifted across the chain can't corrupt a frame with good local clicks; true
+    gaps stay red. Returns {frame: FramePose}.
+    """
+    w, h = size
+    k_arr = np.asarray(k, dtype=np.float64)
+    fp = field_points_3d()
+    prop = propagate_clicks_with_distance(
+        clicks, transforms, segment_of, window=max_reach, frames=frames)
+    out: dict[int, FramePose] = {}
+    for f, kpmap in prop.items():
+        if len(kpmap) < min_points:
+            continue
+        if min(xyd[2] for xyd in kpmap.values()) > gap_dist:  # no reliable nearby anchor
+            continue
+        items = sorted(kpmap.items(), key=lambda kv: kv[1][2])  # ascending source distance
+        kps = [kp for kp, _ in items]
+        img = np.array([[v[0] * w, v[1] * h] for _, v in items], dtype=np.float64)
+        n_seed = min(seed_size, len(kps))
+        if n_seed < min_points:
+            continue
+        ok, rvec0, tvec0 = cv2.solvePnP(
+            fp[kps[:n_seed]].astype(np.float64), img[:n_seed], k_arr, None,
+            flags=cv2.SOLVEPNP_SQPNP)
+        if not ok:
+            continue
+        proj = cv2.projectPoints(
+            fp[kps].astype(np.float64), rvec0, tvec0, k_arr, np.zeros(5))[0].reshape(-1, 2)
+        err = np.sqrt(np.sum((proj - img) ** 2, axis=1))
+        keep = [i for i in range(len(kps)) if i < n_seed or err[i] <= gate_px]
+        if len(keep) < min_points:
+            continue
+        keep_kps = [kps[i] for i in keep]
+        keep_img = img[keep]
+        point_obs = [(keep_kps[i], float(keep_img[i, 0]), float(keep_img[i, 1]))
+                     for i in range(len(keep_kps))]
+        ok2, rvec2, tvec2 = cv2.solvePnP(
+            fp[keep_kps].astype(np.float64), keep_img, k_arr, None, flags=cv2.SOLVEPNP_SQPNP)
+        if not ok2:
+            continue
+        rvec = np.asarray(rvec2, dtype=np.float64)
+        tvec = np.asarray(tvec2, dtype=np.float64)
+        lobs = list(line_obs.get(f, [])) if line_obs else []
+        if lobs:
+            try:
+                rvec, tvec = refine_pose(k_arr, rvec, tvec, point_obs, lobs)
+            except CalibError:
+                pass  # keep the SQPNP pose
+        out[f] = FramePose(
+            rvec=rvec,
+            tvec=tvec,
+            residual_px=_reproj_rms_px(k_arr, rvec, tvec, point_obs),
+            n_points=len(keep_kps),
             fold_count=_fold_for_pose(k_arr, rvec, tvec, size),
         )
     return out

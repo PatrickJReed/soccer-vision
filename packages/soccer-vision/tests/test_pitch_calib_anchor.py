@@ -17,6 +17,7 @@ from soccer_vision.pitch.calib_anchor import (
     calibrate_clicked_frames,
     frame_homography,
     poses_by_click_propagation,
+    poses_by_gated_propagation,
     poses_by_pose_propagation,
 )
 from soccer_vision.pitch.manual_anchor import (
@@ -298,3 +299,73 @@ def test_flag_outlier_clicks_removes_and_flags_a_mislabel() -> None:
     assert flagged.get(4) == [6]                                  # mislabel flagged
     assert not any(c.frame == 4 and c.kp_idx == 6 for c in clean)  # removed from clean
     assert len(clean) == len(clicks) - 1                          # only that one dropped
+
+
+def _static_chain(n: int) -> tuple[dict[int, np.ndarray], dict[int, int], dict[int, np.ndarray]]:
+    interframe = {i: np.eye(3) for i in range(n)}
+    seg = build_segments(interframe, n)
+    transforms = cumulative_transforms(interframe, seg)
+    return interframe, seg, transforms
+
+
+def test_gated_propagation_rejects_corrupted_far_click() -> None:
+    # Identity chain, static camera: a frame with good NEAR clicks plus a CORRUPTED
+    # far click (simulating chain drift) -> the far click is gated out, pose stays true,
+    # and the old aggregate engine is dragged off by the same bad click.
+    _interframe, seg, transforms = _static_chain(400)
+    rvec, tvec = _look_at((-8.0, 34.0, 20.0), (22.85, 34.0, 0.0))
+    fp = field_points_3d()
+    px = cv2.projectPoints(fp, rvec, tvec, _K, np.zeros(5))[0].reshape(-1, 2)
+    in_ids = [j for j in range(21) if j != 5 and 0 < px[j, 0] < 1920 and 0 < px[j, 1] < 1080]
+    assert len(in_ids) >= 8
+    near, far_id = in_ids[:7], in_ids[7]
+    clicks = [Click(0, j, float(px[j, 0]) / 1920, float(px[j, 1]) / 1080) for j in near]
+    clicks.append(Click(200, far_id, float(px[far_id, 0] + 300.0) / 1920,
+                        float(px[far_id, 1]) / 1080))  # corrupted, 300px off, 200 frames away
+    out = poses_by_gated_propagation(
+        clicks, transforms, seg, _K, (1920, 1080),
+        max_reach=360, seed_size=6, gate_px=60.0, gap_dist=180, min_points=4, frames=[0])
+    assert 0 in out
+    assert out[0].n_points == 7  # 7 near kept; corrupted far rejected
+    rec = cv2.projectPoints(fp, out[0].rvec, out[0].tvec, _K, np.zeros(5))[0].reshape(-1, 2)
+    gated_err = float(np.median(np.linalg.norm(px[in_ids] - rec[in_ids], axis=1)))
+    assert gated_err < 1.0  # recovered ~= truth
+    old = poses_by_click_propagation(
+        clicks, transforms, seg, _K, (1920, 1080), window=360, min_points=4, frames=[0])
+    rec_old = cv2.projectPoints(fp, old[0].rvec, old[0].tvec, _K, np.zeros(5))[0].reshape(-1, 2)
+    old_err = float(np.median(np.linalg.norm(px[in_ids] - rec_old[in_ids], axis=1)))
+    assert old_err > gated_err  # the aggregate engine is corrupted; gating is better
+
+
+def test_gated_propagation_stays_red_beyond_gap_dist() -> None:
+    _interframe, seg, transforms = _static_chain(400)
+    rvec, tvec = _look_at((-8.0, 34.0, 20.0), (22.85, 34.0, 0.0))
+    fp = field_points_3d()
+    px = cv2.projectPoints(fp, rvec, tvec, _K, np.zeros(5))[0].reshape(-1, 2)
+    in_ids = [j for j in range(21) if j != 5 and 0 < px[j, 0] < 1920 and 0 < px[j, 1] < 1080]
+    clicks = [Click(300, j, float(px[j, 0]) / 1920, float(px[j, 1]) / 1080) for j in in_ids[:7]]
+    out = poses_by_gated_propagation(
+        clicks, transforms, seg, _K, (1920, 1080),
+        max_reach=360, seed_size=6, gate_px=60.0, gap_dist=180, min_points=4, frames=[0])
+    assert 0 not in out  # nearest click 300 frames away (> gap_dist 180) -> red
+    out2 = poses_by_gated_propagation(
+        clicks, transforms, seg, _K, (1920, 1080),
+        max_reach=360, seed_size=6, gate_px=60.0, gap_dist=320, min_points=4, frames=[0])
+    assert 0 in out2  # a larger gap_dist recovers it -> gap_dist is the gate
+
+
+def test_gated_propagation_accepts_consistent_far_clicks() -> None:
+    _interframe, seg, transforms = _static_chain(200)
+    rvec, tvec = _look_at((-8.0, 34.0, 20.0), (22.85, 34.0, 0.0))
+    fp = field_points_3d()
+    px = cv2.projectPoints(fp, rvec, tvec, _K, np.zeros(5))[0].reshape(-1, 2)
+    in_ids = [j for j in range(21) if j != 5 and 0 < px[j, 0] < 1920 and 0 < px[j, 1] < 1080]
+    assert len(in_ids) >= 10
+    near, far = in_ids[:6], in_ids[6:10]
+    clicks = [Click(0, j, float(px[j, 0]) / 1920, float(px[j, 1]) / 1080) for j in near]
+    clicks += [Click(100, j, float(px[j, 0]) / 1920, float(px[j, 1]) / 1080) for j in far]
+    out = poses_by_gated_propagation(
+        clicks, transforms, seg, _K, (1920, 1080),
+        max_reach=360, seed_size=6, gate_px=60.0, gap_dist=180, min_points=4, frames=[0])
+    assert 0 in out
+    assert out[0].n_points == 10  # consistent (clean-chain) far clicks accepted -> deeper fit

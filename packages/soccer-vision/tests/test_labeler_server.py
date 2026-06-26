@@ -102,13 +102,14 @@ def _get(url: str) -> dict[str, Any]:
 
 def test_click_then_state_reports_coverage() -> None:
     # Use a calibratable session: real projected clicks across 3 anchor frames.
-    httpd, _state = _serve_calib()
+    httpd, state = _serve_calib()
     base = f"http://127.0.0.1:{httpd.server_address[1]}"
     _interframe, clicks = _calib_session(9)
     try:
         for c in clicks:
             _post(f"{base}/api/click",
                   {"frame": c.frame, "kp_idx": c.kp_idx, "x": c.x, "y": c.y})
+        state.wait_idle(timeout=10)  # coverage reflects the background-settled frames
         resp = _get(f"{base}/api/state")
         assert resp["coverage"] > 0.0
         assert len(resp["status_buckets"]) == 9
@@ -140,13 +141,14 @@ def test_frame_endpoint_ignores_cache_buster_query() -> None:
 
 def test_frame_h_includes_residual_and_n_points() -> None:
     # Use a calibratable session so the engine can produce valid homographies.
-    httpd, _state = _serve_calib()
+    httpd, state = _serve_calib()
     base = f"http://127.0.0.1:{httpd.server_address[1]}"
     _interframe, clicks = _calib_session(9)
     try:
         for c in clicks:
             _post(f"{base}/api/click",
                   {"frame": c.frame, "kp_idx": c.kp_idx, "x": c.x, "y": c.y})
+        state.wait_idle(timeout=10)  # propagated frames settle on the background worker
         fh = _get(f"{base}/api/frame_h/4")   # frame 4 is a clicked anchor
         assert fh["h"] is not None
         assert fh["residual"] is not None and fh["residual"] < 25.0  # px threshold

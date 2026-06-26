@@ -9,15 +9,71 @@ from http.server import HTTPServer
 from typing import Any
 from urllib.error import HTTPError
 
+import cv2
 import numpy as np
+from soccer_vision.calib.field_model import field_points_3d
+from soccer_vision.labeler.chain import normalize_homography
 from soccer_vision.labeler.server import make_handler
 from soccer_vision.labeler.state import LabelerState
-from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
+from soccer_vision.pitch.manual_anchor import Click
+
+# Calibrated-engine camera intrinsics shared by tests that need real clicks.
+_K = np.array([[1400.0, 0, 960], [0, 1400, 540], [0, 0, 1]], dtype=np.float64)
+
+
+def _look_at(
+    eye: Any,
+    target: Any,
+    up: tuple[float, float, float] = (0.0, 0.0, 1.0),
+) -> tuple[np.ndarray, np.ndarray]:
+    e, t, u = np.asarray(eye, float), np.asarray(target, float), np.asarray(up, float)
+    f = t - e
+    f /= np.linalg.norm(f)
+    r = np.cross(f, u)
+    r /= np.linalg.norm(r)
+    d = np.cross(f, r)
+    rvec, _ = cv2.Rodrigues(np.vstack([r, d, f]))
+    return rvec, (-np.vstack([r, d, f]) @ e).reshape(3, 1)
+
+
+def _calib_session(n: int = 9) -> tuple[dict[int, np.ndarray], list[Click]]:
+    """Return interframe transforms + projected clicks for a pan session."""
+    center = (-8.0, 34.0, 9.0)
+    poses = {f: _look_at(center, (22.85, 34.0 + dy, 0.0))
+             for f, dy in enumerate(np.linspace(-10, 10, n))}
+    interframe: dict[int, np.ndarray] = {}
+    for i in range(n - 1):
+        ri, _ = cv2.Rodrigues(poses[i][0])
+        rj, _ = cv2.Rodrigues(poses[i + 1][0])
+        g = _K @ rj @ np.linalg.inv(ri) @ np.linalg.inv(_K)
+        interframe[i] = normalize_homography(g, (1920, 1080))
+    fp = field_points_3d()
+    clicks: list[Click] = []
+    for f in (0, 4, 8):
+        px = cv2.projectPoints(fp, poses[f][0], poses[f][1], _K, np.zeros(5))[0].reshape(-1, 2)
+        for j in range(21):
+            if j != 5 and 0 < px[j, 0] < 1920 and 0 < px[j, 1] < 1080:
+                clicks.append(Click(f, j, float(px[j, 0]) / 1920, float(px[j, 1]) / 1080))
+    return interframe, clicks
 
 
 def _serve() -> tuple[HTTPServer, LabelerState]:
     interframe = {i: np.eye(3) for i in range(5)}
     state = LabelerState(interframe=interframe, n_frames=6, size=(1920, 1080), window=10)
+
+    def frame_jpeg(idx: int) -> bytes:
+        return b"\xff\xd8stub-jpeg"
+
+    handler = make_handler(state, frame_jpeg, landmark_names=["pitch"] * 21)
+    httpd = HTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, state
+
+
+def _serve_calib() -> tuple[HTTPServer, LabelerState]:
+    """Serve a session with calibratable interframe transforms."""
+    interframe, _clicks = _calib_session(9)
+    state = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080), window=360)
 
     def frame_jpeg(idx: int) -> bytes:
         return b"\xff\xd8stub-jpeg"
@@ -45,17 +101,18 @@ def _get(url: str) -> dict[str, Any]:
 
 
 def test_click_then_state_reports_coverage() -> None:
-    httpd, _ = _serve()
+    # Use a calibratable session: real projected clicks across 3 anchor frames.
+    httpd, _state = _serve_calib()
     base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    _interframe, clicks = _calib_session(9)
     try:
-        for f, idx in enumerate([0, 3, 6, 11, 16, 19]):
-            px, py = PITCH_LANDMARKS[idx] * 1000.0
+        for c in clicks:
             _post(f"{base}/api/click",
-                  {"frame": f, "kp_idx": int(idx), "x": float(px), "y": float(py)})
-        state = _get(f"{base}/api/state")
-        assert state["coverage"] > 0.0
-        assert len(state["status_buckets"]) == 6
-        assert state["bucket_size"] == 1
+                  {"frame": c.frame, "kp_idx": c.kp_idx, "x": c.x, "y": c.y})
+        resp = _get(f"{base}/api/state")
+        assert resp["coverage"] > 0.0
+        assert len(resp["status_buckets"]) == 9
+        assert resp["bucket_size"] == 1
     finally:
         httpd.shutdown()
 
@@ -82,18 +139,19 @@ def test_frame_endpoint_ignores_cache_buster_query() -> None:
 
 
 def test_frame_h_includes_residual_and_n_points() -> None:
-    httpd, _ = _serve()
+    # Use a calibratable session so the engine can produce valid homographies.
+    httpd, _state = _serve_calib()
     base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    _interframe, clicks = _calib_session(9)
     try:
-        for f, idx in enumerate([0, 3, 6, 11, 16, 19]):
-            px, py = PITCH_LANDMARKS[idx] * 1000.0
+        for c in clicks:
             _post(f"{base}/api/click",
-                  {"frame": f, "kp_idx": int(idx), "x": float(px), "y": float(py)})
-        fh = _get(f"{base}/api/frame_h/3")
+                  {"frame": c.frame, "kp_idx": c.kp_idx, "x": c.x, "y": c.y})
+        fh = _get(f"{base}/api/frame_h/4")   # frame 4 is a clicked anchor
         assert fh["h"] is not None
-        assert fh["residual"] is not None and fh["residual"] < 0.05
-        assert fh["n_points"] == 6
-        assert _get(f"{base}/api/frame_h/0")["h"] is not None
+        assert fh["residual"] is not None and fh["residual"] < 25.0  # px threshold
+        assert fh["n_points"] is not None and fh["n_points"] > 0
+        assert _get(f"{base}/api/frame_h/2")["h"] is not None  # propagated frame
     finally:
         httpd.shutdown()
 

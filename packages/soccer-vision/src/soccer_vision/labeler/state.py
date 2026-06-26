@@ -82,8 +82,10 @@ class LabelerState:
         return [c for c in self.clicks if c.kp_idx not in self._outliers.get(c.frame, [])]
 
     def _try_bootstrap(self) -> bool:
-        """Estimate + freeze the shared focal once >=3 calibratable anchors exist,
-        and flag outlier clicks. Returns True if calibrated."""
+        """Estimate + freeze the shared focal once >=3 anchor frames each have >=6
+        landmarks (calibrate_camera's min), and flag outlier clicks. Returns True if
+        calibrated. The focal is physically constant (fixed Trace lens), so once frozen
+        it stays valid; `recalibrate()` re-estimates K + outliers on demand."""
         if self._calibrated:
             return True
         try:
@@ -165,6 +167,9 @@ class LabelerState:
         self._autosave()
 
     def remove_last(self) -> None:
+        # The frozen focal stays valid after an undo (constant lens); it is NOT
+        # re-estimated here even if the undo drops below the bootstrap count.
+        # `recalibrate()` refreshes K + outlier flags when the user wants.
         if self.clicks:
             removed = self.clicks.pop()
             if self._calibrated:

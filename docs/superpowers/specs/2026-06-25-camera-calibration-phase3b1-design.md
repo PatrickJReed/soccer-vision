@@ -49,16 +49,19 @@ and flagged back to the user.
 ### Per-point RANSAC — `pitch/calib_anchor.py` (per-frame fit only)
 Outlier clicks are dropped at the **per-frame fit** (the focal is already robust, so
 there is no robust-bootstrap step — verified: the focal is 1469 px with or without
-the outliers). `poses_by_click_propagation` switches its per-frame
-`cv2.solvePnP(SQPNP)` to `cv2.solvePnPRansac` (with the frozen `K`): it returns the
-pose **plus an inlier mask**, so the gross mislabels (8526, 56938) and the
-chain-drifted propagated-neighbour clicks the window pulls in are dropped per frame.
-The RANSAC reprojection threshold is a parameter (≈8–10 px). `poses_by_click_propagation`
-also gains a `frames=` argument (restrict the targets) so the labeler can recompute
-just the touched window. Per-frame **outlier clicks** (kp_idx of dropped points) are
-returned for UI flagging, and the frame's `residual_px` / `fold_count` are computed on
-the **inlier** set. `calibrate_clicked_frames` is unchanged — the 152-frame focal seed
-is already clean.
+the outliers). The per-frame fit uses an **iterative drop-worst SQPNP** — NOT
+`cv2.solvePnPRansac`, which degenerates on the coplanar (Z=0) field points (verified:
+it returned ~10⁵ px garbage). The helper (`_robust_sqpnp`): SQPNP the current point
+set, find the worst reprojection residual; if it exceeds the threshold (≈40 px) drop
+that point and refit; repeat until the worst residual is under threshold or fewer than
+`min_points` remain. Verified on the real data — it drops the gross mislabels (8526
+kp8, 56938 kp7) and the imprecise box clicks (14357/14700/27391 kp14/16) to ~10–18 px
+inlier RMS, and leaves every good frame untouched (drops nothing).
+`poses_by_click_propagation` calls this helper instead of plain `solvePnP`, and also
+gains a `frames=` argument (restrict the targets) so the labeler can recompute just the
+touched window. Per-frame **outlier clicks** (kp_idx of dropped points) are returned
+for UI flagging; the frame's `residual_px` / `fold_count` are computed on the **inlier**
+set. `calibrate_clicked_frames` is unchanged — the 152-frame focal seed is already clean.
 
 ### Freeze-focal recompute model — `labeler/state.py`
 The Trace camera focal is **physically constant** (fixed lens, no zoom), so:

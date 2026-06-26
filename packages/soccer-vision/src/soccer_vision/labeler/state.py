@@ -109,10 +109,12 @@ class LabelerState:
             k, _poses = calibrate_clicked_frames(self.clicks, self.size, min_points=6)
         except CalibError:
             return False
-        self._K = k
-        _clean, self._outliers = flag_outlier_clicks(
+        _clean, outliers = flag_outlier_clicks(
             self.clicks, k, self.size, thr=self.outlier_px)
-        self._calibrated = True
+        with self._lock:  # publish K + outliers + calibrated atomically for the worker
+            self._K = k
+            self._outliers = outliers
+            self._calibrated = True
         return True
 
     def _calib_frame(self, pose: FramePose) -> CalibFrame:
@@ -133,11 +135,13 @@ class LabelerState:
         """SQPNP (+ selective refine) for `frames`. Snapshots inputs under the lock,
         then solves OFF the lock (numpy/scipy release the GIL) so readers aren't blocked.
         Returns only the frames that solved (>= min_points)."""
-        if not self._calibrated or self._K is None:
-            return {}
         with self._lock:
-            clicks = self._active_clicks()
+            # Read the calibration guard AND snapshot inputs atomically, so a
+            # concurrent recalibrate()/bootstrap can't null K between guard and use.
+            if not self._calibrated or self._K is None:
+                return {}
             k = self._K
+            clicks = list(self._active_clicks())  # stable COPY for the lock-free solve
             line_obs = self._line_obs(frames)
         return poses_by_click_propagation(
             clicks, self._transforms, self._segment_of, k, self.size,
@@ -252,39 +256,46 @@ class LabelerState:
         # The frozen focal stays valid after an undo (constant lens); it is NOT
         # re-estimated here even if the undo drops below the bootstrap count.
         # `recalibrate()` refreshes K + outlier flags when the user wants.
-        if not self._seq:
-            return
-        kind = self._seq.pop()
-        # `_seq` is kept in lockstep with the two lists, so the matching list is
-        # always non-empty here; assert the invariant rather than silently popping
-        # the wrong kind.
-        if kind == "ln":
-            assert self.line_clicks, "_seq/line_clicks out of sync"
-            removed_frame = self.line_clicks.pop().frame
-        else:
-            assert self.clicks, "_seq/clicks out of sync"
-            removed_frame = self.clicks.pop().frame
+        with self._lock:  # pop _seq + the matching list atomically (worker may be reading)
+            if not self._seq:
+                return
+            kind = self._seq.pop()
+            # `_seq` is kept in lockstep with the two lists, so the matching list is
+            # always non-empty here; assert the invariant rather than silently popping
+            # the wrong kind.
+            if kind == "ln":
+                assert self.line_clicks, "_seq/line_clicks out of sync"
+                removed_frame = self.line_clicks.pop().frame
+            else:
+                assert self.clicks, "_seq/clicks out of sync"
+                removed_frame = self.clicks.pop().frame
         if self._calibrated:
             self._refit_one(removed_frame)
             self._worker.mark_dirty(self._affected(removed_frame))
         self._autosave()
 
     def nudge_click(self, frame: int, kp_idx: int, x: float, y: float) -> bool:
-        for i in range(len(self.clicks) - 1, -1, -1):
-            c = self.clicks[i]
-            if c.frame == frame and c.kp_idx == kp_idx:
-                self.clicks[i] = Click(frame=frame, kp_idx=kp_idx, x=x, y=y)
-                if self._calibrated:
-                    self._refit_one(frame)
-                    self._worker.mark_dirty(self._affected(frame))
-                self._autosave()
-                return True
-        return False
+        with self._lock:  # scan + replace atomically (worker may be reading self.clicks)
+            found = False
+            for i in range(len(self.clicks) - 1, -1, -1):
+                c = self.clicks[i]
+                if c.frame == frame and c.kp_idx == kp_idx:
+                    self.clicks[i] = Click(frame=frame, kp_idx=kp_idx, x=x, y=y)
+                    found = True
+                    break
+        if not found:
+            return False
+        if self._calibrated:
+            self._refit_one(frame)
+            self._worker.mark_dirty(self._affected(frame))
+        self._autosave()
+        return True
 
     def recalibrate(self) -> bool:
-        self._calibrated = False
-        self._K = None
-        self._outliers = {}
+        with self._lock:  # reset calibration state atomically vs the worker's reads
+            self._calibrated = False
+            self._K = None
+            self._outliers = {}
         if not self._try_bootstrap():
             with self._lock:
                 self._fits = {}

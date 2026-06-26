@@ -178,3 +178,30 @@ def test_pending_drains_to_zero() -> None:
         assert st.pending() == 0
     finally:
         st.stop_worker()
+
+
+def test_concurrent_edits_during_refit_are_safe() -> None:
+    # Hammer the mutators from the main thread WITHOUT wait_idle between them, so the
+    # background worker is mid-compute (iterating the clicks snapshot) while clicks are
+    # appended / replaced / popped. With the snapshot copied and the mutations locked
+    # this must not raise (RuntimeError: list changed size during iteration) or corrupt
+    # the _seq/_fits invariants. Without the fix it trips intermittently.
+    interframe, _poses, clicks = _pan_session(40)
+    st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080), window=360)
+    try:
+        st.add_clicks(clicks)  # bootstrap -> calibrated, worker live
+        for r in range(200):
+            f = r % 40
+            st.add_click(f, r % 6, 0.30 + 0.001 * (r % 100), 0.40)
+            if r % 3 == 0:
+                st.nudge_click(f, r % 6, 0.50, 0.50)
+            if r % 7 == 0:
+                st.remove_last()
+        st.wait_idle(timeout=20)
+        # invariants hold once everything settles
+        assert st.pending() == 0
+        assert len(st._seq) == len(st.clicks) + len(st.line_clicks)
+        for cf in st._fits.values():
+            assert cf.H.shape == (3, 3)  # no torn / partial fit
+    finally:
+        st.stop_worker()

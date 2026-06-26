@@ -345,7 +345,9 @@ def poses_by_gated_propagation(
             continue
         proj = cv2.projectPoints(
             fp[kps].astype(np.float64), rvec0, tvec0, k_arr, np.zeros(5))[0].reshape(-1, 2)
-        err = np.sqrt(np.sum((proj - img) ** 2, axis=1))
+        err = np.sqrt(np.sum((proj - img) ** 2, axis=1))  # NaN (behind-camera) -> gated out
+        # items are distance-sorted, so i < n_seed is the seed (always kept); farther
+        # landmarks join only if they reproject within gate_px of the seed pose.
         keep = [i for i in range(len(kps)) if i < n_seed or err[i] <= gate_px]
         if len(keep) < min_points:
             continue

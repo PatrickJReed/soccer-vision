@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping, Sequence
+import threading
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -57,6 +58,7 @@ class LabelerState:
         *,
         size: tuple[int, int],
         window: int = 360,
+        line_band: int = 60,
         # green threshold on the per-frame reprojection RMS (px). Measured on the
         # window-PROPAGATED clicks, so chain drift inflates it well above the true
         # ~7 ft pose accuracy; ~60 px ≈ "close to an anchor / trustworthy" vs
@@ -68,6 +70,9 @@ class LabelerState:
         self.n_frames = n_frames
         self.size = size
         self.window = window
+        self.line_band = line_band
+        self._lock = threading.RLock()
+        self._refit_chunk = 256
         self.residual_px_threshold = residual_px_threshold
         self.outlier_px = outlier_px
         self.autosave_path = autosave_path
@@ -117,36 +122,67 @@ class LabelerState:
         w, h = self.size
         prop = propagate_line_clicks(
             self.line_clicks, self._transforms, self._segment_of,
-            window=self.window, frames=frames)
+            window=self.line_band, frames=frames)
         return {f: [(lid, x * w, y * h) for (lid, x, y) in lst] for f, lst in prop.items()}
+
+    def _compute_poses(self, frames: Sequence[int]) -> dict[int, FramePose]:
+        """SQPNP (+ selective refine) for `frames`. Snapshots inputs under the lock,
+        then solves OFF the lock (numpy/scipy release the GIL) so readers aren't blocked.
+        Returns only the frames that solved (>= min_points)."""
+        if not self._calibrated or self._K is None:
+            return {}
+        with self._lock:
+            clicks = self._active_clicks()
+            k = self._K
+            line_obs = self._line_obs(frames)
+        return poses_by_click_propagation(
+            clicks, self._transforms, self._segment_of, k, self.size,
+            window=self.window, frames=frames, line_obs=line_obs)
+
+    def _compute_dirty(
+        self, frames: Sequence[int], is_cancelled: Callable[[], bool]
+    ) -> dict[int, FramePose | None] | None:
+        """Compute `frames` in chunks (checking cancellation between chunks). Returns a
+        map over EVERY requested frame -> pose-or-None (None = no longer solvable, so the
+        applier pops any stale fit). None return = the whole pass was cancelled."""
+        out: dict[int, FramePose | None] = {}
+        ordered = list(frames)
+        for i in range(0, len(ordered), self._refit_chunk):
+            if is_cancelled():
+                return None
+            chunk = ordered[i:i + self._refit_chunk]
+            solved = self._compute_poses(chunk)
+            for f in chunk:
+                out[f] = solved.get(f)
+        return out
+
+    def _apply_fits(self, results: dict[int, FramePose | None]) -> None:
+        """Merge computed poses into _fits under the lock: set solved frames, pop the rest."""
+        with self._lock:
+            for f, pose in results.items():
+                if pose is None:
+                    self._fits.pop(f, None)
+                else:
+                    self._fits[f] = self._calib_frame(pose)
 
     def _refit(self, frames: list[int]) -> None:
         if not self._calibrated or self._K is None:
-            for f in frames:
-                self._fits.pop(f, None)
+            with self._lock:
+                for f in frames:
+                    self._fits.pop(f, None)
             return
-        sub = poses_by_click_propagation(
-            self._active_clicks(), self._transforms, self._segment_of, self._K,
-            self.size, window=self.window, frames=frames, line_obs=self._line_obs(frames))
-        for f in frames:
-            if f in sub:
-                self._fits[f] = self._calib_frame(sub[f])
-            else:
-                self._fits.pop(f, None)
+        result = self._compute_dirty(frames, lambda: False)
+        assert result is not None  # never cancelled with a constant-False predicate
+        self._apply_fits(result)
 
     def _recompute_all(self, chunk: int = 5000) -> None:
-        self._fits = {}
+        with self._lock:
+            self._fits = {}
         if not self._calibrated or self._K is None:
             return
-        allf = sorted(self._transforms)
-        active = self._active_clicks()
-        for i in range(0, len(allf), chunk):
-            part = allf[i:i + chunk]
-            sub = poses_by_click_propagation(
-                active, self._transforms, self._segment_of, self._K, self.size,
-                window=self.window, frames=part, line_obs=self._line_obs(part))
-            for f, pose in sub.items():
-                self._fits[f] = self._calib_frame(pose)
+        result = self._compute_dirty(sorted(self._transforms), lambda: False)
+        assert result is not None
+        self._apply_fits(result)
 
     def _autosave(self) -> None:
         """Atomically persist normalized clicks + line clicks to the sidecar."""
@@ -239,7 +275,8 @@ class LabelerState:
         return True
 
     def _status_of(self, f: int) -> str:
-        cf = self._fits.get(f)
+        with self._lock:
+            cf = self._fits.get(f)
         if cf is None:
             return "red"
         return "green" if cf.residual <= self.residual_px_threshold else "yellow"
@@ -265,7 +302,8 @@ class LabelerState:
         return out, bucket
 
     def frame_homography(self, frame: int) -> CalibFrame | None:
-        return self._fits.get(frame)
+        with self._lock:
+            return self._fits.get(frame)
 
     def export(self, out_dir: Path) -> None:
         out = Path(out_dir)
@@ -277,7 +315,8 @@ class LabelerState:
         for f in range(self.n_frames):
             if self._status_of(f) != "green":
                 continue
-            cf = self._fits[f]
+            with self._lock:
+                cf = self._fits[f]
             conf = float(np.clip(1.0 - cf.residual / self.residual_px_threshold, 0.0, 1.0))
             entries[f] = HomographyEntry(
                 denormalize_homography(cf.H, self.size), "manual", conf)

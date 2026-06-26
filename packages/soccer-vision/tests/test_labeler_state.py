@@ -11,7 +11,7 @@ from numpy.typing import NDArray
 from soccer_vision.calib.field_model import field_points_3d
 from soccer_vision.labeler.chain import normalize_homography
 from soccer_vision.labeler.state import LabelerState
-from soccer_vision.pitch.manual_anchor import Click
+from soccer_vision.pitch.manual_anchor import Click, LineClick
 
 _K = np.array([[1400.0, 0, 960], [0, 1400, 540], [0, 0, 1]], dtype=np.float64)
 
@@ -120,3 +120,15 @@ def test_labeler_export_writes_line_clicks_parquet(tmp_path: Path) -> None:
     assert list(df.columns) == ["frame", "line_id", "x_px", "y_px"]
     assert df.iloc[0]["line_id"] == "midline"
     assert abs(df.iloc[0]["x_px"] - 0.5 * 1920) < 1e-6
+
+
+def test_line_obs_scoped_to_line_band() -> None:
+    interframe, _poses, clicks = _pan_session(9)
+    st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080),
+                      window=360, line_band=1)   # band of +/-1 frame
+    st.add_clicks(clicks)
+    st.line_clicks.append(LineClick(frame=4, line_id="midline", x=0.5, y=0.5))
+    # _line_obs over all frames: only frames within +/-1 of frame 4 carry the line obs
+    obs = st._line_obs(list(range(9)))
+    carrying = sorted(f for f, lst in obs.items() if lst)
+    assert carrying == [3, 4, 5]

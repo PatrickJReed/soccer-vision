@@ -26,6 +26,7 @@ def make_handler(
     landmark_names: list[str],
     *,
     landmark_xy: list[list[float]] | None = None,
+    line_names: list[str] | None = None,
     export_dir: Path | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Build a request handler class closed over the session state.
@@ -34,6 +35,7 @@ def make_handler(
     the frontend so it can draw the reprojected pitch overlay.
     """
     xy: list[list[float]] = landmark_xy or []
+    lines: list[str] = line_names or []
 
     class LabelerHandler(BaseHTTPRequestHandler):
         def log_message(self, *args: Any) -> None:  # quiet
@@ -59,6 +61,7 @@ def make_handler(
                 "n_clicks": len(state.clicks),
                 "landmark_names": landmark_names,
                 "landmark_xy": xy,
+                "line_names": lines,
             }
 
         def do_GET(self) -> None:
@@ -71,10 +74,16 @@ def make_handler(
             elif path == "/api/state":
                 self._json(self._state_payload())
             elif path == "/api/clicks":
-                self._json({"clicks": [
-                    {"frame": c.frame, "kp_idx": c.kp_idx, "x": c.x, "y": c.y}
-                    for c in state.clicks
-                ]})
+                self._json({
+                    "clicks": [
+                        {"frame": c.frame, "kp_idx": c.kp_idx, "x": c.x, "y": c.y}
+                        for c in state.clicks
+                    ],
+                    "line_clicks": [
+                        {"frame": lc.frame, "line_id": lc.line_id, "x": lc.x, "y": lc.y}
+                        for lc in state.line_clicks
+                    ],
+                })
             elif path.startswith("/api/frame_h/"):
                 idx = int(path.rsplit("/", 1)[1])
                 fit = state.frame_homography(idx)
@@ -116,6 +125,15 @@ def make_handler(
             elif self.path == "/api/recalibrate":
                 ok = state.recalibrate()
                 self._json({"recalibrated": ok, **self._state_payload()})
+            elif self.path == "/api/line_click":
+                from soccer_vision.calib.field_model import FIELD_LINES
+                line_id = str(payload["line_id"])
+                if line_id not in FIELD_LINES:
+                    self._json({"error": f"unknown line_id {line_id!r}"}, code=400)
+                    return
+                state.add_line_click(int(payload["frame"]), line_id,
+                                     float(payload["x"]), float(payload["y"]))
+                self._json(self._state_payload())
             else:
                 self._send(404, b"not found", "text/plain")
 
@@ -140,8 +158,14 @@ def run(
     """
     import cv2
 
+    from soccer_vision.calib.field_model import FIELD_LINES
     from soccer_vision.labeler.chain import compute_chain
-    from soccer_vision.labeler.state import clicks_from_keypoints_parquet, clicks_from_sidecar
+    from soccer_vision.labeler.state import (
+        clicks_from_keypoints_parquet,
+        clicks_from_sidecar,
+        line_clicks_from_parquet,
+        line_clicks_from_sidecar,
+    )
     from soccer_vision.pitch.landmarks import LANDMARK_NAMES, PITCH_LANDMARKS
 
     interframe, n_frames, size = compute_chain(video_path, workers=workers)
@@ -161,6 +185,12 @@ def run(
     elif sidecar.exists():
         state.add_clicks(clicks_from_sidecar(sidecar))
         print(f"restored {len(state.clicks)} clicks from autosave {sidecar}")
+    if resume is not None:
+        lc_path = Path(resume).parent / "line_clicks.parquet"
+        if lc_path.exists():
+            state.add_line_clicks(line_clicks_from_parquet(lc_path, size))
+    elif sidecar.exists():
+        state.add_line_clicks(line_clicks_from_sidecar(sidecar))
     cap = cv2.VideoCapture(str(video_path))
 
     def frame_jpeg(idx: int) -> bytes:
@@ -174,7 +204,8 @@ def run(
 
     names = list(LANDMARK_NAMES)
     xy = [[float(x), float(y)] for x, y in PITCH_LANDMARKS]
-    handler = make_handler(state, frame_jpeg, names, landmark_xy=xy, export_dir=export_dir)
+    handler = make_handler(state, frame_jpeg, names, landmark_xy=xy,
+                           line_names=sorted(FIELD_LINES), export_dir=export_dir)
     httpd = HTTPServer(("127.0.0.1", port), handler)
     print(f"Labeler running at http://127.0.0.1:{port}  (video: {video_path})")
     try:

@@ -190,3 +190,16 @@ def test_clicks_endpoint_returns_session_clicks() -> None:
         assert out["clicks"] == [{"frame": 2, "kp_idx": 4, "x": 0.3, "y": 0.6}]
     finally:
         httpd.shutdown()
+
+
+def test_make_handler_accepts_line_names_and_state_exposes_line_clicks() -> None:
+    from soccer_vision.calib.field_model import FIELD_LINES
+    from soccer_vision.labeler.state import LabelerState
+    # self-contained: an empty chain is fine — add_line_click on an uncalibrated state
+    # just stores the click (no refit), which is what we assert.
+    st = LabelerState(interframe={}, n_frames=5, size=(1920, 1080), window=360)
+    st.add_line_click(2, "midline", 0.5, 0.5)
+    assert st.line_clicks[0].line_id == "midline"
+    handler_cls = make_handler(st, lambda i: b"", [f"kp{i}" for i in range(21)],
+                               line_names=sorted(FIELD_LINES))
+    assert handler_cls is not None  # make_handler accepts the line_names kwarg

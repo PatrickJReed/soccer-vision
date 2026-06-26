@@ -17,16 +17,14 @@ import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
-from soccer_vision.calib.calibrate import CalibError
 from soccer_vision.labeler.chain import denormalize_homography
 from soccer_vision.labeler.refit_worker import RefitWorker
 from soccer_vision.pipeline import homographies_to_parquet
-from soccer_vision.pitch.calib_anchor import (
-    FramePose,
-    calibrate_clicked_frames,
-    flag_outlier_clicks,
-    frame_homography,
-    poses_by_gated_propagation,
+from soccer_vision.pitch.global_calib import (
+    fold_of_norm,
+    frame_status,
+    solve_global,
+    two_ended_segments,
 )
 from soccer_vision.pitch.manual_anchor import (
     Click,
@@ -44,9 +42,10 @@ class CalibFrame:
     """A calibrated per-frame result in the labeler's normalized space."""
 
     H: NDArray[np.float64]  # NORMALIZED image -> pitch[0,1] (frontend overlay)
-    residual: float         # inlier reprojection RMS (px)
-    n_points: int
+    residual: float         # in-sample global-fit RMS (norm px) — diagnostic only
+    n_points: int           # clicks in this frame's segment
     fold_count: int
+    two_ended: bool         # the segment saw both field ends (drives green vs yellow)
 
 
 class LabelerState:
@@ -94,7 +93,7 @@ class LabelerState:
         self._outliers: dict[int, list[int]] = {}
         w, h = size
         self._to_norm = np.diag([float(w), float(h), 1.0])  # H_norm = H_px @ this
-        self._worker: RefitWorker[FramePose | None] = RefitWorker(
+        self._worker: RefitWorker[CalibFrame | None] = RefitWorker(
             self._compute_dirty, self._apply_fits)
         self._worker.start()
 
@@ -105,30 +104,18 @@ class LabelerState:
         return [c for c in self.clicks if c.kp_idx not in self._outliers.get(c.frame, [])]
 
     def _try_bootstrap(self) -> bool:
-        """Estimate + freeze the shared focal once >=3 anchor frames each have >=6
-        landmarks (calibrate_camera's min), and flag outlier clicks. Returns True if
-        calibrated. The focal is physically constant (fixed Trace lens), so once frozen
-        it stays valid; `recalibrate()` re-estimates K + outliers on demand."""
+        """Calibrated once any segment has >= 4 clicks (a homography is fittable).
+        No focal/K: the global model is a plain image->pitch homography."""
         if self._calibrated:
             return True
-        try:
-            k, _poses = calibrate_clicked_frames(self.clicks, self.size, min_points=6)
-        except CalibError:
+        with self._lock:
+            clicks = list(self._active_clicks())
+        gc = solve_global(clicks, self._transforms, self._segment_of, self.size)
+        if not gc.h_by_segment:
             return False
-        _clean, outliers = flag_outlier_clicks(
-            self.clicks, k, self.size, thr=self.outlier_px)
-        with self._lock:  # publish K + outliers + calibrated atomically for the worker
-            self._K = k
-            self._outliers = outliers
+        with self._lock:
             self._calibrated = True
         return True
-
-    def _calib_frame(self, pose: FramePose) -> CalibFrame:
-        assert self._K is not None
-        h_px = frame_homography(self._K, pose.rvec, pose.tvec)  # full-pixel image->pitch
-        h_norm = np.asarray(h_px @ self._to_norm, dtype=np.float64)  # normalized
-        return CalibFrame(H=h_norm, residual=pose.residual_px,
-                          n_points=pose.n_points, fold_count=pose.fold_count)
 
     def _line_obs(self, frames: Sequence[int] | None) -> dict[int, list[tuple[str, float, float]]]:
         w, h = self.size
@@ -137,30 +124,40 @@ class LabelerState:
             window=self.line_band, frames=frames)
         return {f: [(lid, x * w, y * h) for (lid, x, y) in lst] for f, lst in prop.items()}
 
-    def _compute_poses(self, frames: Sequence[int]) -> dict[int, FramePose]:
-        """SQPNP (+ selective refine) for `frames`. Snapshots inputs under the lock,
-        then solves OFF the lock (numpy/scipy release the GIL) so readers aren't blocked.
-        Returns only the frames that solved (>= min_points)."""
+    def _compute_poses(self, frames: Sequence[int]) -> dict[int, CalibFrame]:
+        """Solve the global homography (per segment) from ALL clicks, then emit a
+        CalibFrame for each requested frame. Snapshots inputs under the lock and solves
+        off the lock. The global solve is cheap (one DLT per segment), so recomputing it
+        per chunk is acceptable."""
         with self._lock:
-            # Read the calibration guard AND snapshot inputs atomically, so a
-            # concurrent recalibrate()/bootstrap can't null K between guard and use.
-            if not self._calibrated or self._K is None:
+            if not self._calibrated:
                 return {}
-            k = self._K
             clicks = list(self._active_clicks())  # stable COPY for the lock-free solve
-            line_obs = self._line_obs(frames)
-        return poses_by_gated_propagation(
-            clicks, self._transforms, self._segment_of, k, self.size,
-            max_reach=self.window, seed_size=self.seed_size, gate_px=self.gate_px,
-            gap_dist=self.gap_dist, frames=frames, line_obs=line_obs)
+        gc = solve_global(clicks, self._transforms, self._segment_of, self.size)
+        two_ended = two_ended_segments(clicks, self._segment_of)
+        out: dict[int, CalibFrame] = {}
+        for f in frames:
+            h_norm = gc.frame_homography(f)
+            if h_norm is None:
+                continue
+            seg = self._segment_of.get(f)
+            out[f] = CalibFrame(
+                H=h_norm,
+                residual=gc.rms_by_segment.get(seg, float("nan"))
+                if seg is not None else float("nan"),
+                n_points=gc.n_by_segment.get(seg, 0) if seg is not None else 0,
+                fold_count=fold_of_norm(h_norm, self.size),
+                two_ended=(seg in two_ended),
+            )
+        return out
 
     def _compute_dirty(
         self, frames: Sequence[int], is_cancelled: Callable[[], bool]
-    ) -> dict[int, FramePose | None] | None:
+    ) -> dict[int, CalibFrame | None] | None:
         """Compute `frames` in chunks (checking cancellation between chunks). Returns a
-        map over EVERY requested frame -> pose-or-None (None = no longer solvable, so the
-        applier pops any stale fit). None return = the whole pass was cancelled."""
-        out: dict[int, FramePose | None] = {}
+        map over EVERY requested frame -> CalibFrame-or-None (None = no longer solvable,
+        so the applier pops any stale fit). None return = the whole pass was cancelled."""
+        out: dict[int, CalibFrame | None] = {}
         ordered = list(frames)
         for i in range(0, len(ordered), self._refit_chunk):
             if is_cancelled():
@@ -171,14 +168,14 @@ class LabelerState:
                 out[f] = solved.get(f)
         return out
 
-    def _apply_fits(self, results: dict[int, FramePose | None]) -> None:
-        """Merge computed poses into _fits under the lock: set solved frames, pop the rest."""
+    def _apply_fits(self, results: dict[int, CalibFrame | None]) -> None:
+        """Merge computed fits into _fits under the lock: set solved frames, pop the rest."""
         with self._lock:
-            for f, pose in results.items():
-                if pose is None:
+            for f, cf in results.items():
+                if cf is None:
                     self._fits.pop(f, None)
                 else:
-                    self._fits[f] = self._calib_frame(pose)
+                    self._fits[f] = cf
 
     def _refit_one(self, frame: int) -> None:
         """Synchronously fit just `frame` (instant overlay for the clicked frame)."""
@@ -198,7 +195,7 @@ class LabelerState:
     def _recompute_all(self) -> None:  # chunking is governed by self._refit_chunk
         with self._lock:
             self._fits = {}
-        if not self._calibrated or self._K is None:
+        if not self._calibrated:
             return
         result = self._compute_dirty(sorted(self._transforms), lambda: False)
         assert result is not None
@@ -220,10 +217,10 @@ class LabelerState:
         os.replace(tmp, self.autosave_path)
 
     def _affected(self, frame: int) -> list[int]:
+        """A click changes the global homography for its ENTIRE segment, so every frame
+        in that segment must be recomputed (not just a window)."""
         seg = self._segment_of.get(frame)
-        lo = max(0, frame - self.window)
-        hi = min(self.n_frames - 1, frame + self.window)
-        return [f for f in range(lo, hi + 1) if self._segment_of.get(f) == seg]
+        return [f for f in range(self.n_frames) if self._segment_of.get(f) == seg]
 
     def add_click(self, frame: int, kp_idx: int, x: float, y: float) -> None:
         with self._lock:
@@ -321,7 +318,7 @@ class LabelerState:
             cf = self._fits.get(f)
         if cf is None:
             return "red"
-        return "green" if cf.residual <= self.residual_px_threshold else "yellow"
+        return frame_status(cf.H, self.size, segment_two_ended=cf.two_ended)
 
     def coverage(self) -> float:
         if self.n_frames == 0:

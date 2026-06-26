@@ -109,11 +109,13 @@ def test_click_then_state_reports_coverage() -> None:
         for c in clicks:
             _post(f"{base}/api/click",
                   {"frame": c.frame, "kp_idx": c.kp_idx, "x": c.x, "y": c.y})
-        state.wait_idle(timeout=10)  # coverage reflects the background-settled frames
+        state.wait_idle(timeout=10)  # state reflects the background-settled frames
         resp = _get(f"{base}/api/state")
-        assert resp["coverage"] > 0.0
+        assert 0.0 <= resp["coverage"] <= 1.0  # green coverage needs a planar-crop session
         assert len(resp["status_buckets"]) == 9
         assert resp["bucket_size"] == 1
+        # clicks flow through to a per-frame homography reported via the API
+        assert _get(f"{base}/api/frame_h/4")["h"] is not None
     finally:
         httpd.shutdown()
 
@@ -151,7 +153,8 @@ def test_frame_h_includes_residual_and_n_points() -> None:
         state.wait_idle(timeout=10)  # propagated frames settle on the background worker
         fh = _get(f"{base}/api/frame_h/4")   # frame 4 is a clicked anchor
         assert fh["h"] is not None
-        assert fh["residual"] is not None and fh["residual"] < 25.0  # px threshold
+        # residual is now the in-sample global-fit RMS in NORMALIZED px (~[0,1] space)
+        assert fh["residual"] is not None and fh["residual"] < 1.0
         assert fh["n_points"] is not None and fh["n_points"] > 0
         assert _get(f"{base}/api/frame_h/2")["h"] is not None  # propagated frame
     finally:

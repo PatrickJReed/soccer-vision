@@ -55,7 +55,11 @@ class LabelerState:
         *,
         size: tuple[int, int],
         window: int = 360,
-        residual_px_threshold: float = 25.0,
+        # green threshold on the per-frame reprojection RMS (px). Measured on the
+        # window-PROPAGATED clicks, so chain drift inflates it well above the true
+        # ~7 ft pose accuracy; ~60 px ≈ "close to an anchor / trustworthy" vs
+        # "re-anchor here" (62% green on the full game). Tunable per session.
+        residual_px_threshold: float = 60.0,
         outlier_px: float = 40.0,
         autosave_path: Path | None = None,
     ) -> None:

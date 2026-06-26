@@ -26,7 +26,7 @@ from soccer_vision.pitch.calib_anchor import (
     calibrate_clicked_frames,
     flag_outlier_clicks,
     frame_homography,
-    poses_by_click_propagation,
+    poses_by_gated_propagation,
 )
 from soccer_vision.pitch.manual_anchor import (
     Click,
@@ -60,6 +60,9 @@ class LabelerState:
         size: tuple[int, int],
         window: int = 360,
         line_band: int = 60,
+        seed_size: int = 6,
+        gate_px: float = 60.0,
+        gap_dist: int = 180,
         # green threshold on the per-frame reprojection RMS (px). Measured on the
         # window-PROPAGATED clicks, so chain drift inflates it well above the true
         # ~7 ft pose accuracy; ~60 px ≈ "close to an anchor / trustworthy" vs
@@ -72,6 +75,9 @@ class LabelerState:
         self.size = size
         self.window = window
         self.line_band = line_band
+        self.seed_size = seed_size
+        self.gate_px = gate_px
+        self.gap_dist = gap_dist
         self._lock = threading.RLock()
         self._refit_chunk = 256
         self.residual_px_threshold = residual_px_threshold
@@ -143,9 +149,10 @@ class LabelerState:
             k = self._K
             clicks = list(self._active_clicks())  # stable COPY for the lock-free solve
             line_obs = self._line_obs(frames)
-        return poses_by_click_propagation(
+        return poses_by_gated_propagation(
             clicks, self._transforms, self._segment_of, k, self.size,
-            window=self.window, frames=frames, line_obs=line_obs)
+            max_reach=self.window, seed_size=self.seed_size, gate_px=self.gate_px,
+            gap_dist=self.gap_dist, frames=frames, line_obs=line_obs)
 
     def _compute_dirty(
         self, frames: Sequence[int], is_cancelled: Callable[[], bool]

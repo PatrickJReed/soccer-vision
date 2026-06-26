@@ -205,3 +205,40 @@ def test_concurrent_edits_during_refit_are_safe() -> None:
             assert cf.H.shape == (3, 3)  # no torn / partial fit
     finally:
         st.stop_worker()
+
+
+def test_state_gated_params_default_and_clean_session_fits() -> None:
+    interframe, _poses, clicks = _pan_session(40)
+    st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080), window=360)
+    try:
+        assert (st.seed_size, st.gate_px, st.gap_dist) == (6, 60.0, 180)  # defaults wired
+        st.add_clicks(clicks)
+        st.wait_idle(timeout=10)
+        # clean pan, gated engine: clicked frames are covered and accurate (no regression)
+        for c in sorted({cl.frame for cl in clicks})[:3]:
+            cf = st.frame_homography(c)
+            assert cf is not None and cf.residual < 60.0
+    finally:
+        st.stop_worker()
+
+
+def test_state_gap_dist_reds_far_frames() -> None:
+    # A tighter gap_dist must cover a STRICT SUBSET of frames (far ones go red) -- proves
+    # gap_dist is wired through to the engine, without depending on exact click positions.
+    interframe, _poses, clicks = _pan_session(40)
+    wide = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080),
+                        window=360, gap_dist=180)
+    tight = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080),
+                         window=360, gap_dist=3)
+    try:
+        wide.add_clicks(clicks)
+        wide.wait_idle(timeout=10)
+        tight.add_clicks(clicks)
+        tight.wait_idle(timeout=10)
+        covered_wide = {f for f in range(40) if wide.frame_homography(f) is not None}
+        covered_tight = {f for f in range(40) if tight.frame_homography(f) is not None}
+        assert covered_tight < covered_wide  # strict subset: tight gap_dist reds far frames
+        assert covered_tight  # but clicked frames are still covered
+    finally:
+        wide.stop_worker()
+        tight.stop_worker()

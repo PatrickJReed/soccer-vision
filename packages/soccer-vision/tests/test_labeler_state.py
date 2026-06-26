@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -77,3 +78,45 @@ def test_labeler_flags_outlier_click() -> None:
     st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080), window=360)
     st.add_clicks(clicks)
     assert st._outliers.get(4) == [6]   # the mislabel flagged session-level
+
+
+def test_labeler_add_line_click_refits_and_persists(tmp_path: Path) -> None:
+    interframe, _poses, clicks = _pan_session(9)
+    sidecar = tmp_path / "s.json"
+    st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080),
+                      window=360, autosave_path=sidecar)
+    st.add_clicks(clicks)                     # bootstrap on points
+    _cf_before = st.frame_homography(4)
+    st.add_line_click(4, "midline", 0.5, 0.5)
+    assert len(st.line_clicks) == 1
+    assert st.frame_homography(4) is not None  # still covered (refine ran)
+    # sidecar carries both
+    import json
+    data = json.loads(sidecar.read_text())
+    assert data["line_clicks"] == [{"frame": 4, "line_id": "midline", "x": 0.5, "y": 0.5}]
+    assert len(data["clicks"]) == len(clicks)
+
+
+def test_labeler_remove_last_pops_line_then_point() -> None:
+    interframe, _poses, clicks = _pan_session(9)
+    st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080), window=360)
+    st.add_clicks(clicks)
+    st.add_line_click(4, "near_touchline", 0.1, 0.9)
+    n_pts = len(st.clicks)
+    st.remove_last()                          # pops the line click (added last)
+    assert len(st.line_clicks) == 0 and len(st.clicks) == n_pts
+    st.remove_last()                          # now pops a point
+    assert len(st.clicks) == n_pts - 1
+
+
+def test_labeler_export_writes_line_clicks_parquet(tmp_path: Path) -> None:
+    interframe, _poses, clicks = _pan_session(9)
+    st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080), window=360)
+    st.add_clicks(clicks)
+    st.add_line_click(4, "midline", 0.5, 0.5)
+    st.export(tmp_path)
+    import pandas as pd
+    df = pd.read_parquet(tmp_path / "line_clicks.parquet")
+    assert list(df.columns) == ["frame", "line_id", "x_px", "y_px"]
+    assert df.iloc[0]["line_id"] == "midline"
+    assert abs(df.iloc[0]["x_px"] - 0.5 * 1920) < 1e-6

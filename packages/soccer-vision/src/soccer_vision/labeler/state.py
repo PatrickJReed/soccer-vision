@@ -28,9 +28,11 @@ from soccer_vision.pitch.calib_anchor import (
 )
 from soccer_vision.pitch.manual_anchor import (
     Click,
+    LineClick,
     build_segments,
     clicks_to_keypoints_df,
     cumulative_transforms,
+    propagate_line_clicks,
 )
 from soccer_vision.pitch.propagation import HomographyEntry
 
@@ -72,6 +74,8 @@ class LabelerState:
         self._segment_of = build_segments(interframe, n_frames)
         self._transforms = cumulative_transforms(interframe, self._segment_of)
         self.clicks: list[Click] = []
+        self.line_clicks: list[LineClick] = []
+        self._seq: list[str] = []  # insertion order across clicks ("pt") + line_clicks ("ln")
         self._fits: dict[int, CalibFrame] = {}
         self._K: NDArray[np.float64] | None = None
         self._calibrated = False
@@ -109,6 +113,13 @@ class LabelerState:
         return CalibFrame(H=h_norm, residual=pose.residual_px,
                           n_points=pose.n_points, fold_count=pose.fold_count)
 
+    def _line_obs(self, frames: Sequence[int] | None) -> dict[int, list[tuple[str, float, float]]]:
+        w, h = self.size
+        prop = propagate_line_clicks(
+            self.line_clicks, self._transforms, self._segment_of,
+            window=self.window, frames=frames)
+        return {f: [(lid, x * w, y * h) for (lid, x, y) in lst] for f, lst in prop.items()}
+
     def _refit(self, frames: list[int]) -> None:
         if not self._calibrated or self._K is None:
             for f in frames:
@@ -116,7 +127,7 @@ class LabelerState:
             return
         sub = poses_by_click_propagation(
             self._active_clicks(), self._transforms, self._segment_of, self._K,
-            self.size, window=self.window, frames=frames)
+            self.size, window=self.window, frames=frames, line_obs=self._line_obs(frames))
         for f in frames:
             if f in sub:
                 self._fits[f] = self._calib_frame(sub[f])
@@ -133,19 +144,21 @@ class LabelerState:
             part = allf[i:i + chunk]
             sub = poses_by_click_propagation(
                 active, self._transforms, self._segment_of, self._K, self.size,
-                window=self.window, frames=part)
+                window=self.window, frames=part, line_obs=self._line_obs(part))
             for f, pose in sub.items():
                 self._fits[f] = self._calib_frame(pose)
 
     def _autosave(self) -> None:
-        """Atomically persist normalized clicks to the sidecar (if configured)."""
+        """Atomically persist normalized clicks + line clicks to the sidecar."""
         if self.autosave_path is None:
             return
         self.autosave_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = [
-            {"frame": c.frame, "kp_idx": c.kp_idx, "x": c.x, "y": c.y}
-            for c in self.clicks
-        ]
+        payload = {
+            "clicks": [{"frame": c.frame, "kp_idx": c.kp_idx, "x": c.x, "y": c.y}
+                       for c in self.clicks],
+            "line_clicks": [{"frame": lc.frame, "line_id": lc.line_id, "x": lc.x, "y": lc.y}
+                            for lc in self.line_clicks],
+        }
         tmp = self.autosave_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload))
         os.replace(tmp, self.autosave_path)
@@ -158,6 +171,7 @@ class LabelerState:
 
     def add_click(self, frame: int, kp_idx: int, x: float, y: float) -> None:
         self.clicks.append(Click(frame=frame, kp_idx=kp_idx, x=x, y=y))
+        self._seq.append("pt")
         if not self._calibrated and self._try_bootstrap():
             self._recompute_all()
         elif self._calibrated:
@@ -166,7 +180,21 @@ class LabelerState:
 
     def add_clicks(self, clicks: Sequence[Click], *, chunk: int = 5000) -> None:
         self.clicks.extend(clicks)
+        self._seq.extend("pt" for _ in clicks)
         self._try_bootstrap()
+        self._recompute_all(chunk=chunk)
+        self._autosave()
+
+    def add_line_click(self, frame: int, line_id: str, x: float, y: float) -> None:
+        self.line_clicks.append(LineClick(frame=frame, line_id=line_id, x=x, y=y))
+        self._seq.append("ln")
+        if self._calibrated:
+            self._refit(self._affected(frame))
+        self._autosave()
+
+    def add_line_clicks(self, line_clicks: Sequence[LineClick], *, chunk: int = 5000) -> None:
+        self.line_clicks.extend(line_clicks)
+        self._seq.extend("ln" for _ in line_clicks)
         self._recompute_all(chunk=chunk)
         self._autosave()
 
@@ -174,11 +202,18 @@ class LabelerState:
         # The frozen focal stays valid after an undo (constant lens); it is NOT
         # re-estimated here even if the undo drops below the bootstrap count.
         # `recalibrate()` refreshes K + outlier flags when the user wants.
-        if self.clicks:
-            removed = self.clicks.pop()
-            if self._calibrated:
-                self._refit(self._affected(removed.frame))
-            self._autosave()
+        if not self._seq:
+            return
+        kind = self._seq.pop()
+        if kind == "ln" and self.line_clicks:
+            removed_frame = self.line_clicks.pop().frame
+        elif self.clicks:
+            removed_frame = self.clicks.pop().frame
+        else:
+            return
+        if self._calibrated:
+            self._refit(self._affected(removed_frame))
+        self._autosave()
 
     def nudge_click(self, frame: int, kp_idx: int, x: float, y: float) -> bool:
         for i in range(len(self.clicks) - 1, -1, -1):
@@ -244,16 +279,37 @@ class LabelerState:
             entries[f] = HomographyEntry(
                 denormalize_homography(cf.H, self.size), "manual", conf)
         homographies_to_parquet(entries, out / "homographies.parquet")
+        if self.line_clicks:
+            pd.DataFrame(
+                [{"frame": lc.frame, "line_id": lc.line_id, "x_px": lc.x * w, "y_px": lc.y * h}
+                 for lc in self.line_clicks],
+                columns=["frame", "line_id", "x_px", "y_px"],
+            ).to_parquet(out / "line_clicks.parquet", index=False)
 
 
 def clicks_from_sidecar(path: Path) -> list[Click]:
-    """Load the autosave sidecar (normalized coords) back into Clicks."""
+    """Load the autosave sidecar's POINT clicks (handles the old bare-list format)."""
     data = json.loads(Path(path).read_text())
-    return [
-        Click(frame=int(d["frame"]), kp_idx=int(d["kp_idx"]),
-              x=float(d["x"]), y=float(d["y"]))
-        for d in data
-    ]
+    rows = data["clicks"] if isinstance(data, dict) else data
+    return [Click(frame=int(d["frame"]), kp_idx=int(d["kp_idx"]),
+                  x=float(d["x"]), y=float(d["y"])) for d in rows]
+
+
+def line_clicks_from_sidecar(path: Path) -> list[LineClick]:
+    """Load the autosave sidecar's LINE clicks ([] for the old bare-list format)."""
+    data = json.loads(Path(path).read_text())
+    rows = data.get("line_clicks", []) if isinstance(data, dict) else []
+    return [LineClick(frame=int(d["frame"]), line_id=str(d["line_id"]),
+                      x=float(d["x"]), y=float(d["y"])) for d in rows]
+
+
+def line_clicks_from_parquet(path: Path, size: tuple[int, int]) -> list[LineClick]:
+    """Load an exported line_clicks.parquet (full-pixel) back into normalized LineClicks."""
+    df = pd.read_parquet(path)
+    w, h = size
+    return [LineClick(frame=int(f), line_id=str(lid), x=float(x) / w, y=float(y) / h)
+            for f, lid, x, y in zip(df["frame"].to_numpy(), df["line_id"].to_numpy(),
+                                    df["x_px"].to_numpy(), df["y_px"].to_numpy(), strict=True)]
 
 
 def clicks_from_keypoints_parquet(path: Path, size: tuple[int, int]) -> list[Click]:

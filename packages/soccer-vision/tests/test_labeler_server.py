@@ -233,6 +233,17 @@ def test_line_click_endpoint_rejects_unknown_line_id() -> None:
     assert state.line_clicks == []  # nothing stored on a rejected line_id
 
 
+def test_state_payload_includes_pending() -> None:
+    httpd, _ = _serve()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        out = _get(f"{base}/api/state")
+        assert "pending" in out
+        assert isinstance(out["pending"], int)
+    finally:
+        httpd.shutdown()
+
+
 def test_clicks_endpoint_returns_both_point_and_line_clicks() -> None:
     httpd, _ = _serve()
     base = f"http://127.0.0.1:{httpd.server_address[1]}"

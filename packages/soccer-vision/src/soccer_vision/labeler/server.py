@@ -62,6 +62,7 @@ def make_handler(
                 "landmark_names": landmark_names,
                 "landmark_xy": xy,
                 "line_names": lines,
+                "pending": state.pending(),
             }
 
         def do_GET(self) -> None:
@@ -212,3 +213,4 @@ def run(
         httpd.serve_forever()
     finally:
         cap.release()
+        state.stop_worker()

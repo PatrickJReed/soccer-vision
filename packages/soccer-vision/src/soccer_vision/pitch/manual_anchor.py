@@ -33,6 +33,16 @@ class Click:
     y: float
 
 
+@dataclass(frozen=True)
+class LineClick:
+    """One line observation: pixel (x, y) asserted to lie on field line `line_id`."""
+
+    frame: int
+    line_id: str
+    x: float
+    y: float
+
+
 @dataclass(frozen=True, eq=False)
 class FrameFit:
     """A fitted per-frame homography plus its quality."""
@@ -163,6 +173,48 @@ def propagate_clicks(
         for gi in np.where(ok)[0]:
             out.setdefault(int(frame_arr[gi]), {})[kp] = (
                 float(chosen[gi, 0]), float(chosen[gi, 1]))
+    return out
+
+
+def propagate_line_clicks(
+    line_clicks: Sequence[LineClick],
+    transforms: Mapping[int, NDArray[np.floating]],
+    segment_of: Mapping[int, int],
+    *,
+    window: int,
+    frames: Sequence[int] | None = None,
+) -> dict[int, list[tuple[str, float, float]]]:
+    """For each target frame, EVERY in-window same-segment line click chain-mapped in.
+
+    A line click is a pixel on a known line; the chain maps it to a pixel still on
+    that line in the target frame (the line is rigid; the camera has no parallax).
+    Unlike `propagate_clicks` (nearest-wins per landmark), all in-window line clicks
+    contribute — each is an independent constraint. Returns {frame: [(line_id, x, y)]}
+    in normalized image space (same as the clicks/transforms).
+    """
+    out: dict[int, list[tuple[str, float, float]]] = {}
+    if not line_clicks or not transforms:
+        return out
+    if frames is None:
+        target = sorted(transforms)
+    else:
+        target = sorted(set(transforms) & {int(f) for f in frames})
+    if not target:
+        return out
+    m_inv = {g: np.linalg.inv(np.asarray(transforms[g], dtype=np.float64)) for g in target}
+    seg_t = {g: segment_of.get(g) for g in target}
+    for lc in line_clicks:
+        src_m = transforms.get(lc.frame)
+        seg = segment_of.get(lc.frame)
+        if src_m is None or seg is None:
+            continue
+        ref = np.asarray(src_m, dtype=np.float64) @ np.array([lc.x, lc.y, 1.0])
+        for g in target:
+            if seg_t[g] != seg or abs(g - lc.frame) > window:
+                continue
+            dst = m_inv[g] @ ref
+            out.setdefault(g, []).append(
+                (lc.line_id, float(dst[0] / dst[2]), float(dst[1] / dst[2])))
     return out
 
 

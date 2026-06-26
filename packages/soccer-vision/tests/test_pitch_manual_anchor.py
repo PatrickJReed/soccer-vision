@@ -7,6 +7,7 @@ from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 from soccer_vision.pitch.manual_anchor import (
     Click,
     FrameFit,
+    LineClick,
     build_segments,
     clicks_to_keypoints_df,
     coverage_fraction,
@@ -14,6 +15,7 @@ from soccer_vision.pitch.manual_anchor import (
     fit_frame_homographies,
     frame_status,
     map_point,
+    propagate_line_clicks,
     to_homography_entries,
 )
 
@@ -232,3 +234,39 @@ def test_fit_frames_subset_ignores_unknown_frames() -> None:
         window=10, frames=[1, 99],
     )
     assert set(out) <= {1}
+
+
+def test_propagate_line_clicks_carries_along_identity_chain() -> None:
+    interframe = {i: np.eye(3) for i in range(5)}  # frames 0..5 linked
+    seg = build_segments(interframe, 6)
+    transforms = cumulative_transforms(interframe, seg)
+    lcs = [LineClick(frame=0, line_id="midline", x=0.4, y=0.6)]
+    prop = propagate_line_clicks(lcs, transforms, seg, window=10)
+    assert prop[2] == [("midline", 0.4, 0.6)]   # unchanged under identity
+    assert prop[5] == [("midline", 0.4, 0.6)]
+    small = propagate_line_clicks(lcs, transforms, seg, window=1)
+    assert 5 not in small                        # outside the window
+
+
+def test_propagate_line_clicks_emits_all_in_window() -> None:
+    # two clicks on the same line -> BOTH propagate into a frame (not nearest-wins)
+    interframe = {i: np.eye(3) for i in range(5)}
+    seg = build_segments(interframe, 6)
+    transforms = cumulative_transforms(interframe, seg)
+    lcs = [LineClick(0, "near_touchline", 0.1, 0.9),
+           LineClick(3, "near_touchline", 0.2, 0.95)]
+    prop = propagate_line_clicks(lcs, transforms, seg, window=10, frames=[3])
+    assert set(prop) == {3}                                  # frames= restricts
+    assert ("near_touchline", 0.1, 0.9) in prop[3]
+    assert ("near_touchline", 0.2, 0.95) in prop[3]
+    assert len(prop[3]) == 2
+
+
+def test_propagate_line_clicks_respects_segments() -> None:
+    interframe = {0: np.eye(3), 1: np.eye(3), 3: np.eye(3)}   # link missing at 2
+    seg = build_segments(interframe, 5)
+    transforms = cumulative_transforms(interframe, seg)
+    lcs = [LineClick(0, "midline", 0.5, 0.5)]
+    prop = propagate_line_clicks(lcs, transforms, seg, window=10)
+    assert 1 in prop                                         # same segment
+    assert 4 not in prop                                     # other segment

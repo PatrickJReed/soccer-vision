@@ -175,7 +175,7 @@ class LabelerState:
         assert result is not None  # never cancelled with a constant-False predicate
         self._apply_fits(result)
 
-    def _recompute_all(self, chunk: int = 5000) -> None:
+    def _recompute_all(self) -> None:  # chunking is governed by self._refit_chunk
         with self._lock:
             self._fits = {}
         if not self._calibrated or self._K is None:
@@ -214,11 +214,11 @@ class LabelerState:
             self._refit(self._affected(frame))
         self._autosave()
 
-    def add_clicks(self, clicks: Sequence[Click], *, chunk: int = 5000) -> None:
+    def add_clicks(self, clicks: Sequence[Click]) -> None:
         self.clicks.extend(clicks)
         self._seq.extend("pt" for _ in clicks)
         self._try_bootstrap()
-        self._recompute_all(chunk=chunk)
+        self._recompute_all()
         self._autosave()
 
     def add_line_click(self, frame: int, line_id: str, x: float, y: float) -> None:
@@ -228,10 +228,10 @@ class LabelerState:
             self._refit(self._affected(frame))
         self._autosave()
 
-    def add_line_clicks(self, line_clicks: Sequence[LineClick], *, chunk: int = 5000) -> None:
+    def add_line_clicks(self, line_clicks: Sequence[LineClick]) -> None:
         self.line_clicks.extend(line_clicks)
         self._seq.extend("ln" for _ in line_clicks)
-        self._recompute_all(chunk=chunk)
+        self._recompute_all()
         self._autosave()
 
     def remove_last(self) -> None:
@@ -313,10 +313,10 @@ class LabelerState:
         clicks_to_keypoints_df(px_clicks).to_parquet(out / "keypoints.parquet", index=False)
         entries: dict[int, HomographyEntry] = {}
         for f in range(self.n_frames):
-            if self._status_of(f) != "green":
+            with self._lock:  # single locked read: no green-then-missing TOCTOU window
+                cf = self._fits.get(f)
+            if cf is None or cf.residual > self.residual_px_threshold:  # not green
                 continue
-            with self._lock:
-                cf = self._fits[f]
             conf = float(np.clip(1.0 - cf.residual / self.residual_px_threshold, 0.0, 1.0))
             entries[f] = HomographyEntry(
                 denormalize_homography(cf.H, self.size), "manual", conf)

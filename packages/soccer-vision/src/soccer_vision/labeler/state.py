@@ -205,12 +205,15 @@ class LabelerState:
         if not self._seq:
             return
         kind = self._seq.pop()
-        if kind == "ln" and self.line_clicks:
+        # `_seq` is kept in lockstep with the two lists, so the matching list is
+        # always non-empty here; assert the invariant rather than silently popping
+        # the wrong kind.
+        if kind == "ln":
+            assert self.line_clicks, "_seq/line_clicks out of sync"
             removed_frame = self.line_clicks.pop().frame
-        elif self.clicks:
-            removed_frame = self.clicks.pop().frame
         else:
-            return
+            assert self.clicks, "_seq/clicks out of sync"
+            removed_frame = self.clicks.pop().frame
         if self._calibrated:
             self._refit(self._affected(removed_frame))
         self._autosave()

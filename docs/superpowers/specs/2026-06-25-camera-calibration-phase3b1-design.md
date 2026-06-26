@@ -14,11 +14,16 @@ robust per-frame engine; 8 s/full-game, fold-free, ~7 ft).
 The labeler still fits a **free per-frame homography** (`manual_anchor.fit_frame_homographies`),
 which **folds** on shallow frames (361 folded frames on the full game) and drifts.
 Phase 3a proved the fix: per-frame **camera calibration** (shared focal + per-frame
-SQPNP pose) — fold-free, drift-free. The full-game A/B run also surfaced two
-concrete issues to fix on integration:
-1. **Outlier clicks poison the shared focal.** Two gross mislabels (frames 8526,
-   56938) inflated the joint-calibration focal enough to false-reject ~16 otherwise-
-   good frames (a whole-view rejection, no per-point robustness).
+SQPNP pose) — fold-free, drift-free. Two integration issues remain (both confirmed
+against the full-game data):
+1. **No per-point robustness in the per-frame fit.** Engine A's per-frame `solvePnP`
+   uses every click, so a gross mislabel corrupts that frame's pose, and the
+   chain-drifted neighbour clicks that window-propagation pulls in add noise. (NB:
+   the shared focal itself is *robust* — it comes out 1469 px with or without the two
+   gross outliers, and Engine A's per-frame SQPNP already fits the shallow frames at
+   the converged focal; calibrate's one-pass view-rejection drops ~16 of them from
+   the *focal-seed set* but Engine A fits them anyway. So robustness is needed at the
+   per-frame fit, not the focal.)
 2. **No interactive recompute model** for a shared-focal engine yet (3a computed
    whole-game batches).
 
@@ -41,22 +46,19 @@ and flagged back to the user.
 
 ## Design
 
-### Per-point RANSAC — `calib/` + `pitch/calib_anchor.py`
-Outlier clicks must be dropped in **two** places:
-- **Robust focal bootstrap.** `calibrate_clicked_frames` gains a per-point RANSAC
-  pre-filter (a `robust=True` path): with an initial focal guess (frame width), run
-  `cv2.solvePnPRansac` per anchor frame to get the **inlier clicks**, then estimate
-  the shared focal via `calibrate_camera` on the **inliers only**. A gross mislabel
-  can no longer inflate the focal and false-reject good frames.
-- **Per-frame pose.** `poses_by_click_propagation` switches its per-frame
-  `cv2.solvePnP(SQPNP)` to `cv2.solvePnPRansac` (frozen `K`): it returns the pose
-  **plus an inlier mask**, so chain-drifted propagated neighbours and real mislabels
-  are dropped per frame. The RANSAC reprojection threshold is a parameter (≈8–10 px).
-  `poses_by_click_propagation` also gains a `frames=` argument (restrict the targets)
-  so the labeler can recompute just the touched window. Per-frame **outlier clicks**
-  (kp_idx of dropped points) are returned for UI flagging, and the frame's
-  `residual_px` / `fold_count` are computed on the **inlier** set (not the dropped
-  outliers).
+### Per-point RANSAC — `pitch/calib_anchor.py` (per-frame fit only)
+Outlier clicks are dropped at the **per-frame fit** (the focal is already robust, so
+there is no robust-bootstrap step — verified: the focal is 1469 px with or without
+the outliers). `poses_by_click_propagation` switches its per-frame
+`cv2.solvePnP(SQPNP)` to `cv2.solvePnPRansac` (with the frozen `K`): it returns the
+pose **plus an inlier mask**, so the gross mislabels (8526, 56938) and the
+chain-drifted propagated-neighbour clicks the window pulls in are dropped per frame.
+The RANSAC reprojection threshold is a parameter (≈8–10 px). `poses_by_click_propagation`
+also gains a `frames=` argument (restrict the targets) so the labeler can recompute
+just the touched window. Per-frame **outlier clicks** (kp_idx of dropped points) are
+returned for UI flagging, and the frame's `residual_px` / `fold_count` are computed on
+the **inlier** set. `calibrate_clicked_frames` is unchanged — the 152-frame focal seed
+is already clean.
 
 ### Freeze-focal recompute model — `labeler/state.py`
 The Trace camera focal is **physically constant** (fixed lens, no zoom), so:
@@ -118,14 +120,16 @@ change to the labeler's normalized click handling.
   intact (the free fit stays available for the `compare_engines` tool); only
   `LabelerState` switches engines.
 - **Real-data validation (the decisive run, on Patrick's full-game clicks):** the new
-  `LabelerState` vs the free fit — folds 361 → 0, the 18 previously-rejected frames
-  recovered, the 2 real outlier clicks (8526, 56938) flagged, coverage ≥ the free fit,
+  `LabelerState` vs the free fit — folds 361 → 0; Engine A fits every frame (incl. the
+  shallow goal-views); the two gross-mislabel frames (8526, 56938) get a clean pose
+  via per-frame RANSAC with the bad click **flagged**; coverage ≥ the free fit;
   incremental recompute stays interactive. (Runnable locally — CPU, data on hand.)
 
 ## Go/no-go (Phase 3b-1 success)
 - Fold-free in the actual labeler (≈0 folded frames vs 361).
-- The 18 previously-rejected frames calibrate (per-point RANSAC un-poisons the focal);
-  the 2 genuine outlier clicks are flagged, not whole frames.
+- Engine A produces a pose for every covered frame (incl. the shallow goal-views);
+  the 2 gross-mislabel frames get a clean per-frame-RANSAC pose with the bad click
+  flagged (not the whole frame dropped).
 - Coverage ≥ the free fit; green rate up; held-out accuracy ~7 ft.
 - Incremental recompute stays interactive (windowed, ~free-fit cost); bootstrap +
   full recompute on load is acceptable (≈ Engine A's 8 s for the full game).

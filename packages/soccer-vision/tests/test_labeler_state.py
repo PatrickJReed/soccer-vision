@@ -57,6 +57,37 @@ def test_single_end_session_is_never_green_but_two_ended_is() -> None:
         st.stop_worker()
 
 
+def test_export_skips_non_green_and_blocks_until_idle(tmp_path: Path) -> None:
+    # The honest export gate is whole-field GREEN (two-ended + plausible fold), NOT the
+    # old in-sample residual gate. A single-ended (yellow) session has a tiny residual,
+    # so the old gate would export it as a "sky" frame; the green gate must export nothing.
+    import pandas as pd
+
+    h = np.array([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]])  # pitch -> img_norm
+    st = LabelerState(_identity_chain(10), 10, size=SIZE)
+    try:
+        for f, kp, x, y in _clicks_for(0, OWN_END_IDX, h):  # own end only -> yellow
+            st.add_click(f, kp, x, y)
+        st.wait_idle(timeout=10)
+        assert "green" not in st.status_list()
+        st.export(tmp_path)
+        hdf = pd.read_parquet(tmp_path / "homographies.parquet")
+        assert len(hdf) == 0  # nothing green -> nothing exported (no sky homographies)
+
+        # Add opp-end clicks: the segment becomes two-ended -> green frames -> exported.
+        for f, kp, x, y in _clicks_for(5, OPP_END_IDX, h):
+            st.add_click(f, kp, x, y)
+        st.wait_idle(timeout=10)
+        green = [f for f in range(10) if st._status_of(f) == "green"]
+        assert green  # both ends now constrain the global H -> some frames green
+        st.export(tmp_path)
+        hdf = pd.read_parquet(tmp_path / "homographies.parquet")
+        assert len(hdf) == len(green)  # exactly the green frames are exported
+        assert (hdf["confidence"] > 0).all()
+    finally:
+        st.stop_worker()
+
+
 def _look_at(
     eye: Any,
     target: Any,

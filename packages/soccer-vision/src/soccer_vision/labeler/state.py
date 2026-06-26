@@ -345,7 +345,10 @@ class LabelerState:
             return self._fits.get(frame)
 
     def export(self, out_dir: Path) -> None:
-        self.wait_idle(timeout=30)
+        # Block until the background worker has fully drained — never write a partial
+        # set (no 30s timeout: a partial export of in-flight fits is worse than waiting).
+        while self.pending() > 0:
+            self.wait_idle()
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         w, h = self.size
@@ -355,9 +358,18 @@ class LabelerState:
         for f in range(self.n_frames):
             with self._lock:  # single locked read: no green-then-missing TOCTOU window
                 cf = self._fits.get(f)
-            if cf is None or cf.residual > self.residual_px_threshold:  # not green
+            # Honest gate: only export whole-field GREEN frames (two-ended + plausible
+            # fold), never single-ended "sky" frames — regardless of how tight the
+            # in-sample residual is.
+            if cf is None or self._status_of(f) != "green":
                 continue
-            conf = float(np.clip(1.0 - cf.residual / self.residual_px_threshold, 0.0, 1.0))
+            # Confidence: 1.0 for a green frame (whole-field constrained); the in-sample
+            # RMS is a soft penalty, not the gate. Defensive on a non-finite residual.
+            conf = (
+                float(np.clip(
+                    1.0 - cf.residual / max(self.residual_px_threshold, 1e-9), 0.0, 1.0))
+                if np.isfinite(cf.residual) else 1.0
+            )
             entries[f] = HomographyEntry(
                 denormalize_homography(cf.H, self.size), "manual", conf)
         homographies_to_parquet(entries, out / "homographies.parquet")

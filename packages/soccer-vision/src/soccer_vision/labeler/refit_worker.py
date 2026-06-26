@@ -38,9 +38,10 @@ class RefitWorker(Generic[T]):
         self._idle.set()
 
     def start(self) -> None:
-        if self._running:
-            return
-        self._running = True
+        with self._cv:  # keep _running access consistent with the rest of the class
+            if self._running:
+                return
+            self._running = True
         self._thread = threading.Thread(
             target=self._loop, name="refit-worker", daemon=True
         )

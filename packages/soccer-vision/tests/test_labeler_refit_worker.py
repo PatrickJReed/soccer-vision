@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 
 from soccer_vision.labeler.refit_worker import RefitWorker
 
@@ -10,7 +11,7 @@ from soccer_vision.labeler.refit_worker import RefitWorker
 def test_marks_get_computed_and_applied() -> None:
     applied: dict[int, int] = {}
 
-    def compute(frames: list[int], is_cancelled: object) -> dict[int, int]:
+    def compute(frames: list[int], is_cancelled: Callable[[], bool]) -> dict[int, int]:
         return {f: f * 10 for f in frames}
 
     def apply(results: dict[int, int]) -> None:
@@ -30,7 +31,7 @@ def test_marks_get_computed_and_applied() -> None:
 def test_overlapping_marks_union() -> None:
     seen_batches: list[list[int]] = []
 
-    def compute(frames: list[int], is_cancelled: object) -> dict[int, int]:
+    def compute(frames: list[int], is_cancelled: Callable[[], bool]) -> dict[int, int]:
         seen_batches.append(sorted(frames))
         return {f: f for f in frames}
 
@@ -54,11 +55,11 @@ def test_cancellation_requeues_and_eventually_applies() -> None:
     applied: dict[int, int] = {}
     calls = {"n": 0}
 
-    def compute(frames: list[int], is_cancelled: object) -> dict[int, int] | None:
+    def compute(frames: list[int], is_cancelled: Callable[[], bool]) -> dict[int, int] | None:
         calls["n"] += 1
         if calls["n"] == 1:
             bumped.wait(timeout=5)      # let the test add a newer mark first
-            if callable(is_cancelled) and is_cancelled():
+            if is_cancelled():
                 return None             # superseded -> discard
         return {f: f for f in frames}
 

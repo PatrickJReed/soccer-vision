@@ -60,13 +60,35 @@ def _build_session() -> tuple[
 
 
 def test_solve_global_recovers_homography_and_projects_unclicked_end() -> None:
+    from soccer_vision.pitch.homography import HomographyError, fit_homography
+
     clicks, transforms, segment_of, H_ref_to_pitch, _own_end, opp_end = _build_session()
-    gc = solve_global(clicks, transforms, segment_of, SIZE)
+
+    # Strengthen the test so it genuinely beats a per-frame fit (not just matches it):
+    # keep only 3 of frame 0's own-end clicks, so frame 0 ALONE is under-determined
+    # (a homography needs >=4 points). A per-frame engine cannot calibrate frame 0 at
+    # all; the pooled global solve still does, via frame 2's opp-end clicks.
+    f0 = [c for c in clicks if c.frame == 0][:3]
+    f2 = [c for c in clicks if c.frame == 2]
+    sparse = f0 + f2
+
+    # A per-frame fit from frame 0's clicks alone genuinely fails (under-determined).
+    img0 = np.array([[c.x, c.y] for c in f0], dtype=np.float64)
+    pitch0 = PITCH_LANDMARKS[[c.kp_idx for c in f0]]
+    try:
+        fit_homography(img0, pitch0)
+        per_frame_succeeded = True
+    except HomographyError:
+        per_frame_succeeded = False
+    assert not per_frame_succeeded, "frame 0 alone must be under-determined for this test"
+
+    gc = solve_global(sparse, transforms, segment_of, SIZE)
     assert isinstance(gc, GlobalCalib)
     assert set(gc.h_by_segment) == {0}
 
-    # Frame 0 clicked ONLY the own end; its H must still project the OPP end correctly
-    # (this is the "lines in the sky" regression the old per-frame engine failed).
+    # Frame 0 (3 own-end clicks, never saw the opp end) STILL projects the OPP end
+    # correctly — only possible because the global solve pooled frame 2's opp clicks.
+    # This is the "lines in the sky" regression the per-frame engine could not fix.
     H0 = gc.frame_homography(0)
     assert H0 is not None
     for kp in opp_end:

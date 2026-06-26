@@ -1,257 +1,79 @@
-"""Tests for LabelerState: click handling, coverage, and parquet export."""
+"""Tests for the calibrated LabelerState backend."""
 
 from __future__ import annotations
 
-import random
-from pathlib import Path
+from typing import Any
 
+import cv2
 import numpy as np
-import pandas as pd
-from soccer_vision.labeler.state import (
-    LabelerState,
-    clicks_from_keypoints_parquet,
-    clicks_from_sidecar,
-)
-from soccer_vision.pipeline import homographies_from_parquet
-from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
+from numpy.typing import NDArray
+from soccer_vision.calib.field_model import field_points_3d
+from soccer_vision.labeler.chain import normalize_homography
+from soccer_vision.labeler.state import LabelerState
 from soccer_vision.pitch.manual_anchor import Click
 
-_SCALE = 1000.0
-_IDXS = [0, 3, 6, 11, 16, 19]
+_K = np.array([[1400.0, 0, 960], [0, 1400, 540], [0, 0, 1]], dtype=np.float64)
 
 
-def _state(n: int = 6) -> LabelerState:
-    interframe = {i: np.eye(3) for i in range(n - 1)}
-    return LabelerState(interframe=interframe, n_frames=n, size=(1920, 1080), window=10)
+def _look_at(
+    eye: Any,
+    target: Any,
+    up: tuple[float, float, float] = (0.0, 0.0, 1.0),
+) -> tuple[Any, NDArray[np.float64]]:
+    e, t, u = np.asarray(eye, float), np.asarray(target, float), np.asarray(up, float)
+    f = t - e
+    f /= np.linalg.norm(f)
+    r = np.cross(f, u)
+    r /= np.linalg.norm(r)
+    d = np.cross(f, r)
+    rvec, _ = cv2.Rodrigues(np.vstack([r, d, f]))
+    return rvec, (-np.vstack([r, d, f]) @ e).reshape(3, 1)
 
 
-def test_add_click_updates_coverage() -> None:
-    st = _state()
-    assert st.coverage() == 0.0
-    for f, idx in enumerate(_IDXS):
-        px, py = PITCH_LANDMARKS[idx] * _SCALE
-        st.add_click(frame=f, kp_idx=idx, x=float(px), y=float(py))
-    assert st.coverage() > 0.0
-    assert st.frame_homography(3) is not None
+def _pan_session(
+    n: int = 9,
+) -> tuple[dict[int, NDArray[np.float64]], dict[int, Any], list[Click]]:
+    center = (-8.0, 34.0, 9.0)
+    poses = {f: _look_at(center, (22.85, 34.0 + dy, 0.0))
+             for f, dy in enumerate(np.linspace(-10, 10, n))}
+    interframe: dict[int, NDArray[np.float64]] = {}
+    for i in range(n - 1):
+        ri, _ = cv2.Rodrigues(poses[i][0])
+        rj, _ = cv2.Rodrigues(poses[i + 1][0])
+        g = _K @ rj @ np.linalg.inv(ri) @ np.linalg.inv(_K)
+        interframe[i] = normalize_homography(g, (1920, 1080))
+    fp = field_points_3d()
+    clicks: list[Click] = []
+    for f in (0, 4, 8):
+        px = cv2.projectPoints(fp, poses[f][0], poses[f][1], _K, np.zeros(5))[0].reshape(-1, 2)
+        for j in range(21):
+            if j != 5 and 0 < px[j, 0] < 1920 and 0 < px[j, 1] < 1080:
+                clicks.append(Click(f, j, float(px[j, 0]) / 1920, float(px[j, 1]) / 1080))
+    return interframe, poses, clicks
 
 
-def test_remove_last_click() -> None:
-    st = _state()
-    st.add_click(0, 0, 1.0, 2.0)
-    assert len(st.clicks) == 1
-    st.remove_last()
-    assert len(st.clicks) == 0
+def test_labeler_bootstraps_focal_and_covers_all_frames() -> None:
+    interframe, _poses, clicks = _pan_session(9)
+    st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080), window=360)
+    st.add_clicks(clicks)
+    assert st._calibrated
+    assert st.coverage() > 0.8
+    cf = st.frame_homography(2)  # UNCLICKED frame covered via propagation
+    assert cf is not None and cf.H.shape == (3, 3)
 
 
-def test_status_list_length_matches_frames() -> None:
-    st = _state(5)
-    assert len(st.status_list()) == 5
-    assert set(st.status_list()) <= {"green", "yellow", "red"}
+def test_labeler_uncalibrated_before_three_anchors() -> None:
+    interframe, _poses, clicks = _pan_session(9)
+    st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080), window=360)
+    st.add_clicks([c for c in clicks if c.frame in (0, 4)])  # only 2 anchors
+    assert not st._calibrated
+    assert st.frame_homography(2) is None  # bootstrap gap
 
 
-def test_export_writes_both_parquets(tmp_path: Path) -> None:
-    st = _state()
-    for f, idx in enumerate(_IDXS):
-        px, py = PITCH_LANDMARKS[idx] * _SCALE
-        st.add_click(frame=f, kp_idx=idx, x=float(px), y=float(py))
-    st.export(tmp_path)
-    kp = pd.read_parquet(tmp_path / "keypoints.parquet")
-    hom = pd.read_parquet(tmp_path / "homographies.parquet")
-    assert list(kp.columns) == ["frame", "kp_idx", "x_px", "y_px", "conf"]
-    assert len(kp) == len(_IDXS)
-    assert "source" in hom.columns and (hom["source"] == "manual").all()
-
-
-def test_add_clicks_bulk_matches_individual() -> None:
-    individual = _state()
-    bulk = _state()
-    clicks = []
-    for f, idx in enumerate(_IDXS):
-        px, py = PITCH_LANDMARKS[idx] * _SCALE
-        individual.add_click(frame=f, kp_idx=idx, x=float(px), y=float(py))
-        clicks.append(Click(frame=f, kp_idx=idx, x=float(px), y=float(py)))
-    bulk.add_clicks(clicks)
-    assert bulk.coverage() == individual.coverage()
-    assert bulk.status_list() == individual.status_list()
-
-
-def test_resume_round_trip_restores_coverage(tmp_path: Path) -> None:
-    st = _state()
-    for f, idx in enumerate(_IDXS):
-        px, py = PITCH_LANDMARKS[idx] * _SCALE
-        st.add_click(frame=f, kp_idx=idx, x=float(px), y=float(py))
-    st.export(tmp_path)
-    resumed = clicks_from_keypoints_parquet(tmp_path / "keypoints.parquet", (1920, 1080))
-    st2 = _state()
-    st2.add_clicks(resumed)
-    assert len(st2.clicks) == len(st.clicks)
-    assert st2.coverage() == st.coverage()
-    assert st2.status_list() == st.status_list()
-
-
-def test_export_homography_maps_pixels_to_pitch(tmp_path: Path) -> None:
-    st = LabelerState(
-        interframe={i: np.eye(3) for i in range(5)},
-        n_frames=6, size=(1920, 1080), window=10,
-    )
-    # identity chain => normalized image coords == pitch coords; click each
-    # landmark at its NORMALIZED pitch position.
-    for f, idx in enumerate(_IDXS):
-        nx, ny = PITCH_LANDMARKS[idx]
-        st.add_click(frame=f, kp_idx=idx, x=float(nx), y=float(ny))
-    st.export(tmp_path)
-    entries = homographies_from_parquet(tmp_path / "homographies.parquet")
-    h = entries[3].H
-    # landmark 3 = pitch (1,1); on a 1920x1080 frame that is pixel (1920, 1080)
-    out = h @ np.array([1920.0, 1080.0, 1.0])
-    out = out[:2] / out[2]
-    assert np.allclose(out, PITCH_LANDMARKS[3], atol=1e-6)
-
-
-def _full_recompute_reference(st: LabelerState) -> LabelerState:
-    """Fresh state replaying st's clicks via bulk load (full recompute)."""
-    ref = LabelerState(
-        interframe={i: np.eye(3) for i in range(st.n_frames - 1)},
-        n_frames=st.n_frames, size=st.size, window=st.window,
-    )
-    ref.add_clicks(list(st.clicks))
-    return ref
-
-
-def _assert_fits_equal(a: LabelerState, b: LabelerState) -> None:
-    fa = {f: a.frame_homography(f) for f in range(a.n_frames)}
-    fb = {f: b.frame_homography(f) for f in range(b.n_frames)}
-    keys_a = {f for f, v in fa.items() if v is not None}
-    keys_b = {f for f, v in fb.items() if v is not None}
-    assert keys_a == keys_b
-    for f in keys_a:
-        va, vb = fa[f], fb[f]
-        assert va is not None and vb is not None
-        assert np.allclose(va.H, vb.H)
-        assert np.isclose(va.residual, vb.residual)
-
-
-def test_incremental_equals_full_after_mutation_sequence() -> None:
-    rng = random.Random(0)
-    st = _state(n=40)
-    for _step in range(30):
-        action = rng.random()
-        if action < 0.6 or not st.clicks:
-            idx = rng.choice(_IDXS)
-            px, py = PITCH_LANDMARKS[idx] * _SCALE
-            st.add_click(frame=rng.randrange(40), kp_idx=idx,
-                         x=float(px) + rng.random(), y=float(py) + rng.random())
-        elif action < 0.8:
-            st.remove_last()
-        else:
-            c = st.clicks[rng.randrange(len(st.clicks))]
-            st.nudge_click(c.frame, c.kp_idx, c.x + 0.5, c.y + 0.5)
-    _assert_fits_equal(st, _full_recompute_reference(st))
-
-
-def test_remove_last_clears_lost_fits() -> None:
-    st = _state()
-    for f, idx in enumerate(_IDXS):
-        px, py = PITCH_LANDMARKS[idx] * _SCALE
-        st.add_click(frame=f, kp_idx=idx, x=float(px), y=float(py))
-    assert st.frame_homography(3) is not None
-    for _ in range(3):
-        st.remove_last()
-    # only 3 landmarks remain -> no frame can fit
-    assert all(st.frame_homography(f) is None for f in range(st.n_frames))
-
-
-def test_bulk_add_chunked_matches_unchunked() -> None:
-    st_small_chunk = _state(n=20)
-    st_default = _state(n=20)
-    clicks = []
-    for f, idx in enumerate(_IDXS):
-        px, py = PITCH_LANDMARKS[idx] * _SCALE
-        clicks.append(Click(frame=f * 3, kp_idx=idx, x=float(px), y=float(py)))
-    st_small_chunk.add_clicks(clicks, chunk=4)
-    st_default.add_clicks(clicks)
-    _assert_fits_equal(st_small_chunk, st_default)
-
-
-def test_nudge_click_moves_most_recent_match() -> None:
-    st = _state()
-    st.add_click(0, 0, 0.1, 0.1)
-    st.add_click(0, 0, 0.2, 0.2)   # duplicate (frame, kp_idx)
-    assert st.nudge_click(0, 0, 0.9, 0.9) is True
-    assert np.isclose(st.clicks[1].x, 0.9)   # most recent moved
-    assert np.isclose(st.clicks[0].x, 0.1)   # older untouched
-    assert st.nudge_click(5, 7, 0.5, 0.5) is False
-
-
-def test_autosave_writes_and_loads_round_trip(tmp_path: Path) -> None:
-    side = tmp_path / "v.clicks.json"
-    st = LabelerState(
-        interframe={i: np.eye(3) for i in range(5)},
-        n_frames=6, size=(1920, 1080), window=10, autosave_path=side,
-    )
-    st.add_click(0, 0, 0.25, 0.5)
-    st.add_click(1, 3, 0.75, 0.5)
-    assert side.exists()
-    loaded = clicks_from_sidecar(side)
-    assert [(c.frame, c.kp_idx) for c in loaded] == [(0, 0), (1, 3)]
-    assert np.isclose(loaded[0].x, 0.25)
-
-
-def test_autosave_updates_on_undo_and_nudge(tmp_path: Path) -> None:
-    side = tmp_path / "v.clicks.json"
-    st = LabelerState(
-        interframe={i: np.eye(3) for i in range(5)},
-        n_frames=6, size=(1920, 1080), window=10, autosave_path=side,
-    )
-    st.add_click(0, 0, 0.25, 0.5)
-    st.add_click(1, 3, 0.75, 0.5)
-    st.nudge_click(1, 3, 0.8, 0.6)
-    assert np.isclose(clicks_from_sidecar(side)[1].x, 0.8)
-    st.remove_last()
-    assert len(clicks_from_sidecar(side)) == 1
-
-
-def test_status_buckets_worst_status_rule() -> None:
-    st = _state(n=12)
-    for f, idx in enumerate(_IDXS):
-        px, py = PITCH_LANDMARKS[idx] * _SCALE
-        st.add_click(frame=f, kp_idx=idx, x=float(px), y=float(py))
-    buckets, bucket_size = st.status_buckets(n_buckets=4)
-    assert len(buckets) == 4
-    assert bucket_size == 3
-    full = st.status_list()
-    for b in range(4):
-        states = full[b * bucket_size:(b + 1) * bucket_size]
-        if "red" in states:
-            assert buckets[b] == "red"
-        elif "yellow" in states:
-            assert buckets[b] == "yellow"
-        else:
-            assert buckets[b] == "green"
-
-
-def test_status_buckets_passthrough_when_few_frames() -> None:
-    st = _state(n=6)
-    buckets, bucket_size = st.status_buckets(n_buckets=1200)
-    assert bucket_size == 1
-    assert buckets == st.status_list()
-
-
-def test_status_buckets_mixed_colors() -> None:
-    # window=1 so only frames 0 and 1 (adjacent to the click) can get fits ->
-    # frames 2-11 remain red; sanity: both green and red must appear.
-    st = LabelerState(
-        interframe={i: np.eye(3) for i in range(11)},
-        n_frames=12, size=(1920, 1080), window=1,
-    )
-    for idx in _IDXS:
-        px, py = PITCH_LANDMARKS[idx] * _SCALE
-        st.add_click(frame=0, kp_idx=idx, x=float(px), y=float(py))
-    full = st.status_list()
-    assert "green" in full and "red" in full   # fixture sanity
-    buckets, bucket_size = st.status_buckets(n_buckets=4)
-    assert "red" in buckets
-    for b, chunk_start in enumerate(range(0, 12, bucket_size)):
-        chunk = full[chunk_start:chunk_start + bucket_size]
-        expected = "red" if "red" in chunk else ("yellow" if "yellow" in chunk else "green")
-        assert buckets[b] == expected
+def test_labeler_flags_outlier_click() -> None:
+    interframe, _poses, clicks = _pan_session(9)
+    clicks = [c if not (c.frame == 4 and c.kp_idx == 6)
+              else Click(c.frame, c.kp_idx, c.x + 0.25, c.y) for c in clicks]
+    st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080), window=360)
+    st.add_clicks(clicks)
+    assert st._outliers.get(4) == [6]   # the mislabel flagged session-level

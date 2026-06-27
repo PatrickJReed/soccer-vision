@@ -88,6 +88,32 @@ def test_export_skips_non_green_and_blocks_until_idle(tmp_path: Path) -> None:
         st.stop_worker()
 
 
+def test_two_ended_session_is_green_and_reprojects_clicked_landmark() -> None:
+    # A two-ended clicked session over an identity chain: own-end clicks at frame 0 +
+    # opp-end clicks at frame 5 constrain the ONE global homography across the whole
+    # field -> green frames, and the bundle H reprojects a clicked landmark back onto its
+    # canonical pitch coords within a small pitch error (in-sample, so ~exact).
+    h = np.array([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]])  # pitch -> img_norm
+    st = LabelerState(_identity_chain(10), 10, size=SIZE)
+    try:
+        own = _clicks_for(0, OWN_END_IDX, h)
+        opp = _clicks_for(5, OPP_END_IDX, h)
+        for f, kp, x, y in own + opp:
+            st.add_click(f, kp, x, y)
+        st.wait_idle(timeout=10)
+        assert st._status_of(0) == "green"  # two-ended segment + plausible fold -> green
+        cf = st.frame_homography(0)
+        assert cf is not None and cf.two_ended
+        # the bundle H (normalized image -> pitch) maps a clicked own-end landmark back
+        # onto its canonical pitch coords
+        _f, kp, x, y = own[0]
+        v = cf.H @ np.array([x, y, 1.0])
+        pitch = v[:2] / v[2]
+        assert float(np.linalg.norm(pitch - PITCH_LANDMARKS[kp])) < 1e-3
+    finally:
+        st.stop_worker()
+
+
 def _look_at(
     eye: Any,
     target: Any,
@@ -264,22 +290,36 @@ def test_pending_drains_to_zero() -> None:
 
 def test_concurrent_edits_during_refit_are_safe() -> None:
     # Hammer the mutators from the main thread WITHOUT wait_idle between them, so the
-    # background worker is mid-compute (iterating the clicks snapshot) while clicks are
-    # appended / replaced / popped. With the snapshot copied and the mutations locked
-    # this must not raise (RuntimeError: list changed size during iteration) or corrupt
-    # the _seq/_fits invariants. Without the fix it trips intermittently.
-    interframe, _poses, clicks = _pan_session(40)
+    # background worker is mid-compute (it copies the clicks under the lock, then runs the
+    # field-anchored bundle solve OFF the lock) while clicks are appended / replaced /
+    # popped. With the snapshot copied and the mutations locked this must not raise
+    # (RuntimeError: list changed size during iteration) or corrupt the _seq/_fits
+    # invariants. The hammered clicks are REAL projected landmarks on a handful of frames
+    # so each bundle solve converges fast: garbage clicks force the least_squares to
+    # max_nfev (~10 s per solve), and the lock/snapshot safety this exercises is
+    # independent of the clicks' accuracy. (The off-lock bundle solve is ~tens of ms vs
+    # the old microsecond DLT, so the concurrent-mutation race window is now WIDER.)
+    interframe, poses, clicks = _pan_session(40)
+    fp = field_points_3d()
+    real: dict[tuple[int, int], tuple[float, float]] = {}  # (frame, kp) -> norm click
+    for f in range(6):
+        px = cv2.projectPoints(fp, poses[f][0], poses[f][1], _K, np.zeros(5))[0].reshape(-1, 2)
+        for j in range(21):
+            if j != 5 and 0 < px[j, 0] < 1920 and 0 < px[j, 1] < 1080:
+                real[(f, j)] = (float(px[j, 0]) / 1920, float(px[j, 1]) / 1080)
+    keys = sorted(real)
     st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080), window=360)
     try:
         st.add_clicks(clicks)  # bootstrap -> calibrated, worker live
         for r in range(200):
-            f = r % 40
-            st.add_click(f, r % 6, 0.30 + 0.001 * (r % 100), 0.40)
+            f, kp = keys[r % len(keys)]
+            x, y = real[(f, kp)]
+            st.add_click(f, kp, x, y)
             if r % 3 == 0:
-                st.nudge_click(f, r % 6, 0.50, 0.50)
+                st.nudge_click(f, kp, x, y)
             if r % 7 == 0:
                 st.remove_last()
-        st.wait_idle(timeout=20)
+        st.wait_idle(timeout=30)
         # invariants hold once everything settles
         assert st.pending() == 0
         assert len(st._seq) == len(st.clicks) + len(st.line_clicks)

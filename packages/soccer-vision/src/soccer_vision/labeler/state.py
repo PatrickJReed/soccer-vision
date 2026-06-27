@@ -21,9 +21,10 @@ from soccer_vision.labeler.chain import denormalize_homography
 from soccer_vision.labeler.refit_worker import RefitWorker
 from soccer_vision.pipeline import homographies_to_parquet
 from soccer_vision.pitch.global_calib import (
+    BundleCalib,
     fold_of_norm,
     frame_status,
-    solve_global,
+    solve_bundle,
     two_ended_segments,
 )
 from soccer_vision.pitch.manual_anchor import (
@@ -42,7 +43,7 @@ class CalibFrame:
     """A calibrated per-frame result in the labeler's normalized space."""
 
     H: NDArray[np.float64]  # NORMALIZED image -> pitch[0,1] (frontend overlay)
-    residual: float         # in-sample global-fit RMS (norm px) — diagnostic only
+    residual: float         # in-sample bundle-fit reproj RMS (pitch units) — diagnostic only
     n_points: int           # clicks in this frame's segment
     fold_count: int
     two_ended: bool         # the segment saw both field ends (drives green vs yellow)
@@ -104,14 +105,12 @@ class LabelerState:
         return [c for c in self.clicks if c.kp_idx not in self._outliers.get(c.frame, [])]
 
     def _try_bootstrap(self) -> bool:
-        """Calibrated once any segment has >= 4 clicks (a homography is fittable).
-        No focal/K: the global model is a plain image->pitch homography."""
+        """Calibrated once the field-anchored bundle solves >= 1 segment (a segment with
+        >= 4 pooled clicks). No focal/K: the model is a plain image->pitch homography."""
         if self._calibrated:
             return True
-        with self._lock:
-            clicks = list(self._active_clicks())
-        gc = solve_global(clicks, self._transforms, self._segment_of, self.size)
-        if not gc.h_by_segment:
+        bundle, _two_ended = self._solve()
+        if not bundle.h_by_segment:
             return False
         with self._lock:
             self._calibrated = True
@@ -124,48 +123,54 @@ class LabelerState:
             window=self.line_band, frames=frames)
         return {f: [(lid, x * w, y * h) for (lid, x, y) in lst] for f, lst in prop.items()}
 
-    def _compute_poses(self, frames: Sequence[int]) -> dict[int, CalibFrame]:
-        """Solve the global homography (per segment) from ALL clicks, then emit a
-        CalibFrame for each requested frame. Snapshots inputs under the lock and solves
-        off the lock. The global solve is cheap (one DLT per segment), so recomputing it
-        per chunk is acceptable."""
+    def _solve(self) -> tuple[BundleCalib, set[int]]:
+        """Run the field-anchored bundle solve ONCE over a stable snapshot of the active
+        clicks. Snapshots (force-copies) under the lock, then runs solve_bundle (a single
+        scipy least_squares over ALL clicks) + two-ended detection OFF the lock. Callers
+        must solve once per recompute and reuse the result — NEVER per chunk (the bundle
+        solve is expensive). solve_bundle handles the empty case (no/too-few clicks) by
+        returning an empty BundleCalib, so frame_homography is None for every frame."""
         with self._lock:
-            if not self._calibrated:
-                return {}
             clicks = list(self._active_clicks())  # stable COPY for the lock-free solve
-        gc = solve_global(clicks, self._transforms, self._segment_of, self.size)
+        bundle = solve_bundle(clicks, self._transforms, self._segment_of, self.size)
         two_ended = two_ended_segments(clicks, self._segment_of)
-        out: dict[int, CalibFrame] = {}
-        for f in frames:
-            h_norm = gc.frame_homography(f)
-            if h_norm is None:
-                continue
-            seg = self._segment_of.get(f)
-            out[f] = CalibFrame(
-                H=h_norm,
-                residual=gc.rms_by_segment.get(seg, float("nan"))
-                if seg is not None else float("nan"),
-                n_points=gc.n_by_segment.get(seg, 0) if seg is not None else 0,
-                fold_count=fold_of_norm(h_norm, self.size),
-                two_ended=(seg in two_ended),
-            )
-        return out
+        return bundle, two_ended
+
+    def _build_frame(
+        self, bundle: BundleCalib, two_ended: set[int], f: int
+    ) -> CalibFrame | None:
+        """Build one frame's CalibFrame from an already-solved bundle (cheap: just the
+        affine-interpolated per-frame homography). None if the frame has no homography
+        (its segment was not calibrated / it has no chain transform)."""
+        h = bundle.frame_homography(f)
+        if h is None:
+            return None
+        seg = self._segment_of.get(f)
+        return CalibFrame(
+            H=h,
+            residual=bundle.rms_by_segment.get(seg, float("nan"))
+            if seg is not None else float("nan"),
+            n_points=bundle.n_by_segment.get(seg, 0) if seg is not None else 0,
+            fold_count=fold_of_norm(h, self.size),
+            two_ended=(seg in two_ended),
+        )
 
     def _compute_dirty(
         self, frames: Sequence[int], is_cancelled: Callable[[], bool]
     ) -> dict[int, CalibFrame | None] | None:
-        """Compute `frames` in chunks (checking cancellation between chunks). Returns a
-        map over EVERY requested frame -> CalibFrame-or-None (None = no longer solvable,
+        """Solve the field-anchored bundle ONCE, then build each requested frame's
+        CalibFrame (cheap). Chunks ONLY to check cancellation between chunks — the solve
+        itself is a single least_squares over all clicks, never re-run per chunk. Returns
+        a map over EVERY requested frame -> CalibFrame-or-None (None = no longer solvable,
         so the applier pops any stale fit). None return = the whole pass was cancelled."""
+        bundle, two_ended = self._solve()
         out: dict[int, CalibFrame | None] = {}
         ordered = list(frames)
         for i in range(0, len(ordered), self._refit_chunk):
             if is_cancelled():
                 return None
-            chunk = ordered[i:i + self._refit_chunk]
-            solved = self._compute_poses(chunk)
-            for f in chunk:
-                out[f] = solved.get(f)
+            for f in ordered[i:i + self._refit_chunk]:
+                out[f] = self._build_frame(bundle, two_ended, f)
         return out
 
     def _apply_fits(self, results: dict[int, CalibFrame | None]) -> None:

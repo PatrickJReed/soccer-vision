@@ -194,6 +194,8 @@ class BundleCalib:
     a_params_by_segment: dict[int, dict[int, NDArray[np.float64]]]  # seg -> {clicked frame -> 6 params}
     segment_of: dict[int, int]
     transforms: dict[int, NDArray[np.float64]]                      # frame -> M[frame] (frame -> ref)
+    rms_by_segment: dict[int, float]                               # diagnostic: in-sample reproj RMS (pitch units)
+    n_by_segment: dict[int, int]                                   # clicks used per segment
 
     def frame_homography(self, frame: int) -> NDArray[np.float64] | None:
         """Normalized image_frame -> pitch[0,1] homography H_g @ A_interp @ M[frame], or
@@ -299,16 +301,30 @@ def solve_bundle(
 
     h_by_seg: dict[int, NDArray[np.float64]] = {}
     a_by_seg: dict[int, dict[int, NDArray[np.float64]]] = {}
+    rms_by_seg: dict[int, float] = {}
+    n_by_seg: dict[int, int] = {}
     for seg, seg_clicks in by_seg.items():
         if len(seg_clicks) < min_points:
             continue
         solved = _solve_segment(seg_clicks, transforms, lam)
         if solved is None:
             continue
-        h_by_seg[seg], a_by_seg[seg] = solved
+        hg, a_params = solved
+        h_by_seg[seg], a_by_seg[seg] = hg, a_params
+        # In-sample reprojection RMS (pitch units) over the segment's clicks: predict
+        # each click through H_g @ A @ M[frame] (A interpolated, exact at clicked frames).
+        errs: list[NDArray[np.float64]] = []
+        for c in seg_clicks:
+            a = _affine_from(_interp_affine_params(a_params, c.frame))
+            hf = hg @ a @ np.asarray(transforms[c.frame], dtype=np.float64)
+            q = hf @ np.array([c.x, c.y, 1.0])
+            errs.append((q[:2] / q[2]) - PITCH_LANDMARKS[c.kp_idx])
+        rms_by_seg[seg] = float(np.sqrt(np.mean(np.sum(np.asarray(errs) ** 2, axis=1))))
+        n_by_seg[seg] = len(seg_clicks)
 
     transforms_f64 = {f: np.asarray(m, dtype=np.float64) for f, m in transforms.items()}
-    return BundleCalib(h_by_seg, a_by_seg, dict(segment_of), transforms_f64)
+    return BundleCalib(
+        h_by_seg, a_by_seg, dict(segment_of), transforms_f64, rms_by_seg, n_by_seg)
 
 
 def two_ended_segments(

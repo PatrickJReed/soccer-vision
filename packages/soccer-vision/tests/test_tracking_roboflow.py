@@ -348,3 +348,26 @@ def test_run_pipeline_core_with_canned_models(
     assert list(kp0["x_px"]) == [10.0, 30.0, 50.0]
     assert list(kp0["y_px"]) == [20.0, 40.0, 60.0]
     assert kp0.iloc[0]["conf"] == 0.9
+
+
+def test_tracker_kwargs_default_is_empty(
+    monkeypatch: pytest.MonkeyPatch, tiny_video: Path
+) -> None:
+    _df, _kp, handle, _b = _run_canned(monkeypatch, tiny_video)
+    assert handle.bytetrack_kwargs == {}  # default: today's bare sv.ByteTrack()
+
+
+def test_tracker_kwargs_forwarded_to_bytetrack(
+    monkeypatch: pytest.MonkeyPatch, tiny_video: Path
+) -> None:
+    handle = _install_canned(monkeypatch)
+    backend = RoboflowBackend(
+        device="cpu", detect_pitch=True,
+        tracker_kwargs={"track_activation_threshold": 0.3, "lost_track_buffer": 60},
+    )
+    monkeypatch.setattr(
+        backend, "_download_weights",
+        lambda: {"player": Path("PLAYER.pt"), "ball": Path("BALL.pt"), "pitch": Path("PITCH.pt")},
+    )
+    backend._run_pipeline(tiny_video, emit_keypoints=True)
+    assert handle.bytetrack_kwargs == {"track_activation_threshold": 0.3, "lost_track_buffer": 60}

@@ -275,6 +275,12 @@ class RoboflowBackend:
         When True, download and load the pitch keypoint detection model.
         Required to call process_with_pitch(). Defaults to False to avoid
         downloading the extra weights file unless pitch detection is needed.
+    tracker_kwargs:
+        Extra keyword args forwarded to supervision's ByteTrack constructor.
+        Intentionally empty by default (today's behaviour) and NOT tuned: there is
+        no per-session tracking ground truth to tune against, and track stability
+        is provided downstream by hygiene.stitch_tracks (the 867->400-track result),
+        which the grounded analyze_video path now chains in.
 
     Notes
     -----
@@ -302,6 +308,7 @@ class RoboflowBackend:
         ball_max_gap_frames: int = 15,
         pitch_weights_path: Path | None = None,
         detect_pitch: bool = False,
+        tracker_kwargs: dict[str, object] | None = None,
     ) -> None:
         self._device_override = device
         self._weights_dir = Path(weights_cache_dir) if weights_cache_dir else DEFAULT_CACHE_DIR
@@ -315,6 +322,7 @@ class RoboflowBackend:
             raise FileNotFoundError(f"pitch_weights_path does not exist: {pitch_weights_path}")
         self.pitch_weights_path: Path | None = pitch_weights_path
         self.detect_pitch: bool = detect_pitch
+        self.tracker_kwargs: dict[str, object] = dict(tracker_kwargs or {})
 
     # ------------------------------------------------------------------
     # Weight download helper (lazy gdown import)
@@ -467,7 +475,9 @@ class RoboflowBackend:
             team_classifier.fit(crops)
 
         # ---- Pass 2: full detection, tracking, team prediction --------
-        tracker = sv.ByteTrack()
+        # ByteTrack defaults are intentionally untuned; track stability comes from
+        # downstream hygiene.stitch_tracks. tracker_kwargs defers any tuning to data.
+        tracker = sv.ByteTrack(**self.tracker_kwargs)
         rows: list[dict[str, float | int | str]] = []
         kp_records: list[dict[str, float | int]] = []
         # Per-track player/GK crops (area, crop); classified in one batch after the pass.

@@ -238,11 +238,12 @@ class LabelerState:
         self._autosave()
 
     def add_clicks(self, clicks: Sequence[Click]) -> None:
-        # Bulk boot/resume path: called single-threaded before the server accepts
-        # requests, and finishes with a synchronous _recompute_all (no live worker
-        # pass concurrently iterating the lists), so the unlocked extend is safe.
-        self.clicks.extend(clicks)
-        self._seq.extend("pt" for _ in clicks)
+        # Bulk boot/resume path. Lock the extend so it is atomic vs the worker reading
+        # self.clicks / self._seq, making this unconditionally safe (not just under the
+        # boot-ordering invariant). _recompute_all still runs after.
+        with self._lock:
+            self.clicks.extend(clicks)
+            self._seq.extend("pt" for _ in clicks)
         self._try_bootstrap()
         self._recompute_all()
         self._autosave()
@@ -256,9 +257,10 @@ class LabelerState:
         self._autosave()
 
     def add_line_clicks(self, line_clicks: Sequence[LineClick]) -> None:
-        # Bulk boot/resume path (see add_clicks): single-threaded, synchronous.
-        self.line_clicks.extend(line_clicks)
-        self._seq.extend("ln" for _ in line_clicks)
+        # Bulk boot/resume path (see add_clicks): lock the extend vs the worker.
+        with self._lock:
+            self.line_clicks.extend(line_clicks)
+            self._seq.extend("ln" for _ in line_clicks)
         self._recompute_all()
         self._autosave()
 

@@ -362,6 +362,23 @@ def test_clean_session_fits_two_ended_with_tight_residual() -> None:
         st.stop_worker()
 
 
+def test_bulk_add_clicks_keeps_lists_in_lockstep_with_worker_live() -> None:
+    """add_clicks after the worker is live must keep clicks/_seq consistent (the extend is
+    locked vs the worker reading the lists), not rely on boot-ordering. (Plan predates SP1's
+    removal of the `window` param, so it is omitted here.)"""
+    interframe, _poses, clicks = _pan_session(40)
+    st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080))
+    try:
+        st.add_clicks(clicks)                 # bootstrap -> calibrated, worker live
+        before = len(st.clicks)
+        st.add_clicks(clicks)                 # bulk add again while the worker is running
+        st.wait_idle(timeout=10)
+        assert len(st.clicks) == before + len(clicks)
+        assert len(st._seq) == len(st.clicks) + len(st.line_clicks)
+    finally:
+        st.stop_worker()
+
+
 def test_status_summary_makes_one_status_pass() -> None:
     # SP1 removed the `window` constructor param (global bundle, not windowed propagation),
     # so this constructs LabelerState without it (the plan predates SP1).

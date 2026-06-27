@@ -58,26 +58,17 @@ class LabelerState:
         n_frames: int,
         *,
         size: tuple[int, int],
-        window: int = 360,
         line_band: int = 60,
-        seed_size: int = 6,
-        gate_px: float = 60.0,
-        gap_dist: int = 180,
-        # green threshold on the per-frame reprojection RMS (px). Measured on the
-        # window-PROPAGATED clicks, so chain drift inflates it well above the true
-        # ~7 ft pose accuracy; ~60 px ≈ "close to an anchor / trustworthy" vs
-        # "re-anchor here" (62% green on the full game). Tunable per session.
+        # green threshold on the per-frame reprojection RMS (px). The field-anchored
+        # bundle fits one homography per segment, so this is a soft confidence penalty
+        # (the export gate is whole-field GREEN), not the gate itself. Tunable per session.
         residual_px_threshold: float = 60.0,
         outlier_px: float = 40.0,
         autosave_path: Path | None = None,
     ) -> None:
         self.n_frames = n_frames
         self.size = size
-        self.window = window
         self.line_band = line_band
-        self.seed_size = seed_size
-        self.gate_px = gate_px
-        self.gap_dist = gap_dist
         self._lock = threading.RLock()
         self._refit_chunk = 256
         self.residual_px_threshold = residual_px_threshold

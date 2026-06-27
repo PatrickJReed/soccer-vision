@@ -59,7 +59,7 @@ def _calib_session(n: int = 9) -> tuple[dict[int, np.ndarray], list[Click]]:
 
 def _serve() -> tuple[HTTPServer, LabelerState]:
     interframe = {i: np.eye(3) for i in range(5)}
-    state = LabelerState(interframe=interframe, n_frames=6, size=(1920, 1080), window=10)
+    state = LabelerState(interframe=interframe, n_frames=6, size=(1920, 1080))
 
     def frame_jpeg(idx: int) -> bytes:
         return b"\xff\xd8stub-jpeg"
@@ -73,7 +73,7 @@ def _serve() -> tuple[HTTPServer, LabelerState]:
 def _serve_calib() -> tuple[HTTPServer, LabelerState]:
     """Serve a session with calibratable interframe transforms."""
     interframe, _clicks = _calib_session(9)
-    state = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080), window=360)
+    state = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080))
 
     def frame_jpeg(idx: int) -> bytes:
         return b"\xff\xd8stub-jpeg"
@@ -202,7 +202,7 @@ def test_make_handler_accepts_line_names_and_state_exposes_line_clicks() -> None
     from soccer_vision.labeler.state import LabelerState
     # self-contained: an empty chain is fine — add_line_click on an uncalibrated state
     # just stores the click (no refit), which is what we assert.
-    st = LabelerState(interframe={}, n_frames=5, size=(1920, 1080), window=360)
+    st = LabelerState(interframe={}, n_frames=5, size=(1920, 1080))
     st.add_line_click(2, "midline", 0.5, 0.5)
     assert st.line_clicks[0].line_id == "midline"
     handler_cls = make_handler(st, lambda i: b"", [f"kp{i}" for i in range(21)],

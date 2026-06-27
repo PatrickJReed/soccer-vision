@@ -3,7 +3,6 @@ from __future__ import annotations
 import numpy as np
 from soccer_vision.eval.pitch_metrics import displacement_to_feet
 from soccer_vision.pitch.global_calib import (
-    OPP_END_IDX,
     OWN_END_IDX,
     BundleCalib,
     GlobalCalib,
@@ -241,7 +240,7 @@ def _end_medians(
     get_h: object, clicks: list[Click]
 ) -> tuple[float, float, float]:
     """In-sample own / opp / overall median feet error using a frame->H callable."""
-    own, opp = set(OWN_END_IDX), set(OPP_END_IDX)
+    own = set(OWN_END_IDX)
     own_ft: list[float] = []
     opp_ft: list[float] = []
     for c in clicks:

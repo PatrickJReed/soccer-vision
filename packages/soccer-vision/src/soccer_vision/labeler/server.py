@@ -148,7 +148,6 @@ def run(
     port: int = 8000,
     downscale_display: float = 0.5,
     export_dir: Path | None = None,
-    window: int = 360,
     resume: Path | None = None,
     workers: int | None = None,
 ) -> None:  # pragma: no cover - launches a blocking server
@@ -174,7 +173,7 @@ def run(
     cache_dir = Path(video_path).parent / ".sv_labeler_cache"
     sidecar = cache_dir / f"{Path(video_path).stem}.clicks.json"
     state = LabelerState(
-        interframe=interframe, n_frames=n_frames, size=size, window=window,
+        interframe=interframe, n_frames=n_frames, size=size,
         autosave_path=sidecar,
     )
     if resume is not None:

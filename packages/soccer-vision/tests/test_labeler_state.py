@@ -157,7 +157,7 @@ def test_labeler_bootstraps_and_covers_all_segment_frames() -> None:
     # coverage needs a planar-crop session; the synthetic rotation pan is fold-
     # incompatible, so green is exercised by the identity-chain test above.)
     interframe, _poses, clicks = _pan_session(9)
-    st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080), window=360)
+    st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080))
     st.add_clicks(clicks)
     assert st._calibrated
     assert all(st.frame_homography(f) is not None for f in range(9))
@@ -169,7 +169,7 @@ def test_labeler_uncalibrated_below_min_points() -> None:
     # Calibration now needs only >= 4 pooled clicks (a fittable homography), not the
     # old >= 3 anchor frames; below that there is no homography.
     interframe, _poses, clicks = _pan_session(9)
-    st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080), window=360)
+    st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080))
     st.add_clicks(clicks[:3])  # fewer than 4 points -> nothing fittable
     assert not st._calibrated
     assert st.frame_homography(2) is None  # no global H yet
@@ -181,7 +181,7 @@ def test_labeler_does_not_autoflag_outliers_in_live_path() -> None:
     interframe, _poses, clicks = _pan_session(9)
     clicks = [c if not (c.frame == 4 and c.kp_idx == 6)
               else Click(c.frame, c.kp_idx, c.x + 0.25, c.y) for c in clicks]
-    st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080), window=360)
+    st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080))
     st.add_clicks(clicks)
     assert st._calibrated        # still solves a global homography despite the mislabel
     assert st._outliers == {}    # no live outlier flagging (RANSAC path, not K-based)
@@ -191,7 +191,7 @@ def test_labeler_add_line_click_refits_and_persists(tmp_path: Path) -> None:
     interframe, _poses, clicks = _pan_session(9)
     sidecar = tmp_path / "s.json"
     st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080),
-                      window=360, autosave_path=sidecar)
+                      autosave_path=sidecar)
     st.add_clicks(clicks)                     # bootstrap on points
     _cf_before = st.frame_homography(4)
     st.add_line_click(4, "midline", 0.5, 0.5)
@@ -207,7 +207,7 @@ def test_labeler_add_line_click_refits_and_persists(tmp_path: Path) -> None:
 
 def test_labeler_remove_last_pops_line_then_point() -> None:
     interframe, _poses, clicks = _pan_session(9)
-    st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080), window=360)
+    st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080))
     st.add_clicks(clicks)
     st.add_line_click(4, "near_touchline", 0.1, 0.9)
     n_pts = len(st.clicks)
@@ -219,7 +219,7 @@ def test_labeler_remove_last_pops_line_then_point() -> None:
 
 def test_labeler_export_writes_line_clicks_parquet(tmp_path: Path) -> None:
     interframe, _poses, clicks = _pan_session(9)
-    st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080), window=360)
+    st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080))
     st.add_clicks(clicks)
     st.add_line_click(4, "midline", 0.5, 0.5)
     st.export(tmp_path)
@@ -233,7 +233,7 @@ def test_labeler_export_writes_line_clicks_parquet(tmp_path: Path) -> None:
 def test_line_obs_scoped_to_line_band() -> None:
     interframe, _poses, clicks = _pan_session(9)
     st = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080),
-                      window=360, line_band=1)   # band of +/-1 frame
+                      line_band=1)   # band of +/-1 frame
     st.add_clicks(clicks)
     st.line_clicks.append(LineClick(frame=4, line_id="midline", x=0.5, y=0.5))
     # _line_obs over all frames: only frames within +/-1 of frame 4 carry the line obs
@@ -244,7 +244,7 @@ def test_line_obs_scoped_to_line_band() -> None:
 
 def test_add_click_fits_current_frame_synchronously() -> None:
     interframe, _poses, clicks = _pan_session(40)
-    st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080), window=360)
+    st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080))
     try:
         # bootstrap on all but the last click, synchronously (bulk)
         st.add_clicks(clicks[:-1])
@@ -259,7 +259,7 @@ def test_add_click_fits_current_frame_synchronously() -> None:
 def test_async_refit_matches_synchronous_full_recompute() -> None:
     interframe, _poses, clicks = _pan_session(40)
     st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080),
-                      window=360, line_band=60)
+                      line_band=60)
     try:
         for c in clicks:
             st.add_click(c.frame, c.kp_idx, c.x, c.y)
@@ -278,7 +278,7 @@ def test_async_refit_matches_synchronous_full_recompute() -> None:
 
 def test_pending_drains_to_zero() -> None:
     interframe, _poses, clicks = _pan_session(40)
-    st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080), window=360)
+    st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080))
     try:
         for c in clicks:
             st.add_click(c.frame, c.kp_idx, c.x, c.y)
@@ -308,7 +308,7 @@ def test_concurrent_edits_during_refit_are_safe() -> None:
             if j != 5 and 0 < px[j, 0] < 1920 and 0 < px[j, 1] < 1080:
                 real[(f, j)] = (float(px[j, 0]) / 1920, float(px[j, 1]) / 1080)
     keys = sorted(real)
-    st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080), window=360)
+    st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080))
     try:
         st.add_clicks(clicks)  # bootstrap -> calibrated, worker live
         for r in range(200):
@@ -329,16 +329,14 @@ def test_concurrent_edits_during_refit_are_safe() -> None:
         st.stop_worker()
 
 
-def test_state_legacy_params_wired_and_clean_session_fits() -> None:
+def test_clean_session_fits_two_ended_with_tight_residual() -> None:
     interframe, _poses, clicks = _pan_session(40)
-    st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080), window=360)
+    st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080))
     try:
-        # legacy gated-engine knobs are accepted-but-unused; still exposed as attributes
-        assert (st.seed_size, st.gate_px, st.gap_dist) == (6, 60.0, 180)
         st.add_clicks(clicks)
         st.wait_idle(timeout=10)
         # clean pan: clicked frames are covered, span both ends, with a tight in-sample
-        # global-fit residual (normalized px, not the old pixel scale).
+        # bundle-fit reprojection residual (pitch units).
         for c in sorted({cl.frame for cl in clicks})[:3]:
             cf = st.frame_homography(c)
             assert cf is not None and cf.two_ended
@@ -347,23 +345,15 @@ def test_state_legacy_params_wired_and_clean_session_fits() -> None:
         st.stop_worker()
 
 
-def test_global_model_covers_whole_segment_regardless_of_gap_dist() -> None:
-    # gap_dist is a legacy accepted-but-unused knob: the global homography covers EVERY
-    # frame in the segment, so a tight gap_dist no longer reds far frames (no windowing).
+def test_global_model_covers_whole_segment() -> None:
+    # The field-anchored bundle fits one homography per segment, so EVERY frame in the
+    # segment (clicked or not) gets an overlay — there is no per-frame windowing gap.
     interframe, _poses, clicks = _pan_session(40)
-    wide = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080),
-                        window=360, gap_dist=180)
-    tight = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080),
-                         window=360, gap_dist=3)
+    st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080))
     try:
-        wide.add_clicks(clicks)
-        wide.wait_idle(timeout=10)
-        tight.add_clicks(clicks)
-        tight.wait_idle(timeout=10)
-        covered_wide = {f for f in range(40) if wide.frame_homography(f) is not None}
-        covered_tight = {f for f in range(40) if tight.frame_homography(f) is not None}
-        # the whole (single) segment is covered either way — gap_dist is inert now
-        assert covered_tight == covered_wide == set(range(40))
+        st.add_clicks(clicks)
+        st.wait_idle(timeout=10)
+        covered = {f for f in range(40) if st.frame_homography(f) is not None}
+        assert covered == set(range(40))  # whole (single) segment covered
     finally:
-        wide.stop_worker()
-        tight.stop_worker()
+        st.stop_worker()

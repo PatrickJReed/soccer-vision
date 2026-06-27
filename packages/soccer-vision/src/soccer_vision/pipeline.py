@@ -92,6 +92,12 @@ def assemble_phases(
     When `homographies` (a precomputed {frame: HomographyEntry} from the propagation
     stage) is given, it is used directly; otherwise homographies are computed from
     keypoints (landmark anchors + carry-forward smoothing) exactly as before.
+
+    In the keypoint branch only landmark-anchor frames are provenance-bearing; a
+    carry-forward (smoothed) frame is still mapped to pitch coords but recorded with
+    homography_source="none" (it is intentionally excluded from anchor coverage). So
+    downstream code must NOT treat homography_source=="none" as "no pitch coords" —
+    check x_pitch/y_pitch for NaN instead.
     """
     if homographies is not None:
         h_entries = homographies
@@ -210,17 +216,48 @@ def assemble_from_parquet(
     out_dir: Path,
     *,
     fps: float | None = None,
+    homographies_path: Path | None = None,
     **assemble_opts: object,
 ) -> PipelineResult:
     """Re-run the pure assembly stage from a Stage-1 checkpoint and write deliverables.
 
-    This is the cheap-recompute path: tweak thresholds without re-running GPU tracking.
+    Cheap-recompute path: tweak assemble thresholds without re-running GPU tracking. To
+    reproduce the PRODUCTION deliverable it must replay the same homographies
+    analyze_video wrote (homographies.parquet), not re-derive them from raw keypoints:
+
+      * If a homographies.parquet is found (explicit ``homographies_path``, else a
+        sibling of ``trajectories_px_path``), it is read and replayed verbatim — this
+        branch is identical to ``assemble_from_homographies`` and reproduces production.
+      * If none is found, it falls back to recomputing homographies from the raw
+        keypoint anchors (``build_frame_homographies`` + carry-forward smoothing) and
+        logs a warning. That fallback is a DIFFERENT homography source than production
+        (raw detected anchors, no propagation / no manual labeler), so its coverage and
+        pitch coords will not match the deliverable.
     """
     trajectories_px = pd.read_parquet(trajectories_px_path)
     keypoints = pd.read_parquet(keypoints_path)
     resolved_fps, total_frames = _resolve_fps_and_frames(trajectories_px, fps)
+
+    hom_path = homographies_path
+    if hom_path is None:
+        sibling = Path(trajectories_px_path).parent / "homographies.parquet"
+        if sibling.exists():
+            hom_path = sibling
+
+    homographies: dict[int, HomographyEntry] | None = None
+    if hom_path is not None and Path(hom_path).exists():
+        homographies = homographies_from_parquet(Path(hom_path))
+    else:
+        logger.warning(
+            "homographies.parquet not found alongside %s; recomputing from raw keypoint "
+            "anchors — this is NOT the production homography source (use "
+            "assemble_from_homographies to replay the deliverable).",
+            trajectories_px_path,
+        )
+
     result = assemble_phases(
-        trajectories_px, keypoints, fps=resolved_fps, total_frames=total_frames, **assemble_opts  # type: ignore[arg-type]
+        trajectories_px, keypoints, fps=resolved_fps, total_frames=total_frames,
+        homographies=homographies, **assemble_opts,  # type: ignore[arg-type]
     )
     _write_deliverables(result, Path(out_dir))
     return result

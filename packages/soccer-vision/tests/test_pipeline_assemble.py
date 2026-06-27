@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import cast
 
 import pandas as pd
+import pytest
 from soccer_vision.pipeline import PipelineResult, assemble_phases
 from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 
@@ -189,6 +190,60 @@ def test_assemble_phases_legacy_path_marks_anchors() -> None:
     assert result.anchor_coverage == 1.0   # all 3 frames are landmark anchors in the fixture
 
 
+def test_assemble_from_parquet_reads_sibling_homographies(tmp_path: Path) -> None:
+    import numpy as np
+
+    from soccer_vision.pipeline import (
+        assemble_from_homographies,
+        assemble_from_parquet,
+        homographies_to_parquet,
+    )
+    from soccer_vision.pitch.propagation import HomographyEntry
+
+    traj = _scene()
+    kp = _identity_keypoints(3)
+    traj_path = tmp_path / "trajectories_px.parquet"
+    kp_path = tmp_path / "keypoints.parquet"
+    traj.to_parquet(traj_path, index=False)
+    kp.to_parquet(kp_path, index=False)
+    # source="manual" distinguishes the parquet path from the keypoint branch ("anchor").
+    homs = {f: HomographyEntry(np.eye(3), "manual", 1.0) for f in range(3)}
+    hom_path = tmp_path / "homographies.parquet"
+    homographies_to_parquet(homs, hom_path)
+
+    result = assemble_from_parquet(traj_path, kp_path, tmp_path / "out_pq")
+
+    ph = result.phases.set_index("frame")
+    # provenance is "manual" (read from parquet), NOT "anchor" (keypoint branch).
+    assert set(ph["homography_source"]) == {"manual"}
+
+    # and it matches assemble_from_homographies on the same parquet, frame-for-frame.
+    result2 = assemble_from_homographies(traj_path, hom_path, tmp_path / "out_hom")
+    pd.testing.assert_frame_equal(result.phases, result2.phases)
+
+
+def test_assemble_from_parquet_falls_back_without_sibling(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    from soccer_vision.pipeline import assemble_from_parquet
+
+    traj = _scene()
+    kp = _identity_keypoints(3)
+    traj_path = tmp_path / "trajectories_px.parquet"
+    kp_path = tmp_path / "keypoints.parquet"
+    traj.to_parquet(traj_path, index=False)
+    kp.to_parquet(kp_path, index=False)
+
+    with caplog.at_level(logging.WARNING):
+        result = assemble_from_parquet(traj_path, kp_path, tmp_path / "out")
+
+    ph = result.phases.set_index("frame")
+    assert set(ph["homography_source"]) <= {"anchor", "none"}  # keypoint-branch fallback
+    assert any("homographies.parquet not found" in r.message for r in caplog.records)
+
+
 def test_highest_conf_ball_pick_is_atomic() -> None:
     import numpy as np
 
@@ -203,7 +258,7 @@ def test_highest_conf_ball_pick_is_atomic() -> None:
     ])
     out = _highest_conf_ball_per_frame(ball)
     assert out.loc[0, "x_pitch"] == 0.50
-    assert np.isnan(out.loc[0, "y_pitch"])
+    assert np.isnan(float(cast(float, out.loc[0, "y_pitch"])))
 
 
 def test_highest_conf_ball_pick_normal_case() -> None:

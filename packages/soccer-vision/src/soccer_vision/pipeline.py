@@ -53,6 +53,26 @@ class PipelineResult:
     propagated_coverage: float   # fraction filled by propagation
 
 
+def _highest_conf_ball_per_frame(ball: pd.DataFrame) -> pd.DataFrame:
+    """Pick the single highest-confidence ball detection per frame, ATOMICALLY.
+
+    Returns a frame-indexed DataFrame whose x_pitch/y_pitch come together from the one
+    highest-conf row per frame. groupby().last() on the columns skips NaN per column
+    independently, so a high-conf row with x_pitch valid but y_pitch NaN could borrow
+    y_pitch from a different, lower-conf row (a "Frankenstein" ball). idxmax on conf
+    selects whole rows, so x and y always come from the same detection. Behaviour is
+    identical under the filter_outside_pitch invariant (no row has exactly one of x/y
+    NaN by this point); this only fixes the degenerate case that invariant hides.
+    """
+    if ball.empty:
+        return pd.DataFrame(
+            {"x_pitch": pd.Series(dtype="float64"), "y_pitch": pd.Series(dtype="float64")},
+            index=pd.Index([], dtype="int64", name="frame"),
+        )
+    idx = ball.groupby("frame")["conf"].idxmax()
+    return ball.loc[idx, ["frame", "x_pitch", "y_pitch"]].set_index("frame")
+
+
 def assemble_phases(
     trajectories_px: pd.DataFrame,
     keypoints: pd.DataFrame,
@@ -98,7 +118,7 @@ def assemble_phases(
 
     # Highest-confidence ball per frame (multiple low-conf detections are possible at conf=0.05).
     ball = enriched[enriched["class"] == "ball"]
-    ball_by_frame = ball.sort_values("conf").groupby("frame")[["x_pitch", "y_pitch"]].last()
+    ball_by_frame = _highest_conf_ball_per_frame(ball)
 
     full_index = pd.RangeIndex(0, total_frames, name="frame")
     poss_full = poss_smoothed.reindex(full_index, fill_value="unknown")

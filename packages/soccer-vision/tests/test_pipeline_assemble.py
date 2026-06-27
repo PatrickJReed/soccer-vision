@@ -189,6 +189,47 @@ def test_assemble_phases_legacy_path_marks_anchors() -> None:
     assert result.anchor_coverage == 1.0   # all 3 frames are landmark anchors in the fixture
 
 
+def test_highest_conf_ball_pick_is_atomic() -> None:
+    import numpy as np
+
+    from soccer_vision.pipeline import _highest_conf_ball_per_frame
+
+    # Degenerate case the pitch filter normally prevents: the highest-conf row has
+    # y_pitch NaN. groupby().last() would borrow y_pitch=0.20 from the low-conf row
+    # (a "Frankenstein" ball); the atomic pick must keep y_pitch NaN.
+    ball = pd.DataFrame([
+        {"frame": 0, "conf": 0.9, "x_pitch": 0.50, "y_pitch": np.nan},
+        {"frame": 0, "conf": 0.2, "x_pitch": 0.10, "y_pitch": 0.20},
+    ])
+    out = _highest_conf_ball_per_frame(ball)
+    assert out.loc[0, "x_pitch"] == 0.50
+    assert np.isnan(out.loc[0, "y_pitch"])
+
+
+def test_highest_conf_ball_pick_normal_case() -> None:
+    from soccer_vision.pipeline import _highest_conf_ball_per_frame
+
+    ball = pd.DataFrame([
+        {"frame": 0, "conf": 0.9, "x_pitch": 0.50, "y_pitch": 0.60},
+        {"frame": 0, "conf": 0.2, "x_pitch": 0.10, "y_pitch": 0.20},
+        {"frame": 1, "conf": 0.7, "x_pitch": 0.30, "y_pitch": 0.40},
+    ])
+    out = _highest_conf_ball_per_frame(ball)
+    assert out.loc[0, "x_pitch"] == 0.50 and out.loc[0, "y_pitch"] == 0.60
+    assert out.loc[1, "x_pitch"] == 0.30 and out.loc[1, "y_pitch"] == 0.40
+
+
+def test_highest_conf_ball_pick_empty() -> None:
+    ball = pd.DataFrame(
+        columns=["frame", "conf", "x_pitch", "y_pitch"]
+    ).astype({"frame": "int64", "conf": "float64", "x_pitch": "float64", "y_pitch": "float64"})
+    from soccer_vision.pipeline import _highest_conf_ball_per_frame
+    out = _highest_conf_ball_per_frame(ball)
+    assert out.empty
+    assert list(out.columns) == ["x_pitch", "y_pitch"]
+    assert out.index.name == "frame"
+
+
 def test_assemble_phases_halftime_frame_flips_second_half() -> None:
     """own possession + ball in own third throughout: build before halftime,
     attack after; default (no kwarg) leaves it build."""

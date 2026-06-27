@@ -450,37 +450,15 @@ class RoboflowBackend:
         fps: float = cap.get(cv2.CAP_PROP_FPS) or 30.0
         cap.release()
 
-        # ---- Pass 1: collect player crops for TeamClassifier ----------
-        crops: list[object] = []
-        for frame_idx, frame in enumerate(
-            sv.get_video_frames_generator(source_path=str(video_path))
-        ):
-            if frame_idx % 60 != 0:
-                continue
-            result = player_model(frame, device=device, verbose=False)[0]
-            dets = sv.Detections.from_ultralytics(result)
-            # Keep only player/GK class IDs for team classification
-            player_mask = (dets.class_id == _CLS_PLAYER) | (dets.class_id == _CLS_GK)
-            player_dets = dets[player_mask]
-            for xyxy in player_dets.xyxy:
-                x1, y1, x2, y2 = (int(v) for v in xyxy)
-                crop = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
-                if crop.size > 0:
-                    crops.append(crop)
-
-        # Fit TeamClassifier (needs at least 2 crops; skip if blank video)
-        team_classifier: TeamClassifier | None = None
-        if len(crops) >= 2:
-            team_classifier = TeamClassifier(device=device)
-            team_classifier.fit(crops)
-
-        # ---- Pass 2: full detection, tracking, team prediction --------
+        # ---- Single streaming pass: detection, tracking, crops, ball, keypoints ----
         # ByteTrack defaults are intentionally untuned; track stability comes from
         # downstream hygiene.stitch_tracks. tracker_kwargs defers any tuning to data.
         tracker = sv.ByteTrack(**self.tracker_kwargs)
         rows: list[dict[str, float | int | str]] = []
         kp_records: list[dict[str, float | int]] = []
-        # Per-track player/GK crops (area, crop); classified in one batch after the pass.
+        # Per-track player/GK crops (area, crop): the TeamClassifier is fit on these
+        # clearest (largest-area) crops AFTER the pass, then predicts per track. This
+        # replaces the old whole-video Pass-1 decode with an equal-or-better fit sample.
         track_crops: dict[int, list[tuple[float, object]]] = {}
 
         for frame_idx, frame in enumerate(
@@ -515,7 +493,7 @@ class RoboflowBackend:
                     team = "ref"
                 else:
                     team = "unknown"
-                    if cls_name in ("player", "goalkeeper") and team_classifier is not None:
+                    if cls_name in ("player", "goalkeeper"):
                         crop = frame[max(0, int(y1)):max(0, int(y2)), max(0, int(x1)):max(0, int(x2))]
                         if crop.size > 0:
                             _keep_top_crop(track_crops, track_id, crop, (x2 - x1) * (y2 - y1))
@@ -594,9 +572,14 @@ class RoboflowBackend:
                             "conf":   c,
                         })
 
-        # ---- Per-track team classification (single batched call) -------
-        # A track's team is effectively constant; classify each track once from
-        # its clearest crops instead of every detection on every frame.
+        # ---- Fit the TeamClassifier on the collected crops, then classify per track --
+        # Single-pass fit: the per-track clearest (largest-area) crops are an equal-or-
+        # better unsupervised 2-cluster sample than the old temporally-subsampled Pass 1.
+        team_classifier: TeamClassifier | None = None
+        all_crops = [crop for lst in track_crops.values() for _, crop in lst]
+        if len(all_crops) >= 2:
+            team_classifier = TeamClassifier(device=device)
+            team_classifier.fit(all_crops)
         if team_classifier is not None and track_crops:
             sampled = {tid: [c for _, c in lst] for tid, lst in track_crops.items()}
             team_map = _classify_teams_per_track(sampled, team_classifier.predict, _CLUSTER_TEAM)

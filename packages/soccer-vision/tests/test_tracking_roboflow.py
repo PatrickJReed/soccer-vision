@@ -371,3 +371,18 @@ def test_tracker_kwargs_forwarded_to_bytetrack(
     )
     backend._run_pipeline(tiny_video, emit_keypoints=True)
     assert handle.bytetrack_kwargs == {"track_activation_threshold": 0.3, "lost_track_buffer": 60}
+
+
+def test_run_pipeline_decodes_video_once(
+    monkeypatch: pytest.MonkeyPatch, tiny_video: Path
+) -> None:
+    _df, _kp, handle, _b = _run_canned(monkeypatch, tiny_video)
+    assert handle.decode_count == 1  # no separate TeamClassifier-fit pass
+
+
+def test_single_pass_still_classifies_teams(
+    monkeypatch: pytest.MonkeyPatch, tiny_video: Path
+) -> None:
+    df, _kp, _h, _b = _run_canned(monkeypatch, tiny_video)
+    players = df[df["class"].isin(["player", "goalkeeper"])]
+    assert (players["team"] == "own").all()  # fit-after-pass still labels every track

@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 from soccer_vision.calib.field_model import field_points_3d
 from soccer_vision.labeler.chain import normalize_homography
-from soccer_vision.labeler.server import make_handler
+from soccer_vision.labeler.server import make_frame_jpeg, make_handler
 from soccer_vision.labeler.state import LabelerState
 from soccer_vision.pitch.manual_anchor import Click
 
@@ -98,6 +98,42 @@ def _get(url: str) -> dict[str, Any]:
     with urllib.request.urlopen(url) as r:
         result: dict[str, Any] = json.loads(r.read())
         return result
+
+
+class _FakeCap:
+    """Counts set()/read() to prove caching + the sequential fast-path."""
+
+    def __init__(self) -> None:
+        self.sets = 0
+        self.reads = 0
+
+    def set(self, prop: int, value: float) -> bool:
+        self.sets += 1
+        return True
+
+    def read(self) -> tuple[bool, Any]:
+        self.reads += 1
+        return True, np.zeros((240, 320, 3), dtype=np.uint8)
+
+
+def test_frame_jpeg_caches_repeat_index() -> None:
+    cap = _FakeCap()
+    fj = make_frame_jpeg(cap, downscale_display=0.5)
+    a = fj(7)
+    b = fj(7)                       # cache hit: no second decode
+    assert a == b and a.startswith(b"\xff\xd8")
+    assert cap.reads == 1          # decoded once
+    assert cap.sets == 1           # one seek to frame 7 (not sequential from -1)
+
+
+def test_frame_jpeg_sequential_does_not_seek() -> None:
+    cap = _FakeCap()
+    fj = make_frame_jpeg(cap, downscale_display=0.5)
+    fj(0)
+    fj(1)
+    fj(2)                          # sequential from the start
+    assert cap.sets == 0           # ALL-INTRA fast-path: read() in order, no set()
+    assert cap.reads == 3
 
 
 def test_click_then_state_reports_coverage() -> None:

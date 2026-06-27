@@ -7,6 +7,7 @@ video (chain precompute + JPEG frames) and serves the static UI.
 
 from __future__ import annotations
 
+import functools
 import json
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -18,6 +19,32 @@ import numpy as np
 from soccer_vision.labeler.state import LabelerState
 
 _STATIC = Path(__file__).parent / "static"
+
+
+def make_frame_jpeg(
+    cap: Any, downscale_display: float = 0.5, *, cache_size: int = 64
+) -> Callable[[int], bytes]:
+    """JPEG-bytes provider for a shared VideoCapture, with an LRU cache + sequential
+    fast-path. Assumes ALL-INTRA clips (the documented Trace operating mode), so a
+    per-frame seek is cheap and decode order is stable: when the requested index is the
+    next one in order we read() without an expensive cap.set() seek, and repeat requests
+    for the same index are served from the LRU cache (no re-decode)."""
+    import cv2
+
+    last_pos = {"i": -1}
+
+    def _decode(idx: int) -> bytes:
+        if idx != last_pos["i"] + 1:          # only seek when not reading the next frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        last_pos["i"] = idx
+        if not ok:
+            return b""
+        small = cv2.resize(frame, None, fx=downscale_display, fy=downscale_display)
+        ok2, buf = cv2.imencode(".jpg", small)
+        return bytes(buf.tobytes()) if ok2 else b""
+
+    return functools.lru_cache(maxsize=cache_size)(_decode)
 
 
 def make_handler(
@@ -193,15 +220,7 @@ def run(
     elif sidecar.exists():
         state.add_line_clicks(line_clicks_from_sidecar(sidecar))
     cap = cv2.VideoCapture(str(video_path))
-
-    def frame_jpeg(idx: int) -> bytes:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, frame = cap.read()
-        if not ok:
-            return b""
-        small = cv2.resize(frame, None, fx=downscale_display, fy=downscale_display)
-        ok2, buf = cv2.imencode(".jpg", small)
-        return buf.tobytes() if ok2 else b""
+    frame_jpeg = make_frame_jpeg(cap, downscale_display)
 
     names = list(LANDMARK_NAMES)
     xy = [[float(x), float(y)] for x, y in PITCH_LANDMARKS]

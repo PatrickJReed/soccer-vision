@@ -386,3 +386,17 @@ def test_single_pass_still_classifies_teams(
     df, _kp, _h, _b = _run_canned(monkeypatch, tiny_video)
     players = df[df["class"].isin(["player", "goalkeeper"])]
     assert (players["team"] == "own").all()  # fit-after-pass still labels every track
+
+
+def test_one_highest_conf_ball_per_frame(
+    monkeypatch: pytest.MonkeyPatch, tiny_video: Path
+) -> None:
+    df, _kp, _h, _b = _run_canned(monkeypatch, tiny_video, n_balls=2, ball_confs=(0.3, 0.9))
+    from soccer_vision.tracking.roboflow import _BALL_TRACK_ID_BASE
+    balls = df[df["class"] == "ball"]
+    per_frame = balls.groupby("frame").size()
+    assert (per_frame == 1).all()  # exactly one ball row per frame
+    b0 = balls[balls["frame"] == 0].iloc[0]
+    assert b0["conf"] == 0.9                      # the higher-conf detection won
+    assert b0["x_px"] == 615.0                    # second box centre (610..620)
+    assert int(b0["track_id"]) == _BALL_TRACK_ID_BASE - 0  # unique synthetic id

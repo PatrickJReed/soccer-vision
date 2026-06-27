@@ -526,15 +526,20 @@ class RoboflowBackend:
             )[0]
             b_dets = sv.Detections.from_ultralytics(b_result)
 
-            for j in range(len(b_dets)):
+            # Emit ONLY the highest-conf ball this frame: the synthetic id
+            # (_BALL_TRACK_ID_BASE - frame_idx) is then unique by construction, and
+            # downstream already keeps the top-conf ball per frame, so no consumer impact.
+            n_balls = len(b_dets)
+            if n_balls > 0:
+                if b_dets.confidence is not None:
+                    j = max(range(n_balls), key=lambda k: float(b_dets.confidence[k]))
+                else:
+                    j = 0
                 x1, y1, x2, y2 = b_dets.xyxy[j]
                 x_px = (x1 + x2) / 2.0
                 y_px = (y1 + y2) / 2.0  # center for ball
-
                 conf_val = float(b_dets.confidence[j]) if b_dets.confidence is not None else 0.5
-                # Synthetic track ID: negative space, collision-proof with ByteTrack IDs
                 synthetic_id = _BALL_TRACK_ID_BASE - frame_idx
-
                 rows.append({
                     "frame":    frame_idx,
                     "t_seconds": t_sec,

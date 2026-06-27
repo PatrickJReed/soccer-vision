@@ -137,9 +137,14 @@ def labeler_fit_residual_feet(
     aspect_ratio: float = DEFAULT_ASPECT_RATIO,
 ) -> float:
     """Labeler self-consistency: median feet error of its homography on its OWN
-    clicked anchors. This is the noise-floor proxy that defines the
-    match-the-labeler bar. (clicked_px: (k,2) image pixels; kp_indices: (k,)
-    landmark ids for each click.)
+    clicked anchors. (clicked_px: (k,2) image pixels; kp_indices: (k,) landmark ids.)
+
+    WARNING — self-consistency proxy, NOT an accuracy bound. A single-end "sky"
+    homography scores a tiny self-residual yet is wildly wrong off-frame. Do NOT use
+    this to set the eval match threshold; the honest bar is SP1's cross-end HELD-OUT
+    distribution (HoldoutReport.median_ft, acceptance < 1.5 m — see
+    2026-06-26-calibration-global-homography-design.md §7) or an independent
+    test-retest. Keep this only as a labeled diagnostic ("self-consistency floor").
     """
     idx = np.asarray(kp_indices)
     pitch_pred = _apply_h(h_gt, np.asarray(clicked_px, dtype=np.float64))

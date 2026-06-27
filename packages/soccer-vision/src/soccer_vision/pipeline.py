@@ -3,6 +3,11 @@
 assemble_phases is pure (no models, no GPU, no ultralytics/sports import) so the
 integration logic is testable without a GPU. analyze_video / assemble_from_parquet / assemble_from_homographies add model
 invocation and parquet I/O around it.
+
+SCOPE GUARD: this glue is complete and is NOT the bottleneck. Do not add new pipeline/
+eval/export surface (public functions, report fields, consumers) until a binding
+constraint is unblocked — a trustworthy homography (SP1) or the §6 metrics layer (SP5).
+See docs/superpowers/plans/2026-06-26-pipeline-eval-cleanup.md (Process notes, F8).
 """
 
 from __future__ import annotations

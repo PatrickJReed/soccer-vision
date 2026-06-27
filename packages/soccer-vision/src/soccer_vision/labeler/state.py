@@ -340,6 +340,26 @@ class LabelerState:
             out.append("red" if "red" in chunk else "yellow" if "yellow" in chunk else "green")
         return out, bucket
 
+    def status_summary(
+        self, *, n_buckets: int = 1200
+    ) -> tuple[float, list[str], int]:
+        """Compute the per-frame status list ONCE and derive both coverage and buckets
+        from it. _state_payload calls this instead of coverage() + status_buckets(),
+        which each walk every frame (two full _status_of passes per /api/state poll)."""
+        full = self.status_list()
+        coverage = (
+            sum(1 for s in full if s == "green") / self.n_frames
+            if self.n_frames else 0.0
+        )
+        if len(full) <= n_buckets:
+            return coverage, full, 1
+        bucket = -(-len(full) // n_buckets)
+        out: list[str] = []
+        for i in range(0, len(full), bucket):
+            chunk = full[i:i + bucket]
+            out.append("red" if "red" in chunk else "yellow" if "yellow" in chunk else "green")
+        return coverage, out, bucket
+
     def frame_homography(self, frame: int) -> CalibFrame | None:
         with self._lock:
             return self._fits.get(frame)

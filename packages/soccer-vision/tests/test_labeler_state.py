@@ -362,6 +362,30 @@ def test_clean_session_fits_two_ended_with_tight_residual() -> None:
         st.stop_worker()
 
 
+def test_status_summary_makes_one_status_pass() -> None:
+    # SP1 removed the `window` constructor param (global bundle, not windowed propagation),
+    # so this constructs LabelerState without it (the plan predates SP1).
+    interframe, _poses, clicks = _pan_session(40)
+    st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080))
+    try:
+        st.add_clicks(clicks)
+        st.wait_idle(timeout=10)
+        calls = {"n": 0}
+        real = st._status_of
+
+        def counting(f: int) -> str:
+            calls["n"] += 1
+            return real(f)
+
+        st._status_of = counting  # type: ignore[method-assign]
+        coverage, buckets, bucket_size = st.status_summary()
+        assert calls["n"] == st.n_frames            # exactly ONE pass, not two
+        assert 0.0 <= coverage <= 1.0
+        assert isinstance(buckets, list) and isinstance(bucket_size, int)
+    finally:
+        st.stop_worker()
+
+
 def test_global_model_covers_whole_segment() -> None:
     # The field-anchored bundle fits one homography per segment, so EVERY frame in the
     # segment (clicked or not) gets an overlay — there is no per-frame windowing gap.

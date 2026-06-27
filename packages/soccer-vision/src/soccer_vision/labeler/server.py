@@ -79,10 +79,10 @@ def make_handler(
             self._send(code, json.dumps(obj).encode(), "application/json")
 
         def _state_payload(self) -> dict[str, Any]:
-            buckets, bucket_size = state.status_buckets()
+            coverage, buckets, bucket_size = state.status_summary()  # one status pass
             return {
                 "n_frames": state.n_frames,
-                "coverage": state.coverage(),
+                "coverage": coverage,
                 "status_buckets": buckets,
                 "bucket_size": bucket_size,
                 "n_clicks": len(state.clicks),

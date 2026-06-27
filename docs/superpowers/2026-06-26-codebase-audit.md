@@ -108,3 +108,16 @@ acceptance gate to make the calibration work *terminate*.
    `analyze_video`, or chain `analyze_video → hygiene` as the default path.
 5. **Add a phase-gate circuit-breaker**: a sub-project that fails twice triggers a scope/fallback
    review, not a third sub-project. Tie every spec to a product deliverable.
+
+## Bake-off provenance note (SP2 §3.10 — record only)
+
+The tracking-backend bake-off decision hinged on a 1-point margin driven by a
+"homography fidelity" scoring axis, which (i) rested on the per-frame camera-model
+premise that SP1 has since reframed (global homography per registration segment),
+and (ii) is a property of pitch detection, which is **separable** from the tracker
+(SP2 §3.2 keeps the one-pass decode as a performance choice, not a fidelity
+requirement). Conclusion for the record: homography fidelity should not have been an
+intra-tracking-backend scoring axis; the backend choice is **reopenable** if evidence
+warrants, but there is currently **no evidence the tracker is the bottleneck** —
+hygiene already addressed track shredding (867->400 tracks, balance 1.11). No re-run
+is scheduled; this is a provenance note, not a task.

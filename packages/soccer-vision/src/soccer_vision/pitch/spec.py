@@ -2,11 +2,21 @@
 
 All distances expressed as fractions of pitch length (the canonical unit).
 This avoids per-game field-size calibration while keeping metrics comparable.
+
+`length_norm_xy` is the single source of truth for aspect-corrected pitch
+distance: x is a fraction of WIDTH and y of LENGTH (§3), so dividing x by
+aspect_ratio puts both axes on the same physical scale. hygiene/core.py uses
+this convention inline; possession (and SP5's §6 radius metrics) import it here.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+import numpy as np
+from numpy.typing import NDArray
+
+PitchCoord = float | NDArray[np.float64]
 
 
 @dataclass(frozen=True)
@@ -39,3 +49,17 @@ class PitchSpec:
             coverage_cell_frac=0.0095,
             goal_width_frac=0.108,
         )
+
+
+def length_norm_xy(
+    x_pitch: PitchCoord, y_pitch: PitchCoord, spec: PitchSpec
+) -> tuple[PitchCoord, PitchCoord]:
+    """Return (x / aspect_ratio, y): coords in isotropic pitch-LENGTH units.
+
+    x is a fraction of pitch WIDTH and y a fraction of pitch LENGTH (master spec
+    §3); dividing x by aspect_ratio puts both axes on the same physical scale so
+    that Euclidean distances are isotropic (a circle, not an ellipse). Accepts
+    scalars or numpy arrays. This is the one convention `hygiene/core.py`
+    applies inline and SP5's §6 metrics will reuse.
+    """
+    return x_pitch / spec.aspect_ratio, y_pitch

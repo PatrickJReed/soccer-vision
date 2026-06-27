@@ -237,21 +237,51 @@ def _seed_hg(
     return np.asarray(h, dtype=np.float64)
 
 
+def _seed_x0_for_segment(
+    seed: BundleCalib | None, seg: int, frames: Sequence[int]
+) -> NDArray[np.float64] | None:
+    """Warm-start optimization vector for a segment from a prior BundleCalib, matching
+    _solve_segment's layout ([H_g flat[:8], then 6 affine params per sorted frame]), or
+    None if the seed is absent / shape-incompatible (the segment's clicked-frame set
+    changed, e.g. a newly-clicked frame added a 6-DOF variable, or a removed click
+    dropped one). The result is ONLY an initial guess for least_squares, which still
+    converges to the same optimum — warm-start changes iteration count, not the answer."""
+    if seed is None or seg not in seed.h_by_segment:
+        return None
+    a_seed = seed.a_params_by_segment.get(seg, {})
+    if set(a_seed) != set(frames):
+        return None
+    hg8 = np.asarray(seed.h_by_segment[seg], dtype=np.float64).flatten()[:8]
+    parts: list[NDArray[np.float64]] = [hg8]
+    parts.extend(np.asarray(a_seed[f], dtype=np.float64) for f in frames)
+    return np.concatenate(parts)
+
+
 def _solve_segment(
     seg_clicks: Sequence[Click],
     transforms: Mapping[int, NDArray[np.floating]],
     lam: float,
+    x0_seed: NDArray[np.float64] | None = None,
 ) -> tuple[NDArray[np.float64], dict[int, NDArray[np.float64]]] | None:
     """Fit one segment's H_g (8 dof) + a per-clicked-frame affine A_f, jointly minimizing
     click reprojection error (pitch units) + lam*(A_f - I). Returns (H_g, {frame: params})
-    or None if the seed homography is degenerate. Ports the prototype's least_squares."""
+    or None if the seed homography is degenerate. Ports the prototype's least_squares.
+
+    If `x0_seed` (a warm-start vector of the matching shape, from _seed_x0_for_segment)
+    is supplied, least_squares starts from it instead of the cold (seed-H_g + identity-
+    affine) guess, so an incremental edit converges in a few iterations; it converges to
+    the same optimum either way. A mismatched/absent seed falls back to the cold start."""
     frames = sorted({c.frame for c in seg_clicks})
     fidx = {f: i for i, f in enumerate(frames)}
-    hg0 = _seed_hg(seg_clicks, transforms)
-    if hg0 is None:
-        return None
     a_id = np.array(_AFFINE_ID, dtype=np.float64)
-    x0 = np.concatenate([hg0.flatten()[:8], np.tile(a_id, len(frames))])
+    n_params = 8 + len(frames) * _AFFINE_DOF
+    if x0_seed is not None and x0_seed.shape == (n_params,):
+        x0 = np.asarray(x0_seed, dtype=np.float64).copy()
+    else:
+        hg0 = _seed_hg(seg_clicks, transforms)
+        if hg0 is None:
+            return None
+        x0 = np.concatenate([hg0.flatten()[:8], np.tile(a_id, len(frames))])
 
     def slot(x: NDArray[np.float64], f: int) -> NDArray[np.float64]:
         i = fidx[f]
@@ -283,6 +313,7 @@ def solve_bundle(
     *,
     lam: float = 0.01,
     min_points: int = 4,
+    seed: BundleCalib | None = None,
 ) -> BundleCalib:
     """Field-anchored bundle adjustment, solved independently per registration segment.
 
@@ -291,6 +322,11 @@ def solve_bundle(
     frame affine absorbs the chain's long-span drift that solve_global (translation-only)
     cannot, which is what lets the cross-end held-out accuracy pass. Segments with fewer
     than `min_points` clicks (or a degenerate seed) are skipped (no H). Pure: no I/O.
+
+    `seed` (a previous BundleCalib) warm-starts each segment's least_squares from the
+    prior solution when shape-compatible (same clicked-frame set), so an incremental
+    click converges in a few iterations instead of from cold. It is only an initial
+    guess — the optimum (and thus accuracy) is unchanged; see _seed_x0_for_segment.
     """
     by_seg: dict[int, list[Click]] = {}
     for c in clicks:
@@ -306,7 +342,9 @@ def solve_bundle(
     for seg, seg_clicks in by_seg.items():
         if len(seg_clicks) < min_points:
             continue
-        solved = _solve_segment(seg_clicks, transforms, lam)
+        frames = sorted({c.frame for c in seg_clicks})
+        x0_seed = _seed_x0_for_segment(seed, seg, frames)
+        solved = _solve_segment(seg_clicks, transforms, lam, x0_seed)
         if solved is None:
             continue
         hg, a_params = solved

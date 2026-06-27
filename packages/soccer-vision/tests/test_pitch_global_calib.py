@@ -9,6 +9,7 @@ from soccer_vision.pitch.global_calib import (
     _affine_from,
     _apply_h,
     _interp_affine_params,
+    _seed_x0_for_segment,
     cross_end_holdout,
     fold_of_norm,
     frame_status,
@@ -317,3 +318,42 @@ def test_solve_bundle_skips_segment_with_too_few_points() -> None:
     assert bc.h_by_segment == {}
     assert bc.a_params_by_segment == {}
     assert bc.frame_homography(0) is None
+
+
+def test_solve_bundle_warm_start_matches_cold_start() -> None:
+    # Warm-starting least_squares from a prior (shape-compatible) BundleCalib must change
+    # only the iteration count, NOT the optimum. Solve a subset cold to build a seed, then
+    # solve the FULL session both cold (seed=None) and warm (seed=subset solution); the two
+    # full solves must agree to a tight tolerance -> warm-start changes speed, not accuracy.
+    clicks, transforms, segment_of = _build_drift_session()
+
+    # A shape-compatible seed: drop one click but keep every clicked frame populated, so
+    # the clicked-frame set (and thus the optimization-vector shape) is unchanged.
+    seed = solve_bundle(clicks[:-1], transforms, segment_of, SIZE)
+    assert sorted(seed.a_params_by_segment[0]) == [0, 1, 2, 3]  # all frames still present
+
+    cold = solve_bundle(clicks, transforms, segment_of, SIZE)
+    warm = solve_bundle(clicks, transforms, segment_of, SIZE, seed=seed)
+
+    np.testing.assert_allclose(warm.h_by_segment[0], cold.h_by_segment[0], atol=1e-6)
+    for f in cold.a_params_by_segment[0]:
+        np.testing.assert_allclose(
+            warm.a_params_by_segment[0][f], cold.a_params_by_segment[0][f], atol=1e-6)
+    # the per-frame homographies (what the labeler actually serves) agree too
+    for f in (0, 1, 2, 3):
+        np.testing.assert_allclose(
+            warm.frame_homography(f), cold.frame_homography(f), atol=1e-6)
+
+
+def test_seed_x0_falls_back_when_frame_set_changes() -> None:
+    # _seed_x0_for_segment yields a warm vector ONLY when the clicked-frame set matches
+    # the seed (same optimization-vector shape); otherwise None -> cold start. This is the
+    # "newly-clicked frame added a variable" / removed-click / absent-seed fallback.
+    clicks, transforms, segment_of = _build_drift_session()
+    seed = solve_bundle(clicks, transforms, segment_of, SIZE)
+    x0 = _seed_x0_for_segment(seed, 0, [0, 1, 2, 3])
+    assert x0 is not None and x0.shape == (8 + 4 * 6,)  # H_g (8) + 6 affine params x 4
+    assert _seed_x0_for_segment(seed, 0, [0, 1, 2, 3, 9]) is None  # new frame added
+    assert _seed_x0_for_segment(seed, 0, [0, 1, 2]) is None        # a frame dropped
+    assert _seed_x0_for_segment(None, 0, [0, 1, 2, 3]) is None     # no seed
+    assert _seed_x0_for_segment(seed, 99, [0]) is None             # unknown segment

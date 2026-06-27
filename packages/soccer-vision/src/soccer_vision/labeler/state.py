@@ -80,6 +80,7 @@ class LabelerState:
         self.line_clicks: list[LineClick] = []
         self._seq: list[str] = []  # insertion order across clicks ("pt") + line_clicks ("ln")
         self._fits: dict[int, CalibFrame] = {}
+        self._last_bundle: BundleCalib | None = None  # warm-start seed for the next solve
         self._K: NDArray[np.float64] | None = None
         self._calibrated = False
         self._outliers: dict[int, list[int]] = {}
@@ -120,11 +121,21 @@ class LabelerState:
         scipy least_squares over ALL clicks) + two-ended detection OFF the lock. Callers
         must solve once per recompute and reuse the result — NEVER per chunk (the bundle
         solve is expensive). solve_bundle handles the empty case (no/too-few clicks) by
-        returning an empty BundleCalib, so frame_homography is None for every frame."""
+        returning an empty BundleCalib, so frame_homography is None for every frame.
+
+        The previous solution (self._last_bundle) is passed as a warm-start seed so the
+        scipy least_squares converges in a few iterations on an incremental edit; it is
+        only an initial guess (the optimum is unchanged), and a stale seed from older
+        clicks is still safe (least_squares re-converges to the CURRENT clicks' optimum).
+        """
         with self._lock:
             clicks = list(self._active_clicks())  # stable COPY for the lock-free solve
-        bundle = solve_bundle(clicks, self._transforms, self._segment_of, self.size)
+            seed = self._last_bundle              # warm-start from the prior solution
+        bundle = solve_bundle(
+            clicks, self._transforms, self._segment_of, self.size, seed=seed)
         two_ended = two_ended_segments(clicks, self._segment_of)
+        with self._lock:
+            self._last_bundle = bundle
         return bundle, two_ended
 
     def _build_frame(
@@ -173,12 +184,6 @@ class LabelerState:
                 else:
                     self._fits[f] = cf
 
-    def _refit_one(self, frame: int) -> None:
-        """Synchronously fit just `frame` (instant overlay for the clicked frame)."""
-        result = self._compute_dirty([frame], lambda: False)
-        assert result is not None
-        self._apply_fits(result)
-
     def wait_idle(self, timeout: float | None = None) -> None:
         self._worker.wait_idle(timeout)
 
@@ -219,14 +224,16 @@ class LabelerState:
         return [f for f in range(self.n_frames) if self._segment_of.get(f) == seg]
 
     def add_click(self, frame: int, kp_idx: int, x: float, y: float) -> None:
+        # Non-blocking: append the click and mark the affected frames dirty, then return
+        # immediately. The background RefitWorker re-solves the bundle off the request
+        # thread; the clicked frame keeps showing its cached (pre-click) overlay until the
+        # worker drains (~100-300 ms), which the frontend picks up on its pending poll.
         with self._lock:
             self.clicks.append(Click(frame=frame, kp_idx=kp_idx, x=x, y=y))
             self._seq.append("pt")
         if not self._calibrated and self._try_bootstrap():
-            self._refit_one(frame)                       # clicked frame instant
-            self._worker.mark_dirty(range(self.n_frames))  # everything else in background
+            self._worker.mark_dirty(range(self.n_frames))  # first calibration in background
         elif self._calibrated:
-            self._refit_one(frame)
             self._worker.mark_dirty(self._affected(frame))
         self._autosave()
 
@@ -245,8 +252,7 @@ class LabelerState:
             self.line_clicks.append(LineClick(frame=frame, line_id=line_id, x=x, y=y))
             self._seq.append("ln")
         if self._calibrated:
-            self._refit_one(frame)
-            self._worker.mark_dirty(self._affected(frame))
+            self._worker.mark_dirty(self._affected(frame))  # non-blocking; worker re-solves
         self._autosave()
 
     def add_line_clicks(self, line_clicks: Sequence[LineClick]) -> None:
@@ -274,8 +280,7 @@ class LabelerState:
                 assert self.clicks, "_seq/clicks out of sync"
                 removed_frame = self.clicks.pop().frame
         if self._calibrated:
-            self._refit_one(removed_frame)
-            self._worker.mark_dirty(self._affected(removed_frame))
+            self._worker.mark_dirty(self._affected(removed_frame))  # non-blocking
         self._autosave()
 
     def nudge_click(self, frame: int, kp_idx: int, x: float, y: float) -> bool:
@@ -290,8 +295,7 @@ class LabelerState:
         if not found:
             return False
         if self._calibrated:
-            self._refit_one(frame)
-            self._worker.mark_dirty(self._affected(frame))
+            self._worker.mark_dirty(self._affected(frame))  # non-blocking; worker re-solves
         self._autosave()
         return True
 

@@ -115,12 +115,16 @@ function applyState(st){
 
 function maybePoll(pending){
   if(pending > 0 && pendingPoll === null){
+    // Clicks are non-blocking: the server defers the bundle re-solve to a background
+    // worker, so we poll while pending>0 and re-fetch the CURRENT frame's overlay each
+    // tick (incl. the drain tick) so the just-placed click's effect appears once the
+    // worker drains (~100-300 ms). Tight interval since the backend no longer blocks.
     pendingPoll = setInterval(async () => {
       const st = await api("/api/state");
       applyState(st);                                   // refresh timeline/coverage
       const fh = await api(`/api/frame_h/${cur}`); curH = fh.h; drawFrame();
       if((st.pending || 0) === 0){ clearInterval(pendingPoll); pendingPoll = null; }
-    }, 750);
+    }, 300);
   } else if(pending === 0 && pendingPoll !== null){
     clearInterval(pendingPoll); pendingPoll = null;
   }

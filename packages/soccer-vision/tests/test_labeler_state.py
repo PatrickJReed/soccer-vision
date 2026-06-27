@@ -242,16 +242,31 @@ def test_line_obs_scoped_to_line_band() -> None:
     assert carrying == [3, 4, 5]
 
 
-def test_add_click_fits_current_frame_synchronously() -> None:
+def test_add_click_is_nonblocking_and_defers_to_worker() -> None:
+    # The click request path must NOT run a synchronous bundle solve. add_click appends
+    # the click, marks the affected frames dirty, and returns immediately: so right after
+    # add_click there is deferred work (pending > 0), the clicked frame still serves its
+    # cached pre-click overlay instantly (never None once calibrated), and once the worker
+    # drains the clicked frame is covered/correct. (Restores instant-click responsiveness:
+    # the previous code ran a full least_squares on the request thread per click.)
     interframe, _poses, clicks = _pan_session(40)
     st = LabelerState(interframe=interframe, n_frames=40, size=(1920, 1080))
     try:
-        # bootstrap on all but the last click, synchronously (bulk)
-        st.add_clicks(clicks[:-1])
+        st.add_clicks(clicks[:-1])    # bootstrap synchronously (bulk), worker then idle
+        st.wait_idle(timeout=10)
         last = clicks[-1]
-        st.add_click(last.frame, last.kp_idx, last.x, last.y)
-        # the clicked frame is fit on return, BEFORE the background worker drains
+        # instant: the clicked frame already has a cached fit from the bulk recompute
         assert st.frame_homography(last.frame) is not None
+        st.add_click(last.frame, last.kp_idx, last.x, last.y)
+        # work was deferred to the background worker (no synchronous full solve on return)
+        assert st.pending() > 0
+        # the clicked frame still serves an overlay instantly (the cached pre-click bundle)
+        assert st.frame_homography(last.frame) is not None
+        # once the worker drains, the clicked frame is covered/correct
+        st.wait_idle(timeout=10)
+        assert st.pending() == 0
+        after = st.frame_homography(last.frame)
+        assert after is not None and after.H.shape == (3, 3)
     finally:
         st.stop_worker()
 
@@ -294,11 +309,13 @@ def test_concurrent_edits_during_refit_are_safe() -> None:
     # field-anchored bundle solve OFF the lock) while clicks are appended / replaced /
     # popped. With the snapshot copied and the mutations locked this must not raise
     # (RuntimeError: list changed size during iteration) or corrupt the _seq/_fits
-    # invariants. The hammered clicks are REAL projected landmarks on a handful of frames
-    # so each bundle solve converges fast: garbage clicks force the least_squares to
-    # max_nfev (~10 s per solve), and the lock/snapshot safety this exercises is
-    # independent of the clicks' accuracy. (The off-lock bundle solve is ~tens of ms vs
-    # the old microsecond DLT, so the concurrent-mutation race window is now WIDER.)
+    # invariants. The mutators are now NON-BLOCKING (they only mark frames dirty; the
+    # background worker runs the warm-started bundle solve off the request thread), so
+    # this hammers the worker harder than before — exactly the race we want to exercise.
+    # The hammered clicks are REAL projected landmarks on a handful of frames so each
+    # bundle solve converges fast: garbage clicks force the least_squares to max_nfev
+    # (~10 s per solve), and the lock/snapshot safety this exercises is independent of
+    # the clicks' accuracy.
     interframe, poses, clicks = _pan_session(40)
     fp = field_points_3d()
     real: dict[tuple[int, int], tuple[float, float]] = {}  # (frame, kp) -> norm click

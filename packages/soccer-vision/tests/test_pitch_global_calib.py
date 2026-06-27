@@ -307,7 +307,9 @@ def test_frame_homography_interpolates_affine_between_clicked_frames() -> None:
 
     # frame_homography wires that interpolated affine in: H = H_g @ A_interp @ M[4].
     expected_h = bc.h_by_segment[0] @ _affine_from(expected) @ transforms[4]
-    assert np.allclose(bc.frame_homography(4), expected_h, atol=1e-9)
+    h4 = bc.frame_homography(4)
+    assert h4 is not None
+    assert np.allclose(h4, expected_h, atol=1e-9)
 
 
 def test_solve_bundle_skips_segment_with_too_few_points() -> None:
@@ -341,8 +343,9 @@ def test_solve_bundle_warm_start_matches_cold_start() -> None:
             warm.a_params_by_segment[0][f], cold.a_params_by_segment[0][f], atol=1e-6)
     # the per-frame homographies (what the labeler actually serves) agree too
     for f in (0, 1, 2, 3):
-        np.testing.assert_allclose(
-            warm.frame_homography(f), cold.frame_homography(f), atol=1e-6)
+        wf, cf = warm.frame_homography(f), cold.frame_homography(f)
+        assert wf is not None and cf is not None
+        np.testing.assert_allclose(wf, cf, atol=1e-6)
 
 
 def test_seed_x0_falls_back_when_frame_set_changes() -> None:

@@ -120,6 +120,9 @@ def assemble_phases(
 
     enriched = PitchMapper().transform(trajectories_px, h_map)
     enriched = filter_outside_pitch(enriched, margin=filter_margin)
+    # Idempotent for the roboflow backend (team is already per-track-constant from
+    # _classify_teams_per_track), but a real per-track smoother for backends that
+    # predict team per frame, so it stays in the chain.
     enriched = apply_modal_team_per_track(enriched)
     validate_trajectories(enriched)
 

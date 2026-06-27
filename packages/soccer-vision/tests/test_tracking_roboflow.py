@@ -7,7 +7,12 @@ extra); those tests are skipped if the extras aren't available.
 
 from __future__ import annotations
 
+import re
+import sys
+import types
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -140,3 +145,15 @@ def test_download_weights_skips_pitch_when_override_given(
     assert "pitch" not in paths  # skipped entirely
     assert "player" in paths and "ball" in paths
     assert not any("pitch" in f for f in fetched)  # no pitch URL/gdrive hit
+
+
+def test_version_is_not_stale_date_marker() -> None:
+    """The stale 'main@YYYY-MM-DD' value is not a real upstream ref; version must be
+    a git SHA, a vX.Y[.Z] tag, or the explicit UNPINNED sentinel (pinned by a human)."""
+    v = RoboflowBackend.version
+    assert not re.fullmatch(r"main@\d{4}-\d{2}-\d{2}", v), (
+        "version is still the stale date marker; pin to a real roboflow/sports SHA or tag"
+    )
+    assert re.fullmatch(r"[0-9a-f]{7,40}|v\d+\.\d+(\.\d+)?|UNPINNED", v), (
+        f"version {v!r} must be a SHA, a vX.Y tag, or the UNPINNED sentinel"
+    )

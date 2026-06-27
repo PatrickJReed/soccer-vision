@@ -14,15 +14,11 @@ import urllib.request
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast
+from typing import Final, cast
 
 import pandas as pd
 
 from soccer_vision.io.schema import validate_trajectories
-
-if TYPE_CHECKING:
-    # Only imported for type-checking; never executed at runtime at module level.
-    pass
 
 # ---------------------------------------------------------------------------
 # Weight registry
@@ -291,7 +287,10 @@ class RoboflowBackend:
     """
 
     name: Final = "roboflow-sports"
-    version: Final = "main@2026-05-28"
+    # UNPINNED: the real roboflow/sports git ref this adapter wraps is a human input —
+    # replace with the installed commit SHA (e.g. from the uv lockfile) or release tag
+    # before any release. A SHA or vX.Y tag both satisfy the version regex test.
+    version: Final = "UNPINNED"
 
     def __init__(
         self,

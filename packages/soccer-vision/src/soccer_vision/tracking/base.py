@@ -17,16 +17,34 @@ class TrackingBackend(Protocol):
     soccer_vision.io.schema.validate_trajectories.
     """
 
-    name: str
-    """Stable identifier for the backend, e.g. 'roboflow-sports'."""
+    @property
+    def name(self) -> str:
+        """Stable identifier for the backend, e.g. 'roboflow-sports'.
 
-    version: str
-    """Version string, e.g. the upstream commit SHA or release tag."""
+        Declared read-only so implementers may expose it as a Final/class
+        attribute (RoboflowBackend), an instance attribute (MockBackend), or a
+        property; all satisfy this member.
+        """
+        ...
+
+    @property
+    def version(self) -> str:
+        """Version string, e.g. the upstream commit SHA or release tag."""
+        ...
 
     def process(self, video_path: Path) -> pd.DataFrame:
         """Run detection + tracking on the video at `video_path`.
 
         Returns a DataFrame with columns defined in
         soccer_vision.io.schema.REQUIRED_COLUMNS.
+        """
+        ...
+
+    def process_with_pitch(self, video_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Run detection + tracking AND pitch-keypoint detection in ONE video pass.
+
+        Returns (trajectories, keypoints). trajectories validates against
+        soccer_vision.io.schema.validate_trajectories; keypoints has columns
+        frame, kp_idx, x_px, y_px, conf and may be empty but must be schema-conformant.
         """
         ...

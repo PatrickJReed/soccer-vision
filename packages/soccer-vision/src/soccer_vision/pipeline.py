@@ -12,7 +12,6 @@ import logging
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import cv2
 import numpy as np
@@ -35,6 +34,7 @@ from soccer_vision.pitch.propagation import (
     compute_interframe_homographies,
     propagate_homographies,
 )
+from soccer_vision.tracking.base import TrackingBackend
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +206,8 @@ def analyze_video(
     video_path: Path,
     out_dir: Path,
     *,
-    backend: Any | None = None,
+    backend: TrackingBackend | None = None,
+    own_kit: str | None = None,
     **assemble_opts: object,
 ) -> PipelineResult:
     """Run the full pipeline on a video and write checkpoints + deliverables.
@@ -214,6 +215,13 @@ def analyze_video(
     Stage 1 (GPU): pitch-aware tracking + checkpoints. Stage 2 (CPU): propagate
     homographies from anchors → homographies.parquet. Stage 3 (pure): assemble +
     write deliverables.
+
+    own_kit grounds own/opp. When given (e.g. "white", "dark blue"), the verified
+    hygiene grounding is chained (stitch fragments -> kit-cluster -> map_own_cluster
+    -> positional goalkeeper assignment -> balance gate); the cleaned, grounded
+    trajectories are assembled, so possession/phase are computed on grounded labels.
+    When None, behaviour is unchanged BUT a loud warning is emitted: the tracker's
+    own/opp comes from an arbitrary KMeans cluster index and may be globally inverted.
     """
     if backend is None:
         from soccer_vision.tracking.roboflow import (
@@ -233,8 +241,39 @@ def analyze_video(
     homographies_to_parquet(homographies, out / "homographies.parquet")
 
     resolved_fps, total_frames = _resolve_fps_and_frames(trajectories_px)
+
+    if own_kit is not None:
+        # Lazy import: hygiene.run imports homographies_from_parquet from THIS module,
+        # so a top-level import would be circular (mirrors the lazy RoboflowBackend above).
+        from soccer_vision.hygiene.run import run_hygiene
+
+        report = run_hygiene(
+            traj_path=out / "trajectories_px.parquet",
+            homographies_path=out / "homographies.parquet",
+            video_path=video_path,
+            out_dir=out,
+            own_kit=own_kit,
+        )
+        balance = report.get("balance") or {}
+        if not balance.get("passed", False):
+            logger.warning(
+                "hygiene balance gate FAILED (own:opp ratio=%s) — own/opp grounding may be "
+                "unreliable; inspect %s and the team_cluster_*.png contact sheets",
+                balance.get("ratio"), out / "hygiene_report.json",
+            )
+        if report.get("warning"):
+            logger.warning("hygiene grounding warning: %s", report["warning"])
+        trajectories_for_assembly = pd.read_parquet(out / "trajectories_px_clean.parquet")
+    else:
+        logger.warning(
+            "own/opp UNGROUNDED: team labels come from an arbitrary KMeans cluster index and "
+            "may be GLOBALLY INVERTED. Pass own_kit=\"<your shirt colour>\" (or run "
+            "`python -m soccer_vision.hygiene`) for trustworthy own-team analytics."
+        )
+        trajectories_for_assembly = trajectories_px
+
     result = assemble_phases(
-        trajectories_px, keypoints, fps=resolved_fps, total_frames=total_frames,
+        trajectories_for_assembly, keypoints, fps=resolved_fps, total_frames=total_frames,
         homographies=homographies, **assemble_opts,  # type: ignore[arg-type]
     )
     _write_deliverables(result, out)

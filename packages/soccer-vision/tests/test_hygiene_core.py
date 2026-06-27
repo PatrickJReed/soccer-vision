@@ -333,3 +333,16 @@ def test_balance_gate_no_opp_returns_inf_false() -> None:
     ratio, passed = balance_gate(df)
     assert ratio == float("inf")
     assert not passed
+
+
+def test_map_own_cluster_invariant_to_kmeans_label_order() -> None:
+    """KMeans labels its clusters in an arbitrary order; map_own_cluster must pick the SAME
+    physical kit regardless. Same two kits, two centroid orderings -> identical chosen centroid."""
+    white = [250.0, 128.0, 128.0, 100.0, 128.0, 128.0]
+    blue = [40.0, 130.0, 80.0, 180.0, 120.0, 190.0]
+    c01 = np.array([white, blue])
+    c10 = np.array([blue, white])
+    own01, _ = map_own_cluster(c01, "white")
+    own10, _ = map_own_cluster(c10, "white")
+    assert own01 != own10                       # index flips with the label order
+    assert np.allclose(c01[own01], c10[own10])  # but the chosen physical centroid is identical

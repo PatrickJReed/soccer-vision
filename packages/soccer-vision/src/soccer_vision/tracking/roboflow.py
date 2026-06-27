@@ -276,6 +276,15 @@ class RoboflowBackend:
         When True, download and load the pitch keypoint detection model.
         Required to call process_with_pitch(). Defaults to False to avoid
         downloading the extra weights file unless pitch detection is needed.
+
+    Notes
+    -----
+    own/opp and goalkeeper team labels emitted here are NOT kit-grounded: the
+    ``sports`` classifier assigns an arbitrary cluster index per track, and
+    goalkeepers go through the same outfield kit classifier so their team may be
+    wrong. The canonical grounded path is ``pipeline.analyze_video(..., own_kit=...)``
+    (or ``python -m soccer_vision.hygiene``), which runs ``hygiene.assign_goalkeepers``
+    positionally and ``hygiene.map_own_cluster`` against the kit hint.
     """
 
     name: Final = "roboflow-sports"

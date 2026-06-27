@@ -5,6 +5,12 @@ unit-testable (the lesson of anchor_cov, which shipped untested and gave a false
 pass). Errors are reported in real-world FEET: x and y are each normalized to [0,1]
 independently (x = fraction of width, y = fraction of length), so each axis must be
 scaled separately before computing the Euclidean norm.
+
+SCOPE: every score here is over GT-VISIBLE (in-frame) landmarks only, so the headline
+accurate_coverage is "match-the-labeler within the visible region", not whole-field
+truth — the eval is structurally blind to off-frame "lines in the sky". FrameScore.
+model_in_frame / EvalReport.model_in_frame_median add a cheap GT-independent whole-field
+plausibility signal; SP1's held-out cross-end validation is the real whole-field bound.
 """
 
 from __future__ import annotations
@@ -44,6 +50,33 @@ def _apply_h(h: NDArray[np.floating], pts_px: NDArray[np.floating]) -> NDArray[n
     homog = np.column_stack([pts, np.ones(len(pts))])
     proj = homog @ np.asarray(h, dtype=np.float64).T
     return np.asarray(proj[:, :2] / proj[:, 2:3], dtype=np.float64)
+
+
+def _model_in_frame_count(
+    model_kpts: NDArray[np.floating] | None,
+    frame_size: tuple[int, int],
+    *,
+    conf_thr: float,
+) -> int:
+    """Whole-field plausibility signal: of the 20 scorable landmarks (21 minus the
+    hidden under-camera idx), how many does the MODEL place sanely — confident
+    (conf >= conf_thr) AND at an in-frame pixel — computed from model_kpts alone,
+    independent of GT visibility. The cheapest signal for the "lines in the sky"
+    failure the GT-visible-only scorer is structurally blind to. (A rigorous
+    alternative, when a fitted model homography is available, is
+    fold_count(inv(model_h), frame_size) from calib/validate.py — the gate SP1 uses.)
+    """
+    if model_kpts is None:
+        return 0
+    w, h = frame_size
+    count = 0
+    for i in range(len(PITCH_LANDMARKS)):
+        if i == HIDDEN_IDX:
+            continue
+        x, y, c = float(model_kpts[i, 0]), float(model_kpts[i, 1]), float(model_kpts[i, 2])
+        if c >= conf_thr and 0.0 <= x <= w and 0.0 <= y <= h:
+            count += 1
+    return count
 
 
 def keypoint_errors_feet(
@@ -124,19 +157,24 @@ class FrameScore:
     gt_visible: list[int]
     predicted: list[int]
     matches: bool
+    model_in_frame: int = 0        # whole-field signal: scorable landmarks the model
+    #                                places confidently in-frame (GT-independent)
 
 
 @dataclass
 class EvalReport:
     n_frames: int                  # scored frames (excludes degenerate GT)
     n_matched: int
-    accurate_coverage: float       # n_matched / n_frames  (the headline)
+    accurate_coverage: float       # n_matched/n_frames — "match-the-labeler within the
+    #                                GT-VISIBLE region", NOT whole-field accuracy (see
+    #                                model_in_frame_median + SP1 held-out validation)
     keypoint_feet_median: float | None
     keypoint_feet_p90: float | None
     reproj_feet_median: float | None
     reproj_feet_p90: float | None
     per_landmark: dict[int, dict[str, float]]  # idx -> {median, p90, detect_rate}
     n_excluded_degenerate: int
+    model_in_frame_median: float | None = None  # whole-field plausibility (GT-independent)
 
 
 def score_frame(
@@ -161,7 +199,7 @@ def score_frame(
                   if i != HIDDEN_IDX and gt_kpts[i, 2] > 0]
 
     if model_kpts is None:
-        return FrameScore(frame, {}, None, None, gt_visible, [], False)
+        return FrameScore(frame, {}, None, None, gt_visible, [], False, model_in_frame=0)
 
     errs = keypoint_errors_feet(h_gt, gt_kpts, model_kpts, conf_thr=conf_thr,
                                 length_ft=length_ft, aspect_ratio=aspect_ratio)
@@ -182,7 +220,9 @@ def score_frame(
 
     matches = (median_feet is not None and len(errs) >= min_match_keypoints
                and median_feet <= match_threshold_feet)
-    return FrameScore(frame, errs, median_feet, reproj_feet, gt_visible, predicted, matches)
+    model_in_frame = _model_in_frame_count(model_kpts, frame_size, conf_thr=conf_thr)
+    return FrameScore(frame, errs, median_feet, reproj_feet, gt_visible, predicted, matches,
+                      model_in_frame=model_in_frame)
 
 
 def score_by_split(
@@ -245,6 +285,7 @@ def score_benchmark(
 
     n = len(scores)
     n_matched = sum(s.matches for s in scores)
+    in_frame_counts = [s.model_in_frame for s in scores]
     kp_all = [v for s in scores for v in s.per_kp_feet.values()]
     reproj_all = [s.reproj_feet for s in scores if s.reproj_feet is not None]
 
@@ -276,4 +317,5 @@ def score_benchmark(
         reproj_feet_p90=_p90(reproj_all),
         per_landmark=per_landmark,
         n_excluded_degenerate=n_excluded,
+        model_in_frame_median=float(np.median(in_frame_counts)) if in_frame_counts else None,
     )

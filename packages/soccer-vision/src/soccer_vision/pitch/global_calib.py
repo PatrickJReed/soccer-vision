@@ -387,7 +387,14 @@ def two_ended_segments(
 
 def fold_of_norm(h_norm: NDArray[np.floating] | None, size: tuple[int, int]) -> int:
     """fold_count for a NORMALIZED image->pitch homography (converts to the pitch->pixel
-    form fold_count expects). 0 if h_norm is None or singular."""
+    form fold_count expects). 0 if h_norm is None or singular.
+
+    A homography is defined only up to sign (H and -H are the same projective map); the
+    bundle solve can land on the negative-sign representation, under which fold_count's
+    cheirality check (wz > 0) would reject EVERY point and report 0. Normalize the sign so
+    the field centre maps with positive homogeneous w before counting, so fold is correct
+    under either representation.
+    """
     if h_norm is None:
         return 0
     w, h = size
@@ -396,6 +403,8 @@ def fold_of_norm(h_norm: NDArray[np.floating] | None, size: tuple[int, int]) -> 
         h_pitch_to_px = np.linalg.inv(h_px)
     except np.linalg.LinAlgError:
         return 0
+    if float((h_pitch_to_px @ np.array([0.5, 0.5, 1.0]))[2]) < 0:
+        h_pitch_to_px = -h_pitch_to_px
     return fold_count(h_pitch_to_px, size)
 
 

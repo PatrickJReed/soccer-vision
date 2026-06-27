@@ -177,6 +177,20 @@ def test_fold_of_norm_counts_in_frame_landmarks() -> None:
     assert 0 <= fold <= len(PITCH_LANDMARKS)
 
 
+def test_fold_of_norm_is_sign_invariant() -> None:
+    # A homography is defined up to sign (H and -H are the same projective map); the bundle
+    # solve can return the negative-sign representation. fold_count's wz>0 cheirality check
+    # would then reject every point and report 0. fold_of_norm must normalize the sign so the
+    # count is identical for H and -H (regression for the real-data all-frames-red gate bug).
+    clicks, transforms, segment_of, *_ = _build_session()
+    h = solve_global(clicks, transforms, segment_of, SIZE).frame_homography(0)
+    assert h is not None
+    pos = fold_of_norm(h, SIZE)
+    neg = fold_of_norm(-h, SIZE)
+    assert pos > 0
+    assert neg == pos
+
+
 def test_frame_status_green_yellow_red() -> None:
     clicks, transforms, segment_of, *_ = _build_session()
     gc = solve_global(clicks, transforms, segment_of, SIZE)

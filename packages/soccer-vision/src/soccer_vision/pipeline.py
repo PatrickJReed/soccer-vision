@@ -65,6 +65,7 @@ def assemble_phases(
     filter_margin: float = 0.05,
     possession_thresholds: PossessionThresholds | None = None,
     transition_seconds: float = 5.0,
+    halftime_frame: int | None = None,
 ) -> PipelineResult:
     """Run the full pitch + phase chain on tracker output. Pure; no I/O.
 
@@ -104,7 +105,10 @@ def assemble_phases(
     ball_x_full = ball_by_frame["x_pitch"].reindex(full_index)
     ball_y_full = ball_by_frame["y_pitch"].reindex(full_index)
 
-    phase_series = label_phase(poss_full, ball_y_full, fps, transition_seconds=transition_seconds)
+    phase_series = label_phase(
+        poss_full, ball_y_full, fps,
+        transition_seconds=transition_seconds, halftime_frame=halftime_frame,
+    )
 
     valid = {f: e for f, e in h_entries.items() if 0 <= f < total_frames}
     src = pd.Series("none", index=full_index)

@@ -84,3 +84,37 @@ def test_no_false_turnover_when_committed_label_unchanged() -> None:
     phases = label_phase(states, ball_y, fps=30.0, transition_seconds=1.0)
     assert "transition" not in set(phases.to_numpy())
     assert phases.loc[12] == "loose_ball"
+
+
+def test_halftime_flip_inverts_thirds_for_own_possession() -> None:
+    """Same own possession + ball_y=0.2 throughout: build before halftime,
+    attack after (the teams switched ends, so canonical y is now reflected)."""
+    states = pd.Series(["own"] * 20, index=range(20))
+    ball_y = pd.Series([0.2] * 20, index=range(20))
+    phases = label_phase(states, ball_y, fps=30.0, halftime_frame=10)
+    assert phases.loc[5] == "build"     # y=0.2 < 0.333
+    assert phases.loc[15] == "attack"   # reflected y=0.8 >= 0.333
+
+
+def test_halftime_flip_inverts_defend_for_opp_possession() -> None:
+    states = pd.Series(["opp"] * 20, index=range(20))
+    ball_y = pd.Series([0.2] * 20, index=range(20))
+    phases = label_phase(states, ball_y, fps=30.0, halftime_frame=10)
+    assert phases.loc[5] == "defend_low"     # y=0.2 < 0.667
+    assert phases.loc[15] == "defend_high"   # reflected y=0.8 > 0.667
+
+
+def test_halftime_none_is_unchanged() -> None:
+    """Default (single-half clip): no flip, today's labels reproduced."""
+    states = pd.Series(["own"] * 20, index=range(20))
+    ball_y = pd.Series([0.2] * 20, index=range(20))
+    phases = label_phase(states, ball_y, fps=30.0)  # halftime_frame defaults to None
+    assert set(phases.to_numpy()) == {"build"}
+
+
+def test_halftime_flip_preserves_nan_as_unknown() -> None:
+    """A NaN ball_y stays NaN through the reflection -> 'unknown' (no 1-NaN bug)."""
+    states = pd.Series(["own", "own"], index=[0, 1])
+    ball_y = pd.Series([0.2, float("nan")], index=[0, 1])
+    phases = label_phase(states, ball_y, fps=30.0, halftime_frame=1)
+    assert phases.loc[1] == "unknown"

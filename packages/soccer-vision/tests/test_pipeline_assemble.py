@@ -41,7 +41,8 @@ def _scene() -> pd.DataFrame:
     # opp player track 101: opp end, always "opp"
     for f in range(3):
         rows.append(_det(f, 101, 0.50, 0.85, "player", "opp"))
-    # ball: f0 near own (build), f1 mid loose, f2 near opp (defend_high)
+    # ball: f0 near own (build), f1 mid loose, f2 near opp (defend_high underlying,
+    # but overlaid as transition: own->loose->opp is a committed own->opp turnover).
     rows.append(_det(0, -1, 0.50, 0.27, "ball", "unknown"))
     rows.append(_det(1, -2, 0.50, 0.55, "ball", "unknown"))
     rows.append(_det(2, -3, 0.50, 0.80, "ball", "unknown"))
@@ -73,7 +74,11 @@ def test_assemble_phases_end_to_end() -> None:
     assert phases.loc[1, "possession_state"] == "loose_ball"
     assert phases.loc[1, "phase"] == "loose_ball"
     assert phases.loc[2, "possession_state"] == "opp"
-    assert phases.loc[2, "phase"] == "defend_high"
+    # §3.3 corrected turnover: own (f0) -> loose_ball (f1) -> opp (f2) is a change of
+    # the last COMMITTED label, so f2 starts the transition window (overlaying the
+    # underlying defend_high). possession_state stays "opp" (above) — only the phase
+    # sub-label is overlaid. (Was "defend_high" under the old direct-adjacency logic.)
+    assert phases.loc[2, "phase"] == "transition"
     # Coverage stats.
     assert result.homography_coverage == 1.0
     assert result.ball_coverage == 1.0
@@ -182,3 +187,24 @@ def test_assemble_phases_legacy_path_marks_anchors() -> None:
     assert set(ph["homography_source"]) <= {"anchor", "none"}
     assert result.propagated_coverage == 0.0
     assert result.anchor_coverage == 1.0   # all 3 frames are landmark anchors in the fixture
+
+
+def test_assemble_phases_halftime_frame_flips_second_half() -> None:
+    """own possession + ball in own third throughout: build before halftime,
+    attack after; default (no kwarg) leaves it build."""
+    rows = []
+    for f in range(4):
+        rows.append(_det(f, 1, 0.50, 0.20, "player", "own"))      # own player by ball
+        rows.append(_det(f, 101, 0.50, 0.95, "player", "opp"))    # opp far away
+        rows.append(_det(f, -1 - f, 0.50, 0.22, "ball", "unknown"))  # ball in own third
+    traj = pd.DataFrame(rows).astype({"frame": "int64", "track_id": "int64"})
+    kp = _identity_keypoints(4)
+
+    flipped = assemble_phases(traj, kp, fps=FPS, total_frames=4, halftime_frame=2)
+    fp = flipped.phases.set_index("frame")
+    assert fp.loc[0, "phase"] == "build"     # before halftime
+    assert fp.loc[2, "phase"] == "attack"    # reflected y=0.78 -> opp 2/3
+    assert set(fp["possession_state"]) == {"own"}  # possession unchanged by the flip
+
+    default = assemble_phases(traj, kp, fps=FPS, total_frames=4)
+    assert default.phases.set_index("frame").loc[2, "phase"] == "build"

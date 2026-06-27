@@ -17,6 +17,7 @@ def label_phase(
     ball_y_pitch: pd.Series,
     fps: float,
     transition_seconds: float = 5.0,
+    halftime_frame: int | None = None,
 ) -> pd.Series:
     """Combine per-frame possession state + ball y-coord into a phase label.
 
@@ -30,6 +31,12 @@ def label_phase(
         Frame rate; used to size the transition window in frames.
     transition_seconds
         Window after each possession change labeled 'transition'.
+    halftime_frame
+        Manual half-time frame (None = single-half clip, no flip). For frames at
+        or after it, the thirds-mapping y is reflected (y -> 1-y) so "own goal at
+        y=0" holds in both halves after the teams switch ends. Only the phase
+        sub-labels are direction-dependent; possession_state and the homography
+        are NOT (so they are unaffected). NaN stays NaN through the reflection.
 
     Returns
     -------
@@ -48,13 +55,21 @@ def label_phase(
     is_turnover = committed.ne(prev_committed) & committed.notna() & prev_committed.notna()
     turnover_frames = frames[is_turnover.to_numpy()]
 
+    # Attack-direction normalization: reflect the thirds-mapping y for the second
+    # half so build<->attack and defend_low<->defend_high are correct after the
+    # teams switch ends. 1.0 - NaN is NaN, so missing-ball frames stay 'unknown'.
+    eff_ball_y = ball_y_pitch
+    if halftime_frame is not None:
+        flip = ball_y_pitch.index >= halftime_frame
+        eff_ball_y = ball_y_pitch.mask(flip, 1.0 - ball_y_pitch)
+
     phases = pd.Series("unknown", index=frames)
     for fi in frames:
         st = possession_state.loc[fi]
         if st in ("contested", "loose_ball", "unknown"):
             phases.loc[fi] = st
             continue
-        by = ball_y_pitch.loc[fi] if fi in ball_y_pitch.index else float("nan")
+        by = eff_ball_y.loc[fi] if fi in eff_ball_y.index else float("nan")
         if pd.isna(by):
             phases.loc[fi] = "unknown"
             continue

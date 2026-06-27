@@ -1,4 +1,10 @@
-"""5-state per-frame possession classifier (own/opp/contested/loose_ball/unknown)."""
+"""5-state per-frame possession classifier (own/opp/contested/loose_ball/unknown).
+
+Distances are isotropic length-normalized pitch units (x_len = x_pitch /
+aspect_ratio, y_len = y_pitch), the same convention hygiene/core.py uses, via
+the shared pitch.spec.length_norm_xy helper. The §3.3 thresholds are already in
+pitch-LENGTH units, so only the metric they apply to is corrected.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +14,8 @@ from typing import Literal, cast
 
 import numpy as np
 import pandas as pd
+
+from soccer_vision.pitch.spec import PitchSpec, length_norm_xy
 
 PossessionState = Literal["own", "opp", "contested", "loose_ball", "unknown"]
 
@@ -24,12 +32,19 @@ class PossessionThresholds:
 def classify_possession(
     detections: pd.DataFrame,
     thresholds: PossessionThresholds | None = None,
+    pitch_spec: PitchSpec | None = None,
 ) -> pd.Series:
     """Classify possession state for each frame in `detections`.
+
+    Distances are length-normalized (isotropic pitch-LENGTH units) via the
+    aspect_ratio of `pitch_spec` (default 9v9). The ball used per frame is the
+    single highest-confidence ball detection (multiple low-conf balls are
+    possible at the conf floor); the same ball the pipeline uses for phase.
 
     Returns a pd.Series indexed by frame, values from PossessionState literals.
     """
     th = thresholds or PossessionThresholds()
+    spec = pitch_spec or PitchSpec.standard_9v9()
     states: dict[int, PossessionState] = {}
 
     for frame_idx, group in detections.groupby("frame", sort=False):
@@ -38,8 +53,9 @@ def classify_possession(
         if ball_rows.empty:
             states[fkey] = "unknown"
             continue
-        bx = ball_rows["x_pitch"].iloc[0]
-        by = ball_rows["y_pitch"].iloc[0]
+        ball = ball_rows.loc[ball_rows["conf"].idxmax()]  # atomic highest-conf row
+        bx = ball["x_pitch"]
+        by = ball["y_pitch"]
         if pd.isna(bx) or pd.isna(by):
             states[fkey] = "unknown"
             continue
@@ -49,9 +65,11 @@ def classify_possession(
             states[fkey] = "unknown"
             continue
 
-        dx = players["x_pitch"].to_numpy() - bx
-        dy = players["y_pitch"].to_numpy() - by
-        dists = np.sqrt(dx * dx + dy * dy)
+        px_n, py_n = length_norm_xy(
+            players["x_pitch"].to_numpy(), players["y_pitch"].to_numpy(), spec
+        )
+        bx_n, by_n = length_norm_xy(float(bx), float(by), spec)
+        dists = np.hypot(px_n - bx_n, py_n - by_n)  # isotropic pitch-LENGTH units
         teams = players["team"].to_numpy()
 
         own_mask = teams == "own"

@@ -26,6 +26,11 @@ def main() -> None:
     res = possession_agreement(gt, phases)
     print(f"compared frames (both attribute a team): {res.n_compared}")
     print(f"agreement: {res.agreement * 100:.1f}%   (target >= 80%)")
+    print(
+        f"committed {res.n_compared}/{res.n_gt_team} GT-team frames "
+        f"({res.pred_commit_rate * 100:.1f}%); "
+        f"contested/loose share {res.pred_contested_frac * 100:.1f}%"
+    )
     if res.disagreements:
         print("disagreement spans (t_start..t_end  gt -> pred):")
         for t0, t1, g, p in res.disagreements:

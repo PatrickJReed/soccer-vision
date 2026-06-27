@@ -1,5 +1,8 @@
 """Export labeler-generated homographies into a YOLOv8-pose training dataset.
 
+DEFERRED ML — feeds the pitch-keypoint fine-tune flywheel, which is deferred (no live
+v1 consumer; only tests + the finetune notebook). Kept, not cancelled.
+
 Converts N games' (video, homographies.parquet) pairs into one combined
 dataset: images/{train,val}, labels/{train,val}, a complete data.yaml
 (kpt_shape + flip_idx from pitch.landmarks), and per-game QA contact sheets

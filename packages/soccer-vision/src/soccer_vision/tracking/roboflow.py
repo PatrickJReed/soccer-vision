@@ -269,9 +269,12 @@ class RoboflowBackend:
         interpolation of the ball position. Defaults to 15 (~0.5s at 30fps).
         Longer gaps are left as holes (sustained losses, not flicker).
     pitch_weights_path:
-        Optional path to a fine-tuned pitch keypoint detector weights file (.pt).
-        When provided, this model is used instead of the default pitch detector.
-        If the path does not exist, raises FileNotFoundError.
+        Optional opt-in override: path to a custom pitch-keypoint detector (.pt). When
+        None (default), the v1 path loads the registry pitch model (WEIGHTS["pitch"]);
+        no CALLER-supplied weights are loaded unless this is set. analyze_video builds
+        RoboflowBackend(detect_pitch=True) WITHOUT this, so the v1 deliverable never
+        depends on a caller-supplied finetune. If a path is given but does not exist,
+        raises FileNotFoundError.
     detect_pitch:
         When True, download and load the pitch keypoint detection model.
         Required to call process_with_pitch(). Defaults to False to avoid

@@ -1,5 +1,10 @@
 """Pure metrics for scoring the pitch-keypoint model against labeler ground truth.
 
+DEFERRED ML — scores a pitch-keypoint MODEL that is not on the v1 path; the labeler is
+the per-game homography source. Kept for the ML flywheel (deferred, not cancelled). NOTE
+the autolabel.project_landmarks this module depends on (score_frame) IS still live (used
+by eval and viz) — do not delete it as orphaned.
+
 Everything here is numpy in / dataclass out, no I/O — so the eval logic itself is
 unit-testable (the lesson of anchor_cov, which shipped untested and gave a false
 pass). Errors are reported in real-world FEET: x and y are each normalized to [0,1]

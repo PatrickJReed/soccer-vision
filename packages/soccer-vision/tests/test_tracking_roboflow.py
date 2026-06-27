@@ -157,3 +157,194 @@ def test_version_is_not_stale_date_marker() -> None:
     assert re.fullmatch(r"[0-9a-f]{7,40}|v\d+\.\d+(\.\d+)?|UNPINNED", v), (
         f"version {v!r} must be a SHA, a vX.Y tag, or the UNPINNED sentinel"
     )
+
+
+@dataclass
+class _Canned:
+    """Handle returned by _install_canned: live counters/captures for assertions."""
+
+    decode_count: int = 0
+    bytetrack_kwargs: dict[str, Any] = field(default_factory=dict)
+
+
+def _install_canned(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    n_frames: int = 5,
+    n_balls: int = 1,
+    ball_confs: tuple[float, ...] = (0.9,),
+) -> _Canned:
+    """Inject fake supervision/ultralytics/torch/sports modules into sys.modules so the
+    lazily-imported heavy path of _run_pipeline runs with no GPU/weights. Player model
+    emits player(cls2)/GK(cls1)/referee(cls3); ball model emits n_balls; pitch model emits
+    1 instance x 3 keypoints. Returns a handle counting video decodes + ByteTrack kwargs."""
+    handle = _Canned()
+    height, width = 720, 1280
+
+    class FakeDetections:
+        def __init__(self, xyxy: Any, class_id: Any,
+                     confidence: Any = None, tracker_id: Any = None) -> None:
+            self.xyxy = np.asarray(xyxy, dtype=np.float64).reshape(-1, 4)
+            self.class_id = np.asarray(class_id, dtype=np.int64)
+            self.confidence = None if confidence is None else np.asarray(confidence, dtype=np.float64)
+            self.tracker_id = None if tracker_id is None else np.asarray(tracker_id, dtype=np.int64)
+
+        def __len__(self) -> int:
+            return len(self.xyxy)
+
+        def __getitem__(self, mask: Any) -> FakeDetections:
+            m = np.asarray(mask)
+            return FakeDetections(
+                self.xyxy[m], self.class_id[m],
+                None if self.confidence is None else self.confidence[m],
+                None if self.tracker_id is None else self.tracker_id[m],
+            )
+
+        @classmethod
+        def from_ultralytics(cls, result: Any) -> FakeDetections:
+            return result.detections  # type: ignore[no-any-return]
+
+    class FakeKeyPoints:
+        def __init__(self, xy: Any, confidence: Any = None) -> None:
+            self.xy = np.asarray(xy, dtype=np.float64)
+            self.confidence = None if confidence is None else np.asarray(confidence, dtype=np.float64)
+
+        def __len__(self) -> int:
+            return int(self.xy.shape[0])
+
+        @classmethod
+        def from_ultralytics(cls, result: Any) -> FakeKeyPoints:
+            return result.keypoints  # type: ignore[no-any-return]
+
+    class FakeByteTrack:
+        def __init__(self, **kwargs: Any) -> None:
+            handle.bytetrack_kwargs = dict(kwargs)
+
+        def update_with_detections(self, dets: FakeDetections) -> FakeDetections:
+            n = len(dets)
+            return FakeDetections(
+                dets.xyxy, dets.class_id, dets.confidence,
+                tracker_id=np.arange(1, n + 1, dtype=np.int64),
+            )
+
+    def get_video_frames_generator(source_path: str) -> Any:
+        handle.decode_count += 1
+
+        def _gen() -> Any:
+            for _ in range(n_frames):
+                yield np.zeros((height, width, 3), dtype=np.uint8)
+
+        return _gen()
+
+    class _PlayerResult:
+        detections = FakeDetections(
+            xyxy=[[100, 200, 140, 300], [400, 200, 440, 300], [700, 200, 720, 300]],
+            class_id=[2, 1, 3], confidence=[0.8, 0.7, 0.6])
+
+    class _BallResult:
+        detections = FakeDetections(
+            xyxy=[[600 + 10 * i, 350, 610 + 10 * i, 360] for i in range(n_balls)],
+            class_id=[0] * n_balls, confidence=list(ball_confs))
+
+    class _PitchResult:
+        keypoints = FakeKeyPoints(xy=[[[10, 20], [30, 40], [50, 60]]],
+                                  confidence=[[0.9, 0.8, 0.7]])
+
+    class FakeYOLO:
+        def __init__(self, path: str) -> None:
+            p = str(path).upper()
+            self._role = "ball" if "BALL" in p else "pitch" if "PITCH" in p else "player"
+
+        def to(self, device: str | None = None) -> FakeYOLO:
+            return self
+
+        def __call__(self, frame: Any, **kwargs: Any) -> list[Any]:
+            if self._role == "ball":
+                return [_BallResult()]
+            if self._role == "pitch":
+                return [_PitchResult()]
+            return [_PlayerResult()]
+
+    class FakeTeamClassifier:
+        def __init__(self, device: str | None = None) -> None:
+            pass
+
+        def fit(self, crops: Any) -> None:
+            pass
+
+        def predict(self, crops: Any) -> list[int]:
+            return [0] * len(crops)  # cluster 0 -> "own" via _CLUSTER_TEAM
+
+    def _module(name: str, **attrs: Any) -> types.ModuleType:
+        # Non-literal attr key -> no ruff B010; setattr (not `mod.x =`) -> no mypy attr-defined.
+        mod = types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(mod, key, value)
+        return mod
+
+    team_mod = _module("sports.common.team", TeamClassifier=FakeTeamClassifier)
+    common_mod = _module("sports.common", team=team_mod)
+    sports_mod = _module("sports", common=common_mod)
+    modules: list[tuple[str, types.ModuleType]] = [
+        ("supervision", _module(
+            "supervision", Detections=FakeDetections, KeyPoints=FakeKeyPoints,
+            ByteTrack=FakeByteTrack, get_video_frames_generator=get_video_frames_generator)),
+        ("ultralytics", _module("ultralytics", YOLO=FakeYOLO)),
+        ("torch", _module(
+            "torch",
+            cuda=types.SimpleNamespace(is_available=lambda: False),
+            backends=types.SimpleNamespace(
+                mps=types.SimpleNamespace(is_available=lambda: False)))),
+        ("sports", sports_mod),
+        ("sports.common", common_mod),
+        ("sports.common.team", team_mod),
+    ]
+    for name, mod in modules:
+        monkeypatch.setitem(sys.modules, name, mod)
+    return handle
+
+
+def _run_canned(
+    monkeypatch: pytest.MonkeyPatch, tiny_video: Path, **kw: Any
+) -> tuple[Any, Any, _Canned, RoboflowBackend]:
+    handle = _install_canned(monkeypatch, **kw)
+    backend = RoboflowBackend(device="cpu", detect_pitch=True)
+    monkeypatch.setattr(
+        backend, "_download_weights",
+        lambda: {"player": Path("PLAYER.pt"), "ball": Path("BALL.pt"), "pitch": Path("PITCH.pt")},
+    )
+    df, kp_df = backend._run_pipeline(tiny_video, emit_keypoints=True)
+    return df, kp_df, handle, backend
+
+
+def test_run_pipeline_core_with_canned_models(
+    monkeypatch: pytest.MonkeyPatch, tiny_video: Path
+) -> None:
+    df, kp_df, _handle, _backend = _run_canned(monkeypatch, tiny_video)
+    validate_trajectories(df)
+
+    f0 = df[df["frame"] == 0]
+    player = f0[f0["class"] == "player"].iloc[0]
+    gk = f0[f0["class"] == "goalkeeper"].iloc[0]
+    ball = f0[f0["class"] == "ball"].iloc[0]
+    ref = f0[f0["class"] == "referee"].iloc[0]
+
+    # foot point: x = bbox centre, y = bbox bottom
+    assert player["x_px"] == 120.0 and player["y_px"] == 300.0
+    assert gk["x_px"] == 420.0 and gk["y_px"] == 300.0
+    # ball centre
+    assert ball["x_px"] == 605.0 and ball["y_px"] == 355.0
+    # class mapping (_CLS_NAME) + referee team from class
+    assert ref["team"] == "ref"
+    # per-track team-map applied to player/GK (cluster 0 -> own)
+    assert player["team"] == "own" and gk["team"] == "own"
+    # synthetic ball id = _BALL_TRACK_ID_BASE - frame_idx
+    from soccer_vision.tracking.roboflow import _BALL_TRACK_ID_BASE
+    assert int(ball["track_id"]) == _BALL_TRACK_ID_BASE - 0
+
+    # keypoint reshape: 1 instance x 3 keypoints per frame
+    kp0 = kp_df[kp_df["frame"] == 0].sort_values("kp_idx")
+    assert list(kp0["kp_idx"]) == [0, 1, 2]
+    assert list(kp0["x_px"]) == [10.0, 30.0, 50.0]
+    assert list(kp0["y_px"]) == [20.0, 40.0, 60.0]
+    assert kp0.iloc[0]["conf"] == 0.9

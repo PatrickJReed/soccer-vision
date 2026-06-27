@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import os
 from collections.abc import Mapping
-from multiprocessing import Pool
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -92,7 +92,7 @@ def _video_hash(video_path: Path) -> str:
 def _chain_worker(
     args: tuple[str, int, int, float],
 ) -> dict[int, NDArray[np.float64]]:
-    """Register pairs [start, end) of one video chunk (runs in a subprocess)."""
+    """Register pairs [start, end) of one video chunk (runs in a worker thread)."""
     video_path, start, end, downscale = args
     cap = cv2.VideoCapture(video_path)
     pos = 0
@@ -190,10 +190,13 @@ def compute_chain(
             for i in range(n_workers)
             if bounds[i] < bounds[i + 1]
         ]
-        # A worker exception aborts the whole precompute (no partial cache is
-        # written) — rerun after fixing the video; completed chunks are not kept.
-        with Pool(processes=len(jobs)) as pool:
-            for part in pool.imap_unordered(_chain_worker, jobs):
+        # Threads, not processes: each chunk's work is OpenCV/ORB + numpy, which release
+        # the GIL, so we get real parallelism without the macOS spawn-method pickling
+        # hang that forced the `--workers 1` workaround. Each _chain_worker opens its own
+        # cv2.VideoCapture, so there is no shared-capture contention. A worker exception
+        # aborts the whole precompute (no partial cache is written).
+        with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+            for part in ex.map(_chain_worker, jobs):
                 interframe_px.update(part)
                 print(f"chain: {len(interframe_px)}/{n_pairs} pairs registered")
 

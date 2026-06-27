@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.optimize import least_squares  # type: ignore[import-untyped]
 
 from soccer_vision.calib.validate import fold_count
 from soccer_vision.pitch.homography import HomographyError, fit_homography
@@ -136,6 +137,180 @@ def solve_global(
     return GlobalCalib(h_by_seg, offsets, dict(segment_of), rms_by_seg, n_by_seg)
 
 
+# --- Field-anchored bundle adjustment -------------------------------------------------
+# Model: H_f = H_g @ A_f @ M[f].  M[f] = transforms[f] is the (drift-prone) chain
+# transform frame -> segment-reference; A_f is a per-clicked-frame 6-DOF AFFINE
+# correction in REFERENCE space that absorbs the chain's long-span drift; H_g is one
+# global reference -> pitch[0,1] homography per segment. H_g (8 dof) and every A_f are
+# fit jointly to all of a segment's clicks (reprojection error in pitch units), with each
+# A_f regularized toward identity. For an unclicked frame, A is linearly interpolated
+# between the segment's bracketing clicked frames. This corrects the chain drift that the
+# translation-only solve_global inherits over the wide own->opp pan (the case that fails
+# the cross-end holdout). Validated prototype: in-sample ~2.6 ft, leave-one-out 4.58 ft.
+
+_AFFINE_DOF = 6
+_AFFINE_ID: tuple[float, ...] = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+
+
+def _affine_from(p: NDArray[np.floating]) -> NDArray[np.float64]:
+    """6 affine params [a, b, tx, c, d, ty] -> 3x3 affine matrix."""
+    return np.array([[p[0], p[1], p[2]],
+                     [p[3], p[4], p[5]],
+                     [0.0, 0.0, 1.0]], dtype=np.float64)
+
+
+def _interp_affine_params(
+    a_params: Mapping[int, NDArray[np.floating]], frame: int
+) -> NDArray[np.float64]:
+    """Affine params at `frame`, linearly interpolated between bracketing clicked frames
+    (nearest clicked frame if outside the clicked range; identity if there are none)."""
+    if not a_params:
+        return np.array(_AFFINE_ID, dtype=np.float64)
+    if frame in a_params:
+        return np.asarray(a_params[frame], dtype=np.float64)
+    frames = sorted(a_params)
+    lo = [g for g in frames if g < frame]
+    hi = [g for g in frames if g > frame]
+    if not lo:
+        return np.asarray(a_params[hi[0]], dtype=np.float64)
+    if not hi:
+        return np.asarray(a_params[lo[-1]], dtype=np.float64)
+    a, b = lo[-1], hi[0]
+    t = (frame - a) / (b - a)
+    return np.asarray(
+        (1 - t) * np.asarray(a_params[a], dtype=np.float64)
+        + t * np.asarray(a_params[b], dtype=np.float64),
+        dtype=np.float64,
+    )
+
+
+@dataclass(frozen=True, eq=False)
+class BundleCalib:
+    """Field-anchored bundle result: per-segment global homography H_g + per-clicked-frame
+    affine corrections A_f, plus the chain transforms needed to build a per-frame
+    H_f = H_g @ A_interp @ M[frame]."""
+
+    h_by_segment: dict[int, NDArray[np.float64]]                    # seg -> H_g (norm ref -> pitch)
+    a_params_by_segment: dict[int, dict[int, NDArray[np.float64]]]  # seg -> {clicked frame -> 6 params}
+    segment_of: dict[int, int]
+    transforms: dict[int, NDArray[np.float64]]                      # frame -> M[frame] (frame -> ref)
+
+    def frame_homography(self, frame: int) -> NDArray[np.float64] | None:
+        """Normalized image_frame -> pitch[0,1] homography H_g @ A_interp @ M[frame], or
+        None if the frame's segment was not calibrated / it has no chain transform. A is
+        linearly interpolated between the segment's bracketing clicked frames."""
+        seg = self.segment_of.get(frame)
+        if seg is None or seg not in self.h_by_segment:
+            return None
+        m = self.transforms.get(frame)
+        if m is None:
+            return None
+        params = _interp_affine_params(self.a_params_by_segment.get(seg, {}), frame)
+        a = _affine_from(params)
+        return np.asarray(
+            self.h_by_segment[seg] @ a @ np.asarray(m, dtype=np.float64), dtype=np.float64
+        )
+
+
+def _seed_hg(
+    seg_clicks: Sequence[Click], transforms: Mapping[int, NDArray[np.floating]]
+) -> NDArray[np.float64] | None:
+    """Seed H_g: lift every click to reference space via its FULL chain transform M[f]
+    (not just the translation) and fit one ref -> pitch homography (RANSAC, pitch-unit
+    threshold). None if degenerate."""
+    img: list[NDArray[np.float64]] = []
+    pitch: list[NDArray[np.float64]] = []
+    for c in seg_clicks:
+        m = np.asarray(transforms[c.frame], dtype=np.float64)
+        lifted = m @ np.array([c.x, c.y, 1.0])
+        img.append(lifted[:2] / lifted[2])
+        pitch.append(PITCH_LANDMARKS[c.kp_idx])
+    try:
+        h = fit_homography(
+            np.asarray(img, dtype=np.float64), np.asarray(pitch, dtype=np.float64),
+            ransac_thresh=0.05,
+        )
+    except HomographyError:
+        return None
+    return np.asarray(h, dtype=np.float64)
+
+
+def _solve_segment(
+    seg_clicks: Sequence[Click],
+    transforms: Mapping[int, NDArray[np.floating]],
+    lam: float,
+) -> tuple[NDArray[np.float64], dict[int, NDArray[np.float64]]] | None:
+    """Fit one segment's H_g (8 dof) + a per-clicked-frame affine A_f, jointly minimizing
+    click reprojection error (pitch units) + lam*(A_f - I). Returns (H_g, {frame: params})
+    or None if the seed homography is degenerate. Ports the prototype's least_squares."""
+    frames = sorted({c.frame for c in seg_clicks})
+    fidx = {f: i for i, f in enumerate(frames)}
+    hg0 = _seed_hg(seg_clicks, transforms)
+    if hg0 is None:
+        return None
+    a_id = np.array(_AFFINE_ID, dtype=np.float64)
+    x0 = np.concatenate([hg0.flatten()[:8], np.tile(a_id, len(frames))])
+
+    def slot(x: NDArray[np.float64], f: int) -> NDArray[np.float64]:
+        i = fidx[f]
+        return np.asarray(x[8 + i * _AFFINE_DOF: 8 + (i + 1) * _AFFINE_DOF])
+
+    def resid(x: NDArray[np.float64]) -> NDArray[np.float64]:
+        hg = np.append(x[:8], 1.0).reshape(3, 3)
+        r: list[float] = []
+        for c in seg_clicks:
+            hf = hg @ _affine_from(slot(x, c.frame)) @ np.asarray(
+                transforms[c.frame], dtype=np.float64)
+            q = hf @ np.array([c.x, c.y, 1.0])
+            r.extend((q[:2] / q[2]) - PITCH_LANDMARKS[c.kp_idx])
+        for f in frames:  # regularize each A toward identity
+            r.extend(lam * (slot(x, f) - a_id))
+        return np.asarray(r, dtype=np.float64)
+
+    sol = least_squares(resid, x0, method="lm", max_nfev=4000)
+    hg = np.asarray(np.append(sol.x[:8], 1.0).reshape(3, 3), dtype=np.float64)
+    a_params = {f: np.asarray(slot(sol.x, f), dtype=np.float64).copy() for f in frames}
+    return hg, a_params
+
+
+def solve_bundle(
+    clicks: Sequence[Click],
+    transforms: Mapping[int, NDArray[np.floating]],
+    segment_of: Mapping[int, int],
+    size: tuple[int, int],
+    *,
+    lam: float = 0.01,
+    min_points: int = 4,
+) -> BundleCalib:
+    """Field-anchored bundle adjustment, solved independently per registration segment.
+
+    For each segment, fits one ref -> pitch homography H_g plus a 6-DOF affine A_f per
+    clicked frame, minimizing click reprojection (pitch units) + lam*(A_f - I). The per-
+    frame affine absorbs the chain's long-span drift that solve_global (translation-only)
+    cannot, which is what lets the cross-end held-out accuracy pass. Segments with fewer
+    than `min_points` clicks (or a degenerate seed) are skipped (no H). Pure: no I/O.
+    """
+    by_seg: dict[int, list[Click]] = {}
+    for c in clicks:
+        seg = segment_of.get(c.frame)
+        if seg is None or c.frame not in transforms:
+            continue
+        by_seg.setdefault(seg, []).append(c)
+
+    h_by_seg: dict[int, NDArray[np.float64]] = {}
+    a_by_seg: dict[int, dict[int, NDArray[np.float64]]] = {}
+    for seg, seg_clicks in by_seg.items():
+        if len(seg_clicks) < min_points:
+            continue
+        solved = _solve_segment(seg_clicks, transforms, lam)
+        if solved is None:
+            continue
+        h_by_seg[seg], a_by_seg[seg] = solved
+
+    transforms_f64 = {f: np.asarray(m, dtype=np.float64) for f, m in transforms.items()}
+    return BundleCalib(h_by_seg, a_by_seg, dict(segment_of), transforms_f64)
+
+
 def two_ended_segments(
     clicks: Sequence[Click], segment_of: Mapping[int, int]
 ) -> set[int]:
@@ -209,10 +384,12 @@ def cross_end_holdout(
     length_ft: float = 224.7,
     aspect_ratio: float = 1.5,
 ) -> HoldoutReport | None:
-    """Leave-one-clicked-frame-out validation: for each clicked frame, refit the global
-    homography from the OTHER frames' clicks and measure how far (feet) this frame's
-    clicks land from their canonical pitch coords. Reports overall + per-end medians.
-    None if there are <2 clicked frames. This is the acceptance bar (Task 6)."""
+    """Leave-one-clicked-frame-out validation: for each clicked frame, refit the field-
+    anchored bundle from the OTHER frames' clicks and measure how far (feet) this frame's
+    clicks land from their canonical pitch coords, predicting the held frame via the
+    bundle's interpolated per-frame affine (so the held frame is treated as an unclicked
+    frame). Reports overall + per-end medians. None if there are <2 clicked frames. This
+    is the acceptance bar (Task 6) and reflects the production solve_bundle path."""
     from soccer_vision.eval.pitch_metrics import displacement_to_feet
 
     own = set(OWN_END_IDX)
@@ -228,8 +405,8 @@ def cross_end_holdout(
         held = [c for c in clicks if c.frame == f and c.kp_idx != NEAR_HALFWAY_IDX]
         if not rest or not held:
             continue
-        gc = solve_global(rest, transforms, segment_of, size)
-        h = gc.frame_homography(f)
+        bc = solve_bundle(rest, transforms, segment_of, size)
+        h = bc.frame_homography(f)
         if h is None:
             continue
         for c in held:

@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import numpy as np
+from soccer_vision.eval.pitch_metrics import displacement_to_feet
 from soccer_vision.pitch.global_calib import (
+    OPP_END_IDX,
+    OWN_END_IDX,
+    BundleCalib,
     GlobalCalib,
+    _affine_from,
+    _apply_h,
+    _interp_affine_params,
     cross_end_holdout,
     fold_of_norm,
     frame_status,
+    solve_bundle,
     solve_global,
     two_ended_segments,
 )
@@ -183,3 +191,130 @@ def test_frame_status_green_yellow_red() -> None:
     sky = np.array([[1e-6, 0, 0], [0, 1e-6, 0], [0, 0, 1.0]])
     assert frame_status(sky, SIZE, segment_two_ended=True) == "red"
     assert two_ended == {0}
+
+
+# --- Field-anchored bundle (solve_bundle) ---------------------------------------------
+
+_H_PITCH_TO_REF = np.array([[0.8, 0.0, 0.1], [0.0, 1.6, 0.1], [0.0, 0.15, 1.0]])
+_OWN_END = [i for i in range(len(PITCH_LANDMARKS)) if PITCH_LANDMARKS[i, 1] < 0.5 and i != 5]
+_OPP_END = [i for i in range(len(PITCH_LANDMARKS)) if PITCH_LANDMARKS[i, 1] > 0.5 and i != 5]
+
+
+def _click_for(frame: int, kp: int, offset: np.ndarray) -> Click:
+    """A ground-truth click: the kp's true reference pixel shifted by the frame's pan
+    offset. The click is independent of any chain drift (it's a real observation)."""
+    ref = _H_PITCH_TO_REF @ np.array([*PITCH_LANDMARKS[kp], 1.0])
+    ref = ref[:2] / ref[2]
+    frame_pt = ref + offset
+    return Click(frame=frame, kp_idx=kp, x=float(frame_pt[0]), y=float(frame_pt[1]))
+
+
+def _build_drift_session() -> tuple[
+    list[Click], dict[int, np.ndarray], dict[int, int]
+]:
+    """A both-ends pan over 4 frames where the registration chain M[f] has injected
+    affine DRIFT that grows with frame index (accumulated chain error). Each end is
+    clicked REDUNDANTLY in two differently-drifted frames (own in 0 & 1, opp in 2 & 3),
+    so a single global homography with only per-frame translation (solve_global) cannot
+    reconcile them, but a per-frame affine correction (solve_bundle) can.
+
+    M[f] = D[f] @ T_true[f], where T_true[f] is the true (drift-free) frame->ref
+    translation and D[f] = I + f * P is a small affine drift in reference space.
+    """
+    offsets = {0: np.array([0.0, 0.0]), 1: np.array([0.18, 0.06]),
+               2: np.array([0.40, 0.14]), 3: np.array([0.58, 0.20])}
+    drift_gen = np.array([[0.04, 0.03, 0.03], [0.025, -0.05, 0.04], [0.0, 0.0, 0.0]])
+    t_true = {f: np.array([[1.0, 0.0, -off[0]], [0.0, 1.0, -off[1]], [0.0, 0.0, 1.0]])
+              for f, off in offsets.items()}
+    transforms = {f: (np.eye(3) + f * drift_gen) @ t_true[f] for f in offsets}
+    segment_of = {f: 0 for f in offsets}
+    clicks = (
+        [_click_for(0, kp, offsets[0]) for kp in _OWN_END]
+        + [_click_for(1, kp, offsets[1]) for kp in _OWN_END]
+        + [_click_for(2, kp, offsets[2]) for kp in _OPP_END]
+        + [_click_for(3, kp, offsets[3]) for kp in _OPP_END]
+    )
+    return clicks, transforms, segment_of
+
+
+def _end_medians(
+    get_h: object, clicks: list[Click]
+) -> tuple[float, float, float]:
+    """In-sample own / opp / overall median feet error using a frame->H callable."""
+    own, opp = set(OWN_END_IDX), set(OPP_END_IDX)
+    own_ft: list[float] = []
+    opp_ft: list[float] = []
+    for c in clicks:
+        h = get_h(c.frame)  # type: ignore[operator]
+        proj = _apply_h(h, np.array([[c.x, c.y]]))[0]
+        ft = float(displacement_to_feet(proj - PITCH_LANDMARKS[c.kp_idx]))
+        (own_ft if c.kp_idx in own else opp_ft).append(ft)
+    return (float(np.median(own_ft)), float(np.median(opp_ft)),
+            float(np.median(own_ft + opp_ft)))
+
+
+def test_solve_bundle_corrects_chain_drift_on_both_ends() -> None:
+    clicks, transforms, segment_of = _build_drift_session()
+
+    bc = solve_bundle(clicks, transforms, segment_of, SIZE)
+    assert isinstance(bc, BundleCalib)
+    assert set(bc.h_by_segment) == {0}
+    assert sorted(bc.a_params_by_segment[0]) == [0, 1, 2, 3]
+
+    b_own, b_opp, b_all = _end_medians(bc.frame_homography, clicks)
+    # The per-frame affine absorbs the injected drift: in-sample reprojection is ~0,
+    # well under 1 ft on BOTH ends.
+    assert b_own < 1.0, f"bundle own {b_own:.3f} ft"
+    assert b_opp < 1.0, f"bundle opp {b_opp:.3f} ft"
+
+    gc = solve_global(clicks, transforms, segment_of, SIZE)
+    g_own, g_opp, g_all = _end_medians(gc.frame_homography, clicks)
+    # solve_global has only a per-frame translation, so it cannot reconcile the two
+    # differently-drifted views of each end -> materially worse on both ends.
+    assert g_all > 2.5, f"solve_global overall {g_all:.3f} ft (drift not exercised)"
+    assert g_own > b_own and g_opp > b_opp
+    assert g_all > 10 * b_all
+
+
+def test_frame_homography_interpolates_affine_between_clicked_frames() -> None:
+    # Two clicked frames (0 own, 8 opp) with growing drift, plus an UNCLICKED frame 4
+    # exactly halfway between them in frame index. frame_homography(4) must use the
+    # midpoint of the two clicked frames' affine params.
+    offsets = {0: np.array([0.0, 0.0]), 4: np.array([0.40, 0.14]),
+               8: np.array([0.58, 0.20])}
+    drift_gen = np.array([[0.03, 0.02, 0.02], [0.02, -0.04, 0.03], [0.0, 0.0, 0.0]])
+    t_true = {f: np.array([[1.0, 0.0, -off[0]], [0.0, 1.0, -off[1]], [0.0, 0.0, 1.0]])
+              for f, off in offsets.items()}
+    transforms = {f: (np.eye(3) + f * drift_gen) @ t_true[f] for f in offsets}
+    segment_of = {f: 0 for f in offsets}
+    clicks = ([_click_for(0, kp, offsets[0]) for kp in _OWN_END]
+              + [_click_for(8, kp, offsets[8]) for kp in _OPP_END])
+
+    bc = solve_bundle(clicks, transforms, segment_of, SIZE)
+    a0 = bc.a_params_by_segment[0][0]
+    a8 = bc.a_params_by_segment[0][8]
+    # the two clicked frames really do have different corrections (drift differs)
+    assert not np.allclose(a0, a8, atol=1e-3)
+
+    # frame 4 is unclicked, exactly halfway -> A is the midpoint of a0 and a8.
+    interp = _interp_affine_params(bc.a_params_by_segment[0], 4)
+    expected = 0.5 * (a0 + a8)
+    assert np.allclose(interp, expected, atol=1e-9)
+    # each component lies between the two clicked frames' values
+    lo = np.minimum(a0, a8)
+    hi = np.maximum(a0, a8)
+    assert np.all(interp >= lo - 1e-9) and np.all(interp <= hi + 1e-9)
+
+    # frame_homography wires that interpolated affine in: H = H_g @ A_interp @ M[4].
+    expected_h = bc.h_by_segment[0] @ _affine_from(expected) @ transforms[4]
+    assert np.allclose(bc.frame_homography(4), expected_h, atol=1e-9)
+
+
+def test_solve_bundle_skips_segment_with_too_few_points() -> None:
+    transforms: dict[int, np.ndarray] = {0: np.eye(3), 1: np.eye(3)}
+    segment_of = {0: 0, 1: 0}
+    clicks = [Click(0, 0, 0.1, 0.1), Click(0, 1, 0.2, 0.2)]  # only 2 points
+    bc = solve_bundle(clicks, transforms, segment_of, SIZE)
+    assert bc.h_by_segment == {}
+    assert bc.a_params_by_segment == {}
+    assert bc.frame_homography(0) is None

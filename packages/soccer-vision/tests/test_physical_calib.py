@@ -5,7 +5,12 @@ from soccer_vision.calib.field_model import LENGTH_M, field_points_3d
 from soccer_vision.pitch.calib_anchor import frame_homography
 from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 from soccer_vision.pitch.manual_anchor import Click, LineClick
-from soccer_vision.pitch.physical_calib import PhysicalCalib, solve_session
+from soccer_vision.pitch.physical_calib import (
+    PhysicalCalib,
+    evaluate_gate,
+    foreground_holdout,
+    solve_session,
+)
 
 SIZE = (1920, 1080)
 IDS = [0, 1, 4, 9, 10, 13, 14]
@@ -161,3 +166,55 @@ def test_status_propagated_yellow_and_gap_red() -> None:
                           transforms=transforms, size=SIZE, gap_guard=200)
     assert calib.status(5) == "yellow"    # propagated within gap, plausible fold
     assert calib.status(400) == "red"     # beyond gap -> no homography
+
+
+# ---- T4: acceptance gate ----
+# Five diverse anchors (a wider pan than POSES) so leave-one-anchor-out still leaves >= 3
+# views for the shared-focal calibration. The chain is the TRUE inter-frame map
+# M[f] = H_ref^-1 @ H_f, so chain-shift recovers a held frame exactly.
+GATE_POSES: dict[int, tuple[NDArray[np.float64], NDArray[np.float64]]] = {
+    10: (np.array([[1.18], [-0.40], [0.0]]), np.array([[-19.0], [-3.0], [41.0]])),
+    20: (np.array([[1.20], [-0.20], [0.0]]), np.array([[-21.0], [-3.0], [40.0]])),
+    30: (np.array([[1.20], [0.00], [0.0]]), np.array([[-22.0], [-3.0], [40.0]])),
+    40: (np.array([[1.20], [0.20], [0.0]]), np.array([[-23.0], [-3.0], [40.0]])),
+    50: (np.array([[1.18], [0.40], [0.0]]), np.array([[-25.0], [-3.0], [41.0]])),
+}
+
+
+def _true_norm_h(rvec: NDArray[np.float64], tvec: NDArray[np.float64]) -> NDArray[np.float64]:
+    diag = np.diag([float(SIZE[0]), float(SIZE[1]), 1.0])
+    return np.asarray(frame_homography(K_TRUE, rvec, tvec), dtype=np.float64) @ diag
+
+
+def _gate_fixture() -> tuple[list[Click], list[LineClick], dict[int, NDArray[np.float64]]]:
+    pts: list[Click] = []
+    lns: list[LineClick] = []
+    for f, (rv, tv) in GATE_POSES.items():
+        pts += _pose_clicks(f, rv, tv)
+        lns += _near_tl_clicks(f, rv, tv)
+    h_ref = _true_norm_h(*GATE_POSES[min(GATE_POSES)])
+    transforms = {f: np.linalg.inv(h_ref) @ _true_norm_h(rv, tv)
+                  for f, (rv, tv) in GATE_POSES.items()}
+    return pts, lns, transforms
+
+
+def test_evaluate_gate_passes_on_clean_session() -> None:
+    pts, lns, transforms = _gate_fixture()
+    rep = evaluate_gate(pts, lns, SIZE, transforms)
+    assert rep.fg_n > 0 and rep.prop_n > 0
+    assert rep.fg_median_ft <= 5.0 and rep.fg_p90_ft <= 12.0
+    assert rep.prop_median_ft <= 5.0
+    assert rep.passed_numeric
+
+
+def test_foreground_holdout_counts() -> None:
+    pts, lns, _transforms = _gate_fixture()
+    errs = foreground_holdout(pts, lns, SIZE)
+    assert len(errs) == len(GATE_POSES) * 3   # 3 near-touchline clicks per anchor
+
+
+def test_gate_fails_without_foreground() -> None:
+    pts, _lns, transforms = _gate_fixture()
+    rep = evaluate_gate(pts, [], SIZE, transforms)   # no near-touchline -> unmeasurable
+    assert rep.fg_n == 0
+    assert not rep.passed_numeric

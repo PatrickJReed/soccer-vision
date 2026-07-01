@@ -24,6 +24,7 @@ from soccer_vision.calib.field_model import (
 from soccer_vision.calib.validate import fold_count
 from soccer_vision.pitch.calib_anchor import flag_outlier_clicks, frame_homography
 from soccer_vision.pitch.homography import HomographyError, fit_homography
+from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 from soccer_vision.pitch.manual_anchor import Click, LineClick
 
 FOLD_MIN, FOLD_MAX = 4, 15
@@ -268,3 +269,96 @@ def solve_session(
         anchor_h[f] = np.asarray(frame_homography(K, rv, tv), dtype=np.float64) @ diag
         grade[f] = _grade(K, po, lcs, size)
     return PhysicalCalib(K, poses, anchor_h, grade, tf, size, gap_guard)
+
+
+@dataclass(frozen=True)
+class GateReport:
+    """Held-out acceptance metrics (feet) for a session's physical calibration."""
+
+    fg_median_ft: float   # near-touchline foreground (held out)
+    fg_p90_ft: float
+    fg_n: int
+    prop_median_ft: float  # leave-one-anchor-out bracket propagation (within gap)
+    prop_p90_ft: float
+    prop_n: int
+    passed_numeric: bool
+
+
+def foreground_holdout(
+    points: Sequence[Click],
+    lines: Sequence[LineClick],
+    size: tuple[int, int],
+    *,
+    min_points: int = 4,
+) -> list[float]:
+    """Per-anchor held-out near-touchline error (feet), pooled across all anchors that have
+    a near-touchline click. Empty if the session can't calibrate a shared focal."""
+    w, h = size
+    by_pt = _group(points)
+    by_ln = _group(lines)
+    obs = {f: [(int(c.kp_idx), float(c.x * w), float(c.y * h)) for c in cs]
+           for f, cs in by_pt.items()}
+    try:
+        k = calibrate_camera(obs, size, min_points=6).K
+    except CalibError:
+        return []
+    errs: list[float] = []
+    for f, pcs in by_pt.items():
+        if len({c.kp_idx for c in pcs}) < min_points:
+            continue
+        po = [(int(c.kp_idx), float(c.x * w), float(c.y * h)) for c in pcs]
+        fe = _foreground_errors(k, po, by_ln.get(f, []), size)
+        if fe:
+            errs.extend(fe)
+    return errs
+
+
+def propagation_holdout(
+    points: Sequence[Click],
+    lines: Sequence[LineClick],
+    size: tuple[int, int],
+    transforms: Mapping[int, NDArray[np.floating[Any]]],
+    *,
+    gap_guard: int = DEFAULT_GAP_GUARD,
+    min_points: int = 4,
+) -> list[float]:
+    """Leave-one-anchor-out: for each anchor whose nearest OTHER anchor is within the gap
+    guard, refit the session without it and bracket-predict its point clicks. Feet errors."""
+    by_pt = _group(points)
+    anchors = sorted(f for f in by_pt if len({c.kp_idx for c in by_pt[f]}) >= min_points)
+    errs: list[float] = []
+    for held in anchors:
+        others = [a for a in anchors if a != held]
+        if not others or min(abs(held - a) for a in others) > gap_guard:
+            continue
+        rest_p = [c for c in points if c.frame != held]
+        rest_l = [lc for lc in lines if lc.frame != held]
+        calib = solve_session(rest_p, rest_l, size, transforms, gap_guard=gap_guard)
+        hmat = calib.frame_homography(held)
+        if hmat is None:
+            continue
+        for c in by_pt[held]:
+            q = _apply(hmat, np.array([[c.x, c.y]]))[0]
+            disp = (q - PITCH_LANDMARKS[c.kp_idx]) * _SCALE
+            errs.append(float(math.hypot(disp[0], disp[1]) * _FT))
+    return errs
+
+
+def evaluate_gate(
+    points: Sequence[Click],
+    lines: Sequence[LineClick],
+    size: tuple[int, int],
+    transforms: Mapping[int, NDArray[np.floating[Any]]],
+    *,
+    gap_guard: int = DEFAULT_GAP_GUARD,
+) -> GateReport:
+    """Numeric acceptance gate: foreground held-out (median <= 5, p90 <= 12 ft) AND
+    leave-one-anchor-out propagation (median <= 5 ft)."""
+    fg = foreground_holdout(points, lines, size)
+    pr = propagation_holdout(points, lines, size, transforms, gap_guard=gap_guard)
+    fg_med = float(np.median(fg)) if fg else float("inf")
+    fg_p90 = float(np.percentile(fg, 90)) if fg else float("inf")
+    pr_med = float(np.median(pr)) if pr else float("inf")
+    pr_p90 = float(np.percentile(pr, 90)) if pr else float("inf")
+    passed = fg_med <= 5.0 and fg_p90 <= 12.0 and pr_med <= 5.0
+    return GateReport(fg_med, fg_p90, len(fg), pr_med, pr_p90, len(pr), passed)

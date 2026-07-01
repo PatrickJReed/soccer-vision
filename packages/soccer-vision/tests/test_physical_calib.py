@@ -1,9 +1,10 @@
 import cv2
 import numpy as np
 from numpy.typing import NDArray
-from soccer_vision.calib.field_model import field_points_3d
+from soccer_vision.calib.field_model import LENGTH_M, field_points_3d
+from soccer_vision.pitch.calib_anchor import frame_homography
 from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
-from soccer_vision.pitch.manual_anchor import Click
+from soccer_vision.pitch.manual_anchor import Click, LineClick
 from soccer_vision.pitch.physical_calib import PhysicalCalib, solve_session
 
 SIZE = (1920, 1080)
@@ -98,3 +99,65 @@ def test_one_sided_shift_beyond_last_anchor() -> None:
 def test_gap_guard_returns_none_far_from_anchor() -> None:
     calib, _H0, _T = _driftfree_calib(gap_guard=200)
     assert calib.frame_homography(400) is None   # 380 > 200 from nearest anchor
+
+
+# ---- T3: coverage grade + status ----
+def _near_tl_clicks(frame: int, rvec: NDArray[np.float64], tvec: NDArray[np.float64],
+                    n: int = 3) -> list[LineClick]:
+    obj = np.array([[0.0, y, 0.0] for y in np.linspace(5.0, LENGTH_M - 5.0, n)])
+    img = cv2.projectPoints(obj, rvec, tvec, K_TRUE, None)[0].reshape(-1, 2)
+    w, h = SIZE
+    return [LineClick(frame=frame, line_id="near_touchline", x=float(x) / w, y=float(y) / h)
+            for x, y in img]
+
+
+def _pose_h(focal: float, rvec: NDArray[np.float64], tvec: NDArray[np.float64]) -> NDArray[np.float64]:
+    k = np.array([[focal, 0, SIZE[0] / 2], [0, focal, SIZE[1] / 2], [0, 0, 1.0]])
+    diag = np.diag([float(SIZE[0]), float(SIZE[1]), 1.0])
+    return np.asarray(frame_homography(k, rvec, tvec), dtype=np.float64) @ diag
+
+
+def test_coverage_grade_green_with_near_touchline() -> None:
+    pts: list[Click] = []
+    lns: list[LineClick] = []
+    for f, (rv, tv) in POSES.items():
+        pts += _pose_clicks(f, rv, tv)
+        lns += _near_tl_clicks(f, rv, tv)
+    calib = solve_session(pts, lns, SIZE, {f: np.eye(3) for f in POSES})
+    for f in POSES:
+        assert calib.coverage_grade[f] == "green"   # foreground self-check passes
+
+
+def test_coverage_grade_yellow_without_near_touchline() -> None:
+    pts: list[Click] = []
+    for f, (rv, tv) in POSES.items():
+        pts += _pose_clicks(f, rv, tv)
+    calib = solve_session(pts, [], SIZE, {f: np.eye(3) for f in POSES})
+    for f in POSES:
+        assert calib.coverage_grade[f] == "yellow"   # foreground unverified
+
+
+def test_status_anchor_grade_and_fold() -> None:
+    rv, tv = POSES[20]
+    h_good = _pose_h(3000.0, rv, tv)   # narrow view, fold in [4,15]
+    h_wide = _pose_h(1460.0, rv, tv)   # sees whole field, fold ~21 (out of range)
+
+    def mk(anchor_h: dict[int, NDArray[np.float64]], grade: dict[int, str]) -> PhysicalCalib:
+        return PhysicalCalib(K=np.eye(3), poses={}, anchor_h=anchor_h,
+                             coverage_grade=grade, transforms={5: np.eye(3)}, size=SIZE)
+
+    assert mk({5: h_good}, {5: "green"}).status(5) == "green"
+    assert mk({5: h_good}, {5: "yellow"}).status(5) == "yellow"
+    assert mk({5: h_wide}, {5: "green"}).status(5) == "red"   # implausible fold -> red
+
+
+def test_status_propagated_yellow_and_gap_red() -> None:
+    rv, tv = POSES[20]
+    h0 = _pose_h(3000.0, rv, tv)
+    transforms = {f: _trans(-0.002 * f) for f in range(0, 410)}
+    anchor_h = {0: h0, 10: h0 @ transforms[10]}
+    calib = PhysicalCalib(K=np.eye(3), poses={}, anchor_h=anchor_h,
+                          coverage_grade={0: "green", 10: "green"},
+                          transforms=transforms, size=SIZE, gap_guard=200)
+    assert calib.status(5) == "yellow"    # propagated within gap, plausible fold
+    assert calib.status(400) == "red"     # beyond gap -> no homography

@@ -96,6 +96,46 @@ def _anchor_pose(
     return rv, tv
 
 
+def _foreground_errors(
+    k: NDArray[np.floating[Any]],
+    po: list[tuple[int, float, float]],
+    line_clicks: Sequence[LineClick],
+    size: tuple[int, int],
+) -> list[float] | None:
+    """Held-out near-touchline error (feet) for ONE frame: refit the pose WITHOUT its
+    near-touchline clicks (points + any other lines only), then measure how far those
+    near-touchline clicks land from the x=0 line. None if the frame has no near-touchline
+    click (foreground unverifiable)."""
+    if not any(lc.line_id == "near_touchline" for lc in line_clicks):
+        return None
+    w, h = size
+    lo_fit = [(lc.line_id, lc.x * w, lc.y * h)
+              for lc in line_clicks if lc.line_id != "near_touchline"]
+    pose = _anchor_pose(k, po, lo_fit, None)
+    if pose is None:
+        return None
+    rv, tv = pose
+    h_norm = np.asarray(frame_homography(k, rv, tv), dtype=np.float64) @ np.diag(
+        [float(w), float(h), 1.0])
+    errs = [_line_perp_feet(_apply(h_norm, np.array([[lc.x, lc.y]]))[0], "near_touchline")
+            for lc in line_clicks if lc.line_id == "near_touchline"]
+    return errs or None
+
+
+def _grade(
+    k: NDArray[np.floating[Any]],
+    po: list[tuple[int, float, float]],
+    line_clicks: Sequence[LineClick],
+    size: tuple[int, int],
+) -> str:
+    """green if the anchor's held-out near-touchline foreground error is within tolerance;
+    yellow otherwise (including no near-touchline click -> foreground unverified)."""
+    errs = _foreground_errors(k, po, line_clicks, size)
+    if errs is None:
+        return "yellow"
+    return "green" if float(np.median(errs)) <= FOREGROUND_OK_FT else "yellow"
+
+
 def _grid(n: int) -> NDArray[np.float64]:
     xs = np.linspace(0.0, 1.0, n)
     gx, gy = np.meshgrid(xs, xs)
@@ -161,6 +201,20 @@ class PhysicalCalib:
             return None
         return _shift_h(self.anchor_h[a], self.transforms[a], self.transforms[frame])
 
+    def status(self, frame: int) -> str:
+        """green = anchor that passed its own held-out foreground self-check and projects
+        plausibly; yellow = anchor with unverified foreground OR a propagated (unclicked)
+        frame within the gap guard; red = no homography (beyond gap / uncalibrated) or an
+        implausible whole-field projection (fold_count out of range)."""
+        h = self.frame_homography(frame)
+        if h is None:
+            return "red"
+        if not FOLD_MIN <= _fold(h, self.size) <= FOLD_MAX:
+            return "red"
+        if frame in self.anchor_h:
+            return self.coverage_grade.get(frame, "yellow")
+        return "yellow"
+
 
 def solve_session(
     points: Sequence[Click],
@@ -212,5 +266,5 @@ def solve_session(
         rv, tv = pose
         poses[f] = (rv, tv)
         anchor_h[f] = np.asarray(frame_homography(K, rv, tv), dtype=np.float64) @ diag
-        grade[f] = "yellow"
+        grade[f] = _grade(K, po, lcs, size)
     return PhysicalCalib(K, poses, anchor_h, grade, tf, size, gap_guard)

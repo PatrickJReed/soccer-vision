@@ -20,13 +20,6 @@ from numpy.typing import NDArray
 from soccer_vision.labeler.chain import denormalize_homography
 from soccer_vision.labeler.refit_worker import RefitWorker
 from soccer_vision.pipeline import homographies_to_parquet
-from soccer_vision.pitch.global_calib import (
-    BundleCalib,
-    fold_of_norm,
-    frame_status,
-    solve_bundle,
-    two_ended_segments,
-)
 from soccer_vision.pitch.manual_anchor import (
     Click,
     LineClick,
@@ -34,6 +27,11 @@ from soccer_vision.pitch.manual_anchor import (
     clicks_to_keypoints_df,
     cumulative_transforms,
     propagate_line_clicks,
+)
+from soccer_vision.pitch.physical_calib import (
+    DEFAULT_GAP_GUARD,
+    PhysicalCalib,
+    solve_session,
 )
 from soccer_vision.pitch.propagation import HomographyEntry
 
@@ -43,10 +41,10 @@ class CalibFrame:
     """A calibrated per-frame result in the labeler's normalized space."""
 
     H: NDArray[np.float64]  # NORMALIZED image -> pitch[0,1] (frontend overlay)
-    residual: float         # in-sample bundle-fit reproj RMS (pitch units) — diagnostic only
-    n_points: int           # clicks in this frame's segment
-    fold_count: int
-    two_ended: bool         # the segment saw both field ends (drives green vs yellow)
+    status: str             # "green" | "yellow" | "red" (physical per-frame status)
+    is_anchor: bool         # True if this frame was directly clicked and solved as a pose
+    residual: float | None  # diagnostic only (unused by the physical gate); None = n/a
+    n_points: int           # point clicks on this anchor frame (0 for propagated frames)
 
 
 class LabelerState:
@@ -80,7 +78,8 @@ class LabelerState:
         self.line_clicks: list[LineClick] = []
         self._seq: list[str] = []  # insertion order across clicks ("pt") + line_clicks ("ln")
         self._fits: dict[int, CalibFrame] = {}
-        self._last_bundle: BundleCalib | None = None  # warm-start seed for the next solve
+        self._last_calib: PhysicalCalib | None = None  # warm-start seed for the next solve
+        self._gap_guard = DEFAULT_GAP_GUARD
         self._K: NDArray[np.float64] | None = None
         self._calibrated = False
         self._outliers: dict[int, list[int]] = {}
@@ -97,12 +96,13 @@ class LabelerState:
         return [c for c in self.clicks if c.kp_idx not in self._outliers.get(c.frame, [])]
 
     def _try_bootstrap(self) -> bool:
-        """Calibrated once the field-anchored bundle solves >= 1 segment (a segment with
-        >= 4 pooled clicks). No focal/K: the model is a plain image->pitch homography."""
+        """Calibrated once solve_session produces >= 1 physical anchor. The physical model
+        needs >= 3 diverse clicked frames (>= 6 points each) to estimate the shared focal;
+        below that there is no anchor yet and this stays False (the bootstrap waits)."""
         if self._calibrated:
             return True
-        bundle, _two_ended = self._solve()
-        if not bundle.h_by_segment:
+        calib = self._solve()
+        if not calib.anchor_h:
             return False
         with self._lock:
             self._calibrated = True
@@ -115,64 +115,67 @@ class LabelerState:
             window=self.line_band, frames=frames)
         return {f: [(lid, x * w, y * h) for (lid, x, y) in lst] for f, lst in prop.items()}
 
-    def _solve(self) -> tuple[BundleCalib, set[int]]:
-        """Run the field-anchored bundle solve ONCE over a stable snapshot of the active
-        clicks. Snapshots (force-copies) under the lock, then runs solve_bundle (a single
-        scipy least_squares over ALL clicks) + two-ended detection OFF the lock. Callers
-        must solve once per recompute and reuse the result — NEVER per chunk (the bundle
-        solve is expensive). solve_bundle handles the empty case (no/too-few clicks) by
-        returning an empty BundleCalib, so frame_homography is None for every frame.
+    def _solve(self) -> PhysicalCalib:
+        """Run the physical per-frame solve ONCE over a stable snapshot of the active clicks
+        (points + lines). Snapshots under the lock, then runs solve_session OFF the lock
+        (shared-focal calibrate + per-anchor SQPNP+refine_pose; bracket-propagation is lazy
+        in frame_homography). Callers solve once per recompute and reuse the result — the
+        solve is expensive. solve_session handles the empty / too-few-views case by returning
+        a PhysicalCalib with no anchors, so frame_homography is None for every frame.
 
-        The previous solution (self._last_bundle) is passed as a warm-start seed so the
-        scipy least_squares converges in a few iterations on an incremental edit; it is
-        only an initial guess (the optimum is unchanged), and a stale seed from older
-        clicks is still safe (least_squares re-converges to the CURRENT clicks' optimum).
+        The previous PhysicalCalib (self._last_calib) is passed as a warm-start seed so each
+        anchor's refine_pose starts from its prior pose; it only affects iteration count, not
+        the optimum, and a stale seed is safe (each anchor re-refines to the current clicks).
         """
         with self._lock:
             clicks = list(self._active_clicks())  # stable COPY for the lock-free solve
-            seed = self._last_bundle              # warm-start from the prior solution
-        bundle = solve_bundle(
-            clicks, self._transforms, self._segment_of, self.size, seed=seed)
-        two_ended = two_ended_segments(clicks, self._segment_of)
+            lines = list(self.line_clicks)
+            seed = self._last_calib               # warm-start from the prior solution
+        calib = solve_session(
+            clicks, lines, self.size, self._transforms,
+            gap_guard=self._gap_guard, seed=seed)
         with self._lock:
-            self._last_bundle = bundle
-        return bundle, two_ended
+            self._last_calib = calib
+        return calib
 
     def _build_frame(
-        self, bundle: BundleCalib, two_ended: set[int], f: int
+        self, calib: PhysicalCalib, counts: Mapping[int, int], f: int
     ) -> CalibFrame | None:
-        """Build one frame's CalibFrame from an already-solved bundle (cheap: just the
-        affine-interpolated per-frame homography). None if the frame has no homography
-        (its segment was not calibrated / it has no chain transform)."""
-        h = bundle.frame_homography(f)
+        """Build one frame's CalibFrame from an already-solved PhysicalCalib (cheap: an
+        anchor lookup or a bracket propagation). None if the frame has no homography
+        (uncalibrated / beyond the gap guard). `counts` is frame -> point-click count."""
+        h = calib.frame_homography(f)
         if h is None:
             return None
-        seg = self._segment_of.get(f)
+        anchor = calib.is_anchor(f)
         return CalibFrame(
             H=h,
-            residual=bundle.rms_by_segment.get(seg, float("nan"))
-            if seg is not None else float("nan"),
-            n_points=bundle.n_by_segment.get(seg, 0) if seg is not None else 0,
-            fold_count=fold_of_norm(h, self.size),
-            two_ended=(seg in two_ended),
+            status=calib.status(f),
+            is_anchor=anchor,
+            residual=None,
+            n_points=counts.get(f, 0) if anchor else 0,
         )
 
     def _compute_dirty(
         self, frames: Sequence[int], is_cancelled: Callable[[], bool]
     ) -> dict[int, CalibFrame | None] | None:
-        """Solve the field-anchored bundle ONCE, then build each requested frame's
-        CalibFrame (cheap). Chunks ONLY to check cancellation between chunks — the solve
-        itself is a single least_squares over all clicks, never re-run per chunk. Returns
-        a map over EVERY requested frame -> CalibFrame-or-None (None = no longer solvable,
-        so the applier pops any stale fit). None return = the whole pass was cancelled."""
-        bundle, two_ended = self._solve()
+        """Solve the physical session ONCE, then build each requested frame's CalibFrame
+        (cheap). Chunks ONLY to check cancellation between chunks — the solve itself runs
+        once, never re-run per chunk. Returns a map over EVERY requested frame ->
+        CalibFrame-or-None (None = no longer solvable, so the applier pops any stale fit).
+        None return = the whole pass was cancelled."""
+        calib = self._solve()
+        with self._lock:
+            counts: dict[int, int] = {}
+            for c in self.clicks:
+                counts[c.frame] = counts.get(c.frame, 0) + 1
         out: dict[int, CalibFrame | None] = {}
         ordered = list(frames)
         for i in range(0, len(ordered), self._refit_chunk):
             if is_cancelled():
                 return None
             for f in ordered[i:i + self._refit_chunk]:
-                out[f] = self._build_frame(bundle, two_ended, f)
+                out[f] = self._build_frame(calib, counts, f)
         return out
 
     def _apply_fits(self, results: dict[int, CalibFrame | None]) -> None:
@@ -318,9 +321,7 @@ class LabelerState:
     def _status_of(self, f: int) -> str:
         with self._lock:
             cf = self._fits.get(f)
-        if cf is None:
-            return "red"
-        return frame_status(cf.H, self.size, segment_two_ended=cf.two_ended)
+        return cf.status if cf is not None else "red"
 
     def coverage(self) -> float:
         if self.n_frames == 0:
@@ -380,20 +381,14 @@ class LabelerState:
         for f in range(self.n_frames):
             with self._lock:  # single locked read: no green-then-missing TOCTOU window
                 cf = self._fits.get(f)
-            # Honest gate: only export whole-field GREEN frames (two-ended + plausible
-            # fold), never single-ended "sky" frames — regardless of how tight the
-            # in-sample residual is.
-            if cf is None or self._status_of(f) != "green":
+            # Honest gate: only export whole-field GREEN frames (anchor that passed its own
+            # foreground self-check + plausible fold), never yellow/red "sky" frames.
+            if cf is None or cf.status != "green":
                 continue
-            # Confidence: 1.0 for a green frame (whole-field constrained); the in-sample
-            # RMS is a soft penalty, not the gate. Defensive on a non-finite residual.
-            conf = (
-                float(np.clip(
-                    1.0 - cf.residual / max(self.residual_px_threshold, 1e-9), 0.0, 1.0))
-                if np.isfinite(cf.residual) else 1.0
-            )
+            # A green frame is whole-field trustworthy -> confidence 1.0. The physical gate
+            # (foreground self-check + fold), not an in-sample residual, decides trust.
             entries[f] = HomographyEntry(
-                denormalize_homography(cf.H, self.size), "manual", conf)
+                denormalize_homography(cf.H, self.size), "manual", 1.0)
         homographies_to_parquet(entries, out / "homographies.parquet")
         if self.line_clicks:
             pd.DataFrame(

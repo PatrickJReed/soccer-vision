@@ -189,8 +189,8 @@ def test_frame_h_includes_residual_and_n_points() -> None:
         state.wait_idle(timeout=10)  # propagated frames settle on the background worker
         fh = _get(f"{base}/api/frame_h/4")   # frame 4 is a clicked anchor
         assert fh["h"] is not None
-        # residual is now the in-sample global-fit RMS in NORMALIZED px (~[0,1] space)
-        assert fh["residual"] is not None and fh["residual"] < 1.0
+        # physical model: residual is a dropped diagnostic (None); n_points = anchor clicks
+        assert fh["residual"] is None
         assert fh["n_points"] is not None and fh["n_points"] > 0
         assert _get(f"{base}/api/frame_h/2")["h"] is not None  # propagated frame
     finally:

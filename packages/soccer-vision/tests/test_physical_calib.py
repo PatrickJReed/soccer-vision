@@ -106,6 +106,37 @@ def test_gap_guard_returns_none_far_from_anchor() -> None:
     assert calib.frame_homography(400) is None   # 380 > 200 from nearest anchor
 
 
+def test_propagation_stays_within_segment() -> None:
+    # Two registration segments (chain resets to identity at each segment start). A frame in
+    # one segment must propagate ONLY from that segment's anchors — never bracket across a
+    # segment break (which would compose two different reference frames -> garbage).
+    transforms = {f: _trans(-0.01 * f) for f in range(0, 10)}          # seg 0
+    transforms.update({f: _trans(-0.01 * (f - 10)) for f in range(10, 20)})  # seg 1 (M[10]=~I)
+    transforms[25] = np.eye(3)                                          # seg 2, no anchors
+    h0 = np.array([[0.5, 0.02, 0.10], [0.01, 0.4, 0.20], [0.0, 0.05, 1.0]])
+    h1 = np.array([[0.4, -0.03, 0.30], [0.02, 0.55, 0.05], [0.0, -0.04, 1.0]])
+    anchor_h = {0: h0, 5: h0 @ transforms[5], 10: h1, 15: h1 @ transforms[15]}
+    segment_of = ({f: 0 for f in range(0, 10)} | {f: 1 for f in range(10, 20)} | {25: 2})
+    calib = PhysicalCalib(K=np.eye(3), poses={}, anchor_h=anchor_h, coverage_grade={},
+                          transforms=transforms, size=SIZE, gap_guard=200, segment_of=segment_of)
+    pts = np.array([[0.2, 0.3, 1.0], [0.6, 0.4, 1.0]])
+
+    # frame 8 (seg 0, no seg-0 anchor above it): one-sided shift from anchor 5 -> seg-0
+    # geometry, NOT bracketed across to seg-1's anchor 10 (the old cross-segment bug).
+    h8 = calib.frame_homography(8)
+    assert h8 is not None
+    assert np.allclose(_act(h8, pts), _act(h0 @ transforms[8], pts), atol=1e-6)
+    assert not np.allclose(_act(h8, pts), _act(h1 @ transforms[8], pts), atol=1e-2)
+
+    # frame 12 (seg 1): bracketed by seg-1 anchors 10 & 15 -> seg-1 geometry
+    h12 = calib.frame_homography(12)
+    assert h12 is not None
+    assert np.allclose(_act(h12, pts), _act(h1 @ transforms[12], pts), atol=1e-4)
+
+    # a segment with no anchors of its own -> no homography (never borrows another segment)
+    assert calib.frame_homography(25) is None
+
+
 # ---- T3: coverage grade + status ----
 def _near_tl_clicks(frame: int, rvec: NDArray[np.float64], tvec: NDArray[np.float64],
                     n: int = 3) -> list[LineClick]:

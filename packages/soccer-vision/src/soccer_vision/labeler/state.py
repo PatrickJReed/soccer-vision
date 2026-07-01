@@ -133,7 +133,7 @@ class LabelerState:
             seed = self._last_calib               # warm-start from the prior solution
         calib = solve_session(
             clicks, lines, self.size, self._transforms,
-            gap_guard=self._gap_guard, seed=seed)
+            segment_of=self._segment_of, gap_guard=self._gap_guard, seed=seed)
         with self._lock:
             self._last_calib = calib
         return calib
@@ -221,23 +221,23 @@ class LabelerState:
         os.replace(tmp, self.autosave_path)
 
     def _affected(self, frame: int) -> list[int]:
-        """A click changes the global homography for its ENTIRE segment, so every frame
-        in that segment must be recomputed (not just a window)."""
+        """Frames whose homography a LINE edit at `frame` can change: its own registration
+        segment (the line refines that segment's anchor poses / propagation). A POINT edit is
+        NOT scoped here — it re-estimates the shared focal K over ALL frames, so point paths
+        mark every frame dirty instead."""
         seg = self._segment_of.get(frame)
         return [f for f in range(self.n_frames) if self._segment_of.get(f) == seg]
 
     def add_click(self, frame: int, kp_idx: int, x: float, y: float) -> None:
-        # Non-blocking: append the click and mark the affected frames dirty, then return
-        # immediately. The background RefitWorker re-solves the bundle off the request
-        # thread; the clicked frame keeps showing its cached (pre-click) overlay until the
-        # worker drains (~100-300 ms), which the frontend picks up on its pending poll.
+        # Non-blocking: append the click and mark frames dirty, then return immediately. The
+        # background RefitWorker re-solves off the request thread; the clicked frame keeps its
+        # cached (pre-click) overlay until the worker drains (~100-300 ms). A point click feeds
+        # the SHARED focal K (estimated over all frames), so every frame is marked dirty.
         with self._lock:
             self.clicks.append(Click(frame=frame, kp_idx=kp_idx, x=x, y=y))
             self._seq.append("pt")
-        if not self._calibrated and self._try_bootstrap():
-            self._worker.mark_dirty(range(self.n_frames))  # first calibration in background
-        elif self._calibrated:
-            self._worker.mark_dirty(self._affected(frame))
+        if self._calibrated or self._try_bootstrap():
+            self._worker.mark_dirty(range(self.n_frames))
         self._autosave()
 
     def add_clicks(self, clicks: Sequence[Click]) -> None:
@@ -285,7 +285,9 @@ class LabelerState:
                 assert self.clicks, "_seq/clicks out of sync"
                 removed_frame = self.clicks.pop().frame
         if self._calibrated:
-            self._worker.mark_dirty(self._affected(removed_frame))  # non-blocking
+            # a removed POINT changes the shared K (all frames); a removed LINE is segment-scoped
+            affected = self._affected(removed_frame) if kind == "ln" else range(self.n_frames)
+            self._worker.mark_dirty(affected)  # non-blocking
         self._autosave()
 
     def nudge_click(self, frame: int, kp_idx: int, x: float, y: float) -> bool:
@@ -300,7 +302,7 @@ class LabelerState:
         if not found:
             return False
         if self._calibrated:
-            self._worker.mark_dirty(self._affected(frame))  # non-blocking; worker re-solves
+            self._worker.mark_dirty(range(self.n_frames))  # point moved -> shared K changes
         self._autosave()
         return True
 

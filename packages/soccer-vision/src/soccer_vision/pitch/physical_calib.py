@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import cv2
@@ -184,34 +184,51 @@ class PhysicalCalib:
     transforms: dict[int, NDArray[np.float64]]
     size: tuple[int, int]
     gap_guard: int = DEFAULT_GAP_GUARD
+    # frame -> registration-segment id. The chain transforms reset to identity at each
+    # segment start, so propagation may only compose anchors WITHIN a frame's own segment.
+    # Empty == treat the whole clip as one segment (frames/anchors all in segment 0).
+    segment_of: dict[int, int] = field(default_factory=dict)
 
     def is_anchor(self, frame: int) -> bool:
         return frame in self.anchor_h
 
+    def _segment(self, frame: int) -> int:
+        return self.segment_of.get(frame, 0)
+
+    def _segment_anchors(self, frame: int) -> list[int]:
+        seg = self._segment(frame)
+        return sorted(a for a in self.anchor_h if self._segment(a) == seg)
+
     def nearest_anchor_gap(self, frame: int) -> int | None:
-        if not self.anchor_h:
+        """Frames to the nearest anchor IN THE SAME SEGMENT (None if that segment has none)."""
+        seg_anchors = self._segment_anchors(frame)
+        if not seg_anchors:
             return None
-        return min(abs(frame - a) for a in self.anchor_h)
+        return min(abs(frame - a) for a in seg_anchors)
 
     def frame_homography(self, frame: int) -> NDArray[np.float64] | None:
         if frame in self.anchor_h:
             return self.anchor_h[frame]
-        if not self.anchor_h or frame not in self.transforms:
+        if frame not in self.transforms:
             return None
-        gap = self.nearest_anchor_gap(frame)
-        if gap is None or gap > self.gap_guard:
+        seg = self._segment(frame)
+        # propagate ONLY from same-segment anchors that have a chain transform (the chain
+        # composes within a segment; crossing a segment break would compose two references)
+        usable = sorted(a for a in self.anchor_h
+                        if self._segment(a) == seg and a in self.transforms)
+        if not usable:
             return None
-        anchors = sorted(self.anchor_h)
-        lo = [a for a in anchors if a < frame]
-        hi = [a for a in anchors if a > frame]
-        if lo and hi and lo[-1] in self.transforms and hi[0] in self.transforms:
+        gap = min(abs(frame - a) for a in usable)
+        if gap > self.gap_guard:
+            return None
+        lo = [a for a in usable if a < frame]
+        hi = [a for a in usable if a > frame]
+        if lo and hi:
             a, b = lo[-1], hi[0]
             h_lo = _shift_h(self.anchor_h[a], self.transforms[a], self.transforms[frame])
             h_hi = _shift_h(self.anchor_h[b], self.transforms[b], self.transforms[frame])
             return _bracket_h(h_lo, h_hi, (frame - a) / (b - a))
         a = lo[-1] if lo else hi[0]
-        if a not in self.transforms:
-            return None
         return _shift_h(self.anchor_h[a], self.transforms[a], self.transforms[frame])
 
     def status(self, frame: int) -> str:
@@ -235,12 +252,14 @@ def solve_session(
     size: tuple[int, int],
     transforms: Mapping[int, NDArray[np.floating[Any]]],
     *,
+    segment_of: Mapping[int, int] | None = None,
     min_points: int = 4,
     gap_guard: int = DEFAULT_GAP_GUARD,
     seed: PhysicalCalib | None = None,
 ) -> PhysicalCalib:
     w, h = size
     tf = {f: np.asarray(m, dtype=np.float64) for f, m in transforms.items()}
+    seg_of: dict[int, int] = dict(segment_of) if segment_of is not None else {}
     by_pt = _group(points)
     by_ln = _group(lines)
     obs: dict[int, list[tuple[int, float, float]]] = {
@@ -255,7 +274,7 @@ def solve_session(
         # labeler bootstrap simply waits for more clicked frames. We deliberately do NOT
         # fall back to a free per-frame homography -- that is exactly the model this engine
         # replaces (it is non-physical and folds the field into the sky).
-        return PhysicalCalib(np.eye(3), {}, {}, {}, tf, size, gap_guard)
+        return PhysicalCalib(np.eye(3), {}, {}, {}, tf, size, gap_guard, seg_of)
     clean, _flagged = flag_outlier_clicks(points, K, size)
     by_clean = _group(clean)
     diag = np.diag([float(w), float(h), 1.0])
@@ -280,7 +299,7 @@ def solve_session(
         poses[f] = (rv, tv)
         anchor_h[f] = np.asarray(frame_homography(K, rv, tv), dtype=np.float64) @ diag
         grade[f] = _grade(K, po, lcs, size)
-    return PhysicalCalib(K, poses, anchor_h, grade, tf, size, gap_guard)
+    return PhysicalCalib(K, poses, anchor_h, grade, tf, size, gap_guard, seg_of)
 
 
 @dataclass(frozen=True)
@@ -331,21 +350,25 @@ def propagation_holdout(
     size: tuple[int, int],
     transforms: Mapping[int, NDArray[np.floating[Any]]],
     *,
+    segment_of: Mapping[int, int] | None = None,
     gap_guard: int = DEFAULT_GAP_GUARD,
     min_points: int = 4,
 ) -> list[float]:
-    """Leave-one-anchor-out: for each anchor whose nearest OTHER anchor is within the gap
-    guard, refit the session without it and bracket-predict its point clicks. Feet errors."""
+    """Leave-one-anchor-out: for each anchor whose nearest OTHER same-segment anchor is
+    within the gap guard, refit the session without it and bracket-predict its point clicks.
+    Feet errors."""
+    seg = dict(segment_of) if segment_of is not None else {}
     by_pt = _group(points)
     anchors = sorted(f for f in by_pt if len({c.kp_idx for c in by_pt[f]}) >= min_points)
     errs: list[float] = []
     for held in anchors:
-        others = [a for a in anchors if a != held]
+        others = [a for a in anchors if a != held and seg.get(a, 0) == seg.get(held, 0)]
         if not others or min(abs(held - a) for a in others) > gap_guard:
             continue
         rest_p = [c for c in points if c.frame != held]
         rest_l = [lc for lc in lines if lc.frame != held]
-        calib = solve_session(rest_p, rest_l, size, transforms, gap_guard=gap_guard)
+        calib = solve_session(rest_p, rest_l, size, transforms,
+                              segment_of=segment_of, gap_guard=gap_guard)
         hmat = calib.frame_homography(held)
         if hmat is None:
             continue
@@ -362,12 +385,14 @@ def evaluate_gate(
     size: tuple[int, int],
     transforms: Mapping[int, NDArray[np.floating[Any]]],
     *,
+    segment_of: Mapping[int, int] | None = None,
     gap_guard: int = DEFAULT_GAP_GUARD,
 ) -> GateReport:
     """Numeric acceptance gate: foreground held-out (median <= 5, p90 <= 12 ft) AND
     leave-one-anchor-out propagation (median <= 5 ft)."""
     fg = foreground_holdout(points, lines, size)
-    pr = propagation_holdout(points, lines, size, transforms, gap_guard=gap_guard)
+    pr = propagation_holdout(points, lines, size, transforms,
+                             segment_of=segment_of, gap_guard=gap_guard)
     fg_med = float(np.median(fg)) if fg else float("inf")
     fg_p90 = float(np.percentile(fg, 90)) if fg else float("inf")
     pr_med = float(np.median(pr)) if pr else float("inf")

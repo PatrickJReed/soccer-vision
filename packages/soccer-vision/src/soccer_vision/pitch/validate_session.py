@@ -53,7 +53,7 @@ def run_gate(chain_path: Path, clicks_path: Path) -> GateReport | None:
     lines = line_clicks_from_sidecar(clicks_path)
     segment_of = build_segments(interframe, n_frames)
     transforms = cumulative_transforms(interframe, segment_of)
-    return evaluate_gate(points, lines, size, transforms)
+    return evaluate_gate(points, lines, size, transforms, segment_of=segment_of)
 
 
 def _spot_frames(clicked: list[int], n_frames: int, k: int = 8) -> list[int]:
@@ -81,7 +81,7 @@ def render_spotcheck(
     lines = line_clicks_from_sidecar(clicks_path)
     segment_of = build_segments(interframe, n_frames)
     transforms = cumulative_transforms(interframe, segment_of)
-    calib = solve_session(points, lines, size, transforms)
+    calib = solve_session(points, lines, size, transforms, segment_of=segment_of)
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -60,6 +60,23 @@ function renderTimeline(){
   const t=document.getElementById("timeline"); t.innerHTML="";
   for(const s of status){const d=document.createElement("div");
     d.style.flex="1"; d.style.background=colorFor(s); t.appendChild(d);}
+  const m=document.createElement("div"); m.id="tlmarker"; t.appendChild(m);
+  updateMarker();
+}
+function updateMarker(){
+  const m=document.getElementById("tlmarker");
+  if(m && nFrames>1) m.style.left=(100*cur/(nFrames-1))+"%";
+}
+function renderTicks(){
+  const el=document.getElementById("ticks"); if(!el || nFrames<2) return;
+  el.innerHTML=""; const N=8;
+  for(let i=0;i<=N;i++){
+    const s=document.createElement("span"); s.className="tick";
+    s.textContent=Math.round(i/N*(nFrames-1)); s.style.left=(100*i/N)+"%";
+    if(i===0) s.style.transform="none";
+    else if(i===N) s.style.transform="translateX(-100%)";
+    el.appendChild(s);
+  }
 }
 
 function drawOverlay(){
@@ -104,6 +121,8 @@ function drawFrame(){
 
 async function loadFrame(i){
   cur=i; document.getElementById("frameNum").textContent=i;
+  const s=document.getElementById("scrub"); if(+s.value!==i) s.value=i;  // keep slider synced
+  updateMarker();
   const fh=await api(`/api/frame_h/${i}`); curH=fh.h;
   const resEl = document.getElementById("res");
   if (fh.residual == null) { resEl.textContent = "—"; resEl.style.color = ""; }
@@ -126,7 +145,8 @@ function applyState(st){
   document.getElementById("cov").textContent=Math.round(st.coverage*100)+"%";
   document.getElementById("nclicks").textContent=st.n_clicks;
   document.getElementById("scrub").max=st.n_frames-1;
-  renderPalette(); renderTimeline(); drawFrame();
+  document.getElementById("frameMax").textContent=st.n_frames-1;
+  renderPalette(); renderTimeline(); renderTicks(); drawFrame();
 }
 
 function maybePoll(pending){
@@ -199,6 +219,11 @@ canvas.onclick = async (e) => {
 };
 
 document.getElementById("scrub").oninput=(e)=>loadFrame(+e.target.value);
+document.getElementById("timeline").onclick=(e)=>{   // click a colour band -> jump there
+  const r=e.currentTarget.getBoundingClientRect();
+  const frac=Math.min(1,Math.max(0,(e.clientX-r.left)/r.width));
+  if(nFrames>1) loadFrame(Math.round(frac*(nFrames-1)));
+};
 document.getElementById("undo").onclick=async()=>{
   applyState(await postJSON("/api/undo",{}));
   const cl=await api("/api/clicks"); clicks=cl.clicks; lineClicks=cl.line_clicks||[];

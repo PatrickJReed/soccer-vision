@@ -4,7 +4,7 @@ from numpy.typing import NDArray
 from soccer_vision.calib.field_model import field_points_3d
 from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 from soccer_vision.pitch.manual_anchor import Click
-from soccer_vision.pitch.physical_calib import solve_session
+from soccer_vision.pitch.physical_calib import PhysicalCalib, solve_session
 
 SIZE = (1920, 1080)
 IDS = [0, 1, 4, 9, 10, 13, 14]
@@ -57,3 +57,44 @@ def test_too_few_views_returns_empty_not_free_homography() -> None:
     calib = solve_session(_pose_clicks(20, rv, tv), [], SIZE, {20: np.eye(3)})
     assert calib.anchor_h == {}
     assert calib.frame_homography(20) is None
+
+
+def _trans(dx: float) -> NDArray[np.float64]:
+    return np.array([[1.0, 0, dx], [0, 1.0, 0], [0, 0, 1.0]], dtype=np.float64)
+
+
+def _act(H: NDArray[np.float64], pts: NDArray[np.float64]) -> NDArray[np.float64]:
+    q = (H @ pts.T).T
+    return np.asarray(q[:, :2] / q[:, 2:3], dtype=np.float64)
+
+
+def _driftfree_calib(gap_guard: int = 200) -> tuple[PhysicalCalib, NDArray[np.float64], dict[int, NDArray[np.float64]]]:
+    transforms = {f: _trans(-0.01 * f) for f in range(0, 410)}
+    H0 = np.array([[0.5, 0.02, 0.10], [0.01, 0.4, 0.20], [0.0, 0.05, 1.0]])
+    anchor_h = {0: H0, 20: H0 @ transforms[20]}  # chain-consistent anchors
+    calib = PhysicalCalib(K=np.eye(3), poses={}, anchor_h=anchor_h, coverage_grade={},
+                          transforms=transforms, size=SIZE, gap_guard=gap_guard)
+    return calib, H0, transforms
+
+
+def test_bracket_recovers_interior_on_driftfree_chain() -> None:
+    calib, H0, T = _driftfree_calib()
+    H10 = calib.frame_homography(10)          # bracketed by anchors 0 and 20
+    assert H10 is not None
+    expected = H0 @ T[10]
+    pts = np.array([[0.2, 0.3, 1.0], [0.7, 0.6, 1.0], [0.5, 0.5, 1.0]])
+    assert np.allclose(_act(H10, pts), _act(expected, pts), atol=1e-4)
+
+
+def test_one_sided_shift_beyond_last_anchor() -> None:
+    calib, H0, T = _driftfree_calib()
+    H25 = calib.frame_homography(25)          # beyond anchor 20, within gap, one-sided
+    assert H25 is not None
+    expected = H0 @ T[25]
+    pts = np.array([[0.2, 0.3, 1.0], [0.6, 0.4, 1.0]])
+    assert np.allclose(_act(H25, pts), _act(expected, pts), atol=1e-6)
+
+
+def test_gap_guard_returns_none_far_from_anchor() -> None:
+    calib, _H0, _T = _driftfree_calib(gap_guard=200)
+    assert calib.frame_homography(400) is None   # 380 > 200 from nearest anchor

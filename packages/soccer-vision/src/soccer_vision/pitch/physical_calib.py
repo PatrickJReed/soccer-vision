@@ -23,6 +23,7 @@ from soccer_vision.calib.field_model import (
 )
 from soccer_vision.calib.validate import fold_count
 from soccer_vision.pitch.calib_anchor import flag_outlier_clicks, frame_homography
+from soccer_vision.pitch.homography import HomographyError, fit_homography
 from soccer_vision.pitch.manual_anchor import Click, LineClick
 
 FOLD_MIN, FOLD_MAX = 4, 15
@@ -95,6 +96,32 @@ def _anchor_pose(
     return rv, tv
 
 
+def _grid(n: int) -> NDArray[np.float64]:
+    xs = np.linspace(0.0, 1.0, n)
+    gx, gy = np.meshgrid(xs, xs)
+    return np.column_stack([gx.ravel(), gy.ravel(), np.ones(gx.size)])
+
+
+def _shift_h(anchor_h: NDArray[np.floating[Any]], m_a: NDArray[np.floating[Any]],
+             m_t: NDArray[np.floating[Any]]) -> NDArray[np.float64]:
+    return np.asarray(
+        np.asarray(anchor_h, dtype=np.float64)
+        @ np.linalg.inv(np.asarray(m_a, dtype=np.float64))
+        @ np.asarray(m_t, dtype=np.float64),
+        dtype=np.float64,
+    )
+
+
+def _bracket_h(h_lo: NDArray[np.floating[Any]], h_hi: NDArray[np.floating[Any]],
+               w: float) -> NDArray[np.float64]:
+    g = _grid(GRID_N)
+    blended = (1.0 - w) * _apply(h_lo, g) + w * _apply(h_hi, g)
+    try:
+        return np.asarray(fit_homography(g[:, :2], blended), dtype=np.float64)
+    except HomographyError:
+        return np.asarray(h_lo if w < 0.5 else h_hi, dtype=np.float64)
+
+
 @dataclass(frozen=True, eq=False)
 class PhysicalCalib:
     K: NDArray[np.float64]
@@ -116,7 +143,23 @@ class PhysicalCalib:
     def frame_homography(self, frame: int) -> NDArray[np.float64] | None:
         if frame in self.anchor_h:
             return self.anchor_h[frame]
-        return None
+        if not self.anchor_h or frame not in self.transforms:
+            return None
+        gap = self.nearest_anchor_gap(frame)
+        if gap is None or gap > self.gap_guard:
+            return None
+        anchors = sorted(self.anchor_h)
+        lo = [a for a in anchors if a < frame]
+        hi = [a for a in anchors if a > frame]
+        if lo and hi and lo[-1] in self.transforms and hi[0] in self.transforms:
+            a, b = lo[-1], hi[0]
+            h_lo = _shift_h(self.anchor_h[a], self.transforms[a], self.transforms[frame])
+            h_hi = _shift_h(self.anchor_h[b], self.transforms[b], self.transforms[frame])
+            return _bracket_h(h_lo, h_hi, (frame - a) / (b - a))
+        a = lo[-1] if lo else hi[0]
+        if a not in self.transforms:
+            return None
+        return _shift_h(self.anchor_h[a], self.transforms[a], self.transforms[frame])
 
 
 def solve_session(

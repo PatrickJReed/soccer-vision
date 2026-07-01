@@ -146,9 +146,9 @@ def labeler_fit_residual_feet(
 
     WARNING — self-consistency proxy, NOT an accuracy bound. A single-end "sky"
     homography scores a tiny self-residual yet is wildly wrong off-frame. Do NOT use
-    this to set the eval match threshold; the honest bar is SP1's cross-end HELD-OUT
-    distribution (HoldoutReport.median_ft, acceptance < 1.5 m — see
-    2026-06-26-calibration-global-homography-design.md §7) or an independent
+    this to set the eval match threshold; the honest bar is the physical calibration's
+    HELD-OUT gate (foreground + propagation feet — see
+    pitch.physical_calib.evaluate_gate / validate_session) or an independent
     test-retest. Keep this only as a labeled diagnostic ("self-consistency floor").
     """
     idx = np.asarray(kp_indices)

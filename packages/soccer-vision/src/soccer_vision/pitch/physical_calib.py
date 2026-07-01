@@ -1,7 +1,7 @@
 """Physical per-frame calibration for a fixed camera: each clicked (anchor) frame is a
 real camera pose H = K[r1|r2|t] against the rigid 9v9 field; unclicked frames are filled by
 bracket-propagating the neighbouring anchors through the inter-frame chain. Replaces the
-free-homography bundle (pitch.global_calib). Pure: no I/O."""
+earlier free-homography bundle. Pure: no I/O."""
 from __future__ import annotations
 
 import math

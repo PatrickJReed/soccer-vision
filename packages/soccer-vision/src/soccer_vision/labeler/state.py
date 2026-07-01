@@ -57,9 +57,9 @@ class LabelerState:
         *,
         size: tuple[int, int],
         line_band: int = 60,
-        # green threshold on the per-frame reprojection RMS (px). The field-anchored
-        # bundle fits one homography per segment, so this is a soft confidence penalty
-        # (the export gate is whole-field GREEN), not the gate itself. Tunable per session.
+        # Diagnostic-only display threshold served to the frontend for colouring the
+        # per-frame residual readout. The physical engine does not use an in-sample residual
+        # gate (export is gated on whole-field GREEN status), so this affects UI colour only.
         residual_px_threshold: float = 60.0,
         outlier_px: float = 40.0,
         autosave_path: Path | None = None,

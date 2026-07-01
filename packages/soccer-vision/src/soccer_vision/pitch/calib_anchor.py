@@ -1,10 +1,9 @@
 """Clicked-frame outlier flagging + small camera-pose helpers for a fixed-camera session.
 
-The per-frame propagation engines (and the three-way `calib_compare` harness) were retired
-once the field-anchored bundle solver (`pitch.global_calib.solve_bundle`) became the live
-labeler path. What remains here is the robust per-clicked-frame outlier detector
-(`flag_outlier_clicks` + its planar-safe `_robust_sqpnp`) and a few pose -> homography /
-reprojection helpers. Internally full-pixel image space. Pure: no I/O.
+The live labeler path is the physical per-frame calibration (`pitch.physical_calib`). What
+remains here is the robust per-clicked-frame outlier detector (`flag_outlier_clicks` + its
+planar-safe `_robust_sqpnp`) and a few pose -> homography / reprojection helpers used by that
+engine. Internally full-pixel image space. Pure: no I/O.
 """
 
 from __future__ import annotations

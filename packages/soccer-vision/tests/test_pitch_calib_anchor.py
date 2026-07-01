@@ -1,7 +1,7 @@
 """Tests for the retained fixed-camera calib helpers.
 
 The per-frame propagation engines (Engine A/B + gated) and the calib_compare harness were
-retired in favour of the field-anchored bundle solver (pitch.global_calib); what remains
+retired in favour of the physical per-frame calibration (pitch.physical_calib); what remains
 here is flag_outlier_clicks / _robust_sqpnp plus the pose -> homography / reprojection
 helpers (and the shared manual_anchor click-propagation primitives).
 """

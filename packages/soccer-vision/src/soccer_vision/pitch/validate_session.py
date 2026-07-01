@@ -98,9 +98,12 @@ def render_spotcheck(
         h_pitch_to_px = np.diag([float(w), float(h), 1.0]) @ np.linalg.inv(h_norm)
         for a, b in _SKELETON:
             samples = np.linspace(a, b, 50)
-            poly = clipped_polyline(h_pitch_to_px, samples, size=size, margin=60)
-            for p, q in itertools.pairwise(poly):
-                cv2.line(frame, p, q, (0, 255, 255), 2, cv2.LINE_AA)
+            # Clip per-segment so a line that exits the frame / dips behind the camera
+            # BREAKS instead of drawing a spurious chord across the dropped gap.
+            for s0, s1 in itertools.pairwise(samples):
+                seg = clipped_polyline(h_pitch_to_px, np.array([s0, s1]), size=size, margin=60)
+                if len(seg) == 2:
+                    cv2.line(frame, seg[0], seg[1], (0, 255, 255), 2, cv2.LINE_AA)
         tag = f"frame {f}  {calib.status(f)}  {'anchor' if calib.is_anchor(f) else 'propagated'}"
         cv2.putText(frame, tag, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 5)
         cv2.putText(frame, tag, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)

@@ -218,3 +218,18 @@ def test_gate_fails_without_foreground() -> None:
     rep = evaluate_gate(pts, [], SIZE, transforms)   # no near-touchline -> unmeasurable
     assert rep.fg_n == 0
     assert not rep.passed_numeric
+
+
+def test_grade_yellow_when_near_touchline_is_wrong() -> None:
+    # The foreground hold-out is GENUINE: a deliberately-displaced near-touchline must not
+    # pass (its endpoints are held out of the refit too), so the anchor stays yellow while
+    # the honestly-clicked anchors go green.
+    pts, lns, transforms = _gate_fixture()
+    bad_frame = min(GATE_POSES)
+    corrupted = [LineClick(lc.frame, lc.line_id, lc.x + 0.3, lc.y)
+                 if lc.frame == bad_frame and lc.line_id == "near_touchline" else lc
+                 for lc in lns]
+    calib = solve_session(pts, corrupted, SIZE, transforms)
+    assert calib.coverage_grade[bad_frame] == "yellow"          # wrong near-TL -> not green
+    other = next(f for f in GATE_POSES if f != bad_frame)
+    assert calib.coverage_grade[other] == "green"               # honest anchors still green

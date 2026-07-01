@@ -15,6 +15,7 @@ from numpy.typing import NDArray
 
 from soccer_vision.calib.calibrate import CalibError, calibrate_camera, refine_pose
 from soccer_vision.calib.field_model import (
+    FIELD_LINES,
     LENGTH_M,
     METRES_TO_FEET,
     WIDTH_M,
@@ -33,6 +34,9 @@ FOREGROUND_OK_FT = 8.0
 GRID_N = 9
 _FT = METRES_TO_FEET
 _SCALE = np.array([WIDTH_M, LENGTH_M])
+# Point landmarks that lie ON the near touchline (its endpoints, x=0). They must be held
+# out alongside the near-touchline LINE clicks, else the foreground self-check is circular.
+_NEAR_TL_POINT_IDS = set(FIELD_LINES["near_touchline"])  # {0, 2}
 
 
 def _group(items: Sequence[Any]) -> dict[int, list[Any]]:
@@ -84,12 +88,16 @@ def _anchor_pose(
     img = np.array([[x, y] for _, x, y in po], dtype=np.float64)
     fp = field_points_3d()
     ok, _rv_raw, _tv_raw = cv2.solvePnP(fp[ids], img, np.asarray(k), None, flags=cv2.SOLVEPNP_SQPNP)
-    if not ok:
+    # SQPNP is the data-driven, robust init; prefer it always. A warm-start seed is used
+    # ONLY when SQPNP fails to converge, so a stale seed can never pull LM off the SQPNP basin.
+    if ok:
+        rv: NDArray[np.float64] = np.asarray(_rv_raw, dtype=np.float64)
+        tv: NDArray[np.float64] = np.asarray(_tv_raw, dtype=np.float64)
+    elif seed_pose is not None:
+        rv = np.asarray(seed_pose[0], dtype=np.float64)
+        tv = np.asarray(seed_pose[1], dtype=np.float64)
+    else:
         return None
-    rv: NDArray[np.float64] = np.asarray(_rv_raw, dtype=np.float64)
-    tv: NDArray[np.float64] = np.asarray(_tv_raw, dtype=np.float64)
-    if seed_pose is not None:
-        rv, tv = np.asarray(seed_pose[0], dtype=np.float64), np.asarray(seed_pose[1], dtype=np.float64)
     try:
         rv, tv = refine_pose(k, rv, tv, po, lo)
     except CalibError:
@@ -103,16 +111,20 @@ def _foreground_errors(
     line_clicks: Sequence[LineClick],
     size: tuple[int, int],
 ) -> list[float] | None:
-    """Held-out near-touchline error (feet) for ONE frame: refit the pose WITHOUT its
-    near-touchline clicks (points + any other lines only), then measure how far those
-    near-touchline clicks land from the x=0 line. None if the frame has no near-touchline
-    click (foreground unverifiable)."""
+    """Held-out near-touchline error (feet) for ONE frame: refit the pose WITHOUT any
+    near-touchline evidence -- both the near-touchline LINE clicks AND the point landmarks
+    that lie on it (its endpoints, x=0) -- then measure how far the near-touchline clicks
+    land from the x=0 line. None if the frame has no near-touchline click (foreground
+    unverifiable) or too few remaining points to refit a pose."""
     if not any(lc.line_id == "near_touchline" for lc in line_clicks):
         return None
     w, h = size
     lo_fit = [(lc.line_id, lc.x * w, lc.y * h)
               for lc in line_clicks if lc.line_id != "near_touchline"]
-    pose = _anchor_pose(k, po, lo_fit, None)
+    po_fit = [obs for obs in po if obs[0] not in _NEAR_TL_POINT_IDS]
+    if len(po_fit) < 4:
+        return None  # not enough off-near-touchline points to genuinely hold it out
+    pose = _anchor_pose(k, po_fit, lo_fit, None)
     if pose is None:
         return None
     rv, tv = pose

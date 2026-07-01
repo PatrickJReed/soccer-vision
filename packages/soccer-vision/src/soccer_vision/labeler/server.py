@@ -197,6 +197,10 @@ def restore_session(
         lns = line_clicks_from_parquet(lc_path, size) if lc_path.exists() else []
         src = str(resume)
     elif sidecar.exists():
+        # Insurance: snapshot the sidecar before restoring, so a bug in the restore/autosave
+        # path can never silently destroy a session with no recoverable copy.
+        import shutil
+        shutil.copy2(sidecar, sidecar.with_suffix(sidecar.suffix + ".bak"))
         pts = clicks_from_sidecar(sidecar)
         lns = line_clicks_from_sidecar(sidecar)
         src = str(sidecar)

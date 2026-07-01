@@ -208,17 +208,22 @@ def run(
             backup = sidecar.parent / (sidecar.name + ".bak")
             sidecar.replace(backup)
             print(f"existing autosave backed up to {backup}")
-        state.add_clicks(clicks_from_keypoints_parquet(resume, size))
-        print(f"resumed {len(state.clicks)} clicks from {resume}")
-    elif sidecar.exists():
-        state.add_clicks(clicks_from_sidecar(sidecar))
-        print(f"restored {len(state.clicks)} clicks from autosave {sidecar}")
-    if resume is not None:
         lc_path = Path(resume).parent / "line_clicks.parquet"
-        if lc_path.exists():
-            state.add_line_clicks(line_clicks_from_parquet(lc_path, size))
+        restore_lines = line_clicks_from_parquet(lc_path, size) if lc_path.exists() else []
+        state.add_clicks(clicks_from_keypoints_parquet(resume, size))
+        if restore_lines:
+            state.add_line_clicks(restore_lines)
+        print(f"resumed {len(state.clicks)} clicks + {len(state.line_clicks)} lines from {resume}")
     elif sidecar.exists():
-        state.add_line_clicks(line_clicks_from_sidecar(sidecar))
+        # Read BOTH points and lines from the sidecar BEFORE any add_*, because add_clicks
+        # autosaves and would otherwise clobber the (not-yet-restored) lines to [] on disk.
+        restore_pts = clicks_from_sidecar(sidecar)
+        restore_lns = line_clicks_from_sidecar(sidecar)
+        state.add_clicks(restore_pts)
+        if restore_lns:
+            state.add_line_clicks(restore_lns)
+        print(f"restored {len(state.clicks)} clicks + {len(state.line_clicks)} lines "
+              f"from autosave {sidecar}")
     cap = cv2.VideoCapture(str(video_path))
     frame_jpeg = make_frame_jpeg(cap, downscale_display)
 

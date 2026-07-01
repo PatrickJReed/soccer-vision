@@ -29,6 +29,10 @@ function inv3(m){ // invert a flat 9-array 3x3
 }
 function applyH(m,x,y){ const w=m[6]*x+m[7]*y+m[8];
   return [(m[0]*x+m[1]*y+m[2])/w, (m[3]*x+m[4]*y+m[5])/w]; }
+// project with the homogeneous w so callers can drop points BEHIND the camera (w<=0),
+// which otherwise flip to garbage pixels ("lines in the sky").
+function projW(m,x,y){ const w=m[6]*x+m[7]*y+m[8];
+  return [(m[0]*x+m[1]*y+m[2])/w, (m[3]*x+m[4]*y+m[5])/w, w]; }
 
 function renderPalette(){
   const p=document.getElementById("palette");
@@ -59,10 +63,19 @@ function drawOverlay(){
   if(!showGrid || !curH || !LXY.length) return;
   const hi=inv3(curH); if(!hi) return;            // pitch -> normalized image
   ctx.strokeStyle="#39d98a"; ctx.lineWidth=1.5; ctx.globalAlpha=0.85;
+  const NS=24;                                     // samples per edge
   for(const [a,b] of EDGES){
-    const pa=applyH(hi, LXY[a][0], LXY[a][1]), pb=applyH(hi, LXY[b][0], LXY[b][1]);
-    ctx.beginPath(); ctx.moveTo(pa[0]*canvas.width, pa[1]*canvas.height);
-    ctx.lineTo(pb[0]*canvas.width, pb[1]*canvas.height); ctx.stroke();
+    const ax=LXY[a][0], ay=LXY[a][1], bx=LXY[b][0], by=LXY[b][1];
+    let prev=null;                                 // previous IN-FRONT pixel, or null
+    for(let k=0;k<=NS;k++){
+      const t=k/NS, px=ax+(bx-ax)*t, py=ay+(by-ay)*t;
+      const q=projW(hi, px, py);
+      // clip to the part of the edge in front of the camera; a segment that crosses
+      // behind the camera BREAKS here instead of drawing a spurious line to the horizon.
+      const cur = q[2]>1e-9 ? [q[0]*canvas.width, q[1]*canvas.height] : null;
+      if(cur && prev){ ctx.beginPath(); ctx.moveTo(prev[0],prev[1]); ctx.lineTo(cur[0],cur[1]); ctx.stroke(); }
+      prev=cur;
+    }
   }
   ctx.globalAlpha=1.0;
 }

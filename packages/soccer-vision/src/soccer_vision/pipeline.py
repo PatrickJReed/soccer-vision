@@ -3,6 +3,11 @@
 assemble_phases is pure (no models, no GPU, no ultralytics/sports import) so the
 integration logic is testable without a GPU. analyze_video / assemble_from_parquet / assemble_from_homographies add model
 invocation and parquet I/O around it.
+
+SCOPE GUARD: this glue is complete and is NOT the bottleneck. Do not add new pipeline/
+eval/export surface (public functions, report fields, consumers) until a binding
+constraint is unblocked — a trustworthy homography (SP1) or the §6 metrics layer (SP5).
+See docs/superpowers/plans/2026-06-26-pipeline-eval-cleanup.md (Process notes, F8).
 """
 
 from __future__ import annotations
@@ -12,7 +17,6 @@ import logging
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import cv2
 import numpy as np
@@ -35,6 +39,7 @@ from soccer_vision.pitch.propagation import (
     compute_interframe_homographies,
     propagate_homographies,
 )
+from soccer_vision.tracking.base import TrackingBackend
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +58,26 @@ class PipelineResult:
     propagated_coverage: float   # fraction filled by propagation
 
 
+def _highest_conf_ball_per_frame(ball: pd.DataFrame) -> pd.DataFrame:
+    """Pick the single highest-confidence ball detection per frame, ATOMICALLY.
+
+    Returns a frame-indexed DataFrame whose x_pitch/y_pitch come together from the one
+    highest-conf row per frame. groupby().last() on the columns skips NaN per column
+    independently, so a high-conf row with x_pitch valid but y_pitch NaN could borrow
+    y_pitch from a different, lower-conf row (a "Frankenstein" ball). idxmax on conf
+    selects whole rows, so x and y always come from the same detection. Behaviour is
+    identical under the filter_outside_pitch invariant (no row has exactly one of x/y
+    NaN by this point); this only fixes the degenerate case that invariant hides.
+    """
+    if ball.empty:
+        return pd.DataFrame(
+            {"x_pitch": pd.Series(dtype="float64"), "y_pitch": pd.Series(dtype="float64")},
+            index=pd.Index([], dtype="int64", name="frame"),
+        )
+    idx = ball.groupby("frame")["conf"].idxmax()
+    return ball.loc[idx, ["frame", "x_pitch", "y_pitch"]].set_index("frame")
+
+
 def assemble_phases(
     trajectories_px: pd.DataFrame,
     keypoints: pd.DataFrame,
@@ -65,12 +90,19 @@ def assemble_phases(
     filter_margin: float = 0.05,
     possession_thresholds: PossessionThresholds | None = None,
     transition_seconds: float = 5.0,
+    halftime_frame: int | None = None,
 ) -> PipelineResult:
     """Run the full pitch + phase chain on tracker output. Pure; no I/O.
 
     When `homographies` (a precomputed {frame: HomographyEntry} from the propagation
     stage) is given, it is used directly; otherwise homographies are computed from
     keypoints (landmark anchors + carry-forward smoothing) exactly as before.
+
+    In the keypoint branch only landmark-anchor frames are provenance-bearing; a
+    carry-forward (smoothed) frame is still mapped to pitch coords but recorded with
+    homography_source="none" (it is intentionally excluded from anchor coverage). So
+    downstream code must NOT treat homography_source=="none" as "no pitch coords" —
+    check x_pitch/y_pitch for NaN instead.
     """
     if homographies is not None:
         h_entries = homographies
@@ -88,6 +120,9 @@ def assemble_phases(
 
     enriched = PitchMapper().transform(trajectories_px, h_map)
     enriched = filter_outside_pitch(enriched, margin=filter_margin)
+    # Idempotent for the roboflow backend (team is already per-track-constant from
+    # _classify_teams_per_track), but a real per-track smoother for backends that
+    # predict team per frame, so it stays in the chain.
     enriched = apply_modal_team_per_track(enriched)
     validate_trajectories(enriched)
 
@@ -97,14 +132,17 @@ def assemble_phases(
 
     # Highest-confidence ball per frame (multiple low-conf detections are possible at conf=0.05).
     ball = enriched[enriched["class"] == "ball"]
-    ball_by_frame = ball.sort_values("conf").groupby("frame")[["x_pitch", "y_pitch"]].last()
+    ball_by_frame = _highest_conf_ball_per_frame(ball)
 
     full_index = pd.RangeIndex(0, total_frames, name="frame")
     poss_full = poss_smoothed.reindex(full_index, fill_value="unknown")
     ball_x_full = ball_by_frame["x_pitch"].reindex(full_index)
     ball_y_full = ball_by_frame["y_pitch"].reindex(full_index)
 
-    phase_series = label_phase(poss_full, ball_y_full, fps, transition_seconds=transition_seconds)
+    phase_series = label_phase(
+        poss_full, ball_y_full, fps,
+        transition_seconds=transition_seconds, halftime_frame=halftime_frame,
+    )
 
     valid = {f: e for f, e in h_entries.items() if 0 <= f < total_frames}
     src = pd.Series("none", index=full_index)
@@ -186,17 +224,48 @@ def assemble_from_parquet(
     out_dir: Path,
     *,
     fps: float | None = None,
+    homographies_path: Path | None = None,
     **assemble_opts: object,
 ) -> PipelineResult:
     """Re-run the pure assembly stage from a Stage-1 checkpoint and write deliverables.
 
-    This is the cheap-recompute path: tweak thresholds without re-running GPU tracking.
+    Cheap-recompute path: tweak assemble thresholds without re-running GPU tracking. To
+    reproduce the PRODUCTION deliverable it must replay the same homographies
+    analyze_video wrote (homographies.parquet), not re-derive them from raw keypoints:
+
+      * If a homographies.parquet is found (explicit ``homographies_path``, else a
+        sibling of ``trajectories_px_path``), it is read and replayed verbatim — this
+        branch is identical to ``assemble_from_homographies`` and reproduces production.
+      * If none is found, it falls back to recomputing homographies from the raw
+        keypoint anchors (``build_frame_homographies`` + carry-forward smoothing) and
+        logs a warning. That fallback is a DIFFERENT homography source than production
+        (raw detected anchors, no propagation / no manual labeler), so its coverage and
+        pitch coords will not match the deliverable.
     """
     trajectories_px = pd.read_parquet(trajectories_px_path)
     keypoints = pd.read_parquet(keypoints_path)
     resolved_fps, total_frames = _resolve_fps_and_frames(trajectories_px, fps)
+
+    hom_path = homographies_path
+    if hom_path is None:
+        sibling = Path(trajectories_px_path).parent / "homographies.parquet"
+        if sibling.exists():
+            hom_path = sibling
+
+    homographies: dict[int, HomographyEntry] | None = None
+    if hom_path is not None and Path(hom_path).exists():
+        homographies = homographies_from_parquet(Path(hom_path))
+    else:
+        logger.warning(
+            "homographies.parquet not found alongside %s; recomputing from raw keypoint "
+            "anchors — this is NOT the production homography source (use "
+            "assemble_from_homographies to replay the deliverable).",
+            trajectories_px_path,
+        )
+
     result = assemble_phases(
-        trajectories_px, keypoints, fps=resolved_fps, total_frames=total_frames, **assemble_opts  # type: ignore[arg-type]
+        trajectories_px, keypoints, fps=resolved_fps, total_frames=total_frames,
+        homographies=homographies, **assemble_opts,  # type: ignore[arg-type]
     )
     _write_deliverables(result, Path(out_dir))
     return result
@@ -206,7 +275,8 @@ def analyze_video(
     video_path: Path,
     out_dir: Path,
     *,
-    backend: Any | None = None,
+    backend: TrackingBackend | None = None,
+    own_kit: str | None = None,
     **assemble_opts: object,
 ) -> PipelineResult:
     """Run the full pipeline on a video and write checkpoints + deliverables.
@@ -214,6 +284,13 @@ def analyze_video(
     Stage 1 (GPU): pitch-aware tracking + checkpoints. Stage 2 (CPU): propagate
     homographies from anchors → homographies.parquet. Stage 3 (pure): assemble +
     write deliverables.
+
+    own_kit grounds own/opp. When given (e.g. "white", "dark blue"), the verified
+    hygiene grounding is chained (stitch fragments -> kit-cluster -> map_own_cluster
+    -> positional goalkeeper assignment -> balance gate); the cleaned, grounded
+    trajectories are assembled, so possession/phase are computed on grounded labels.
+    When None, behaviour is unchanged BUT a loud warning is emitted: the tracker's
+    own/opp comes from an arbitrary KMeans cluster index and may be globally inverted.
     """
     if backend is None:
         from soccer_vision.tracking.roboflow import (
@@ -233,8 +310,39 @@ def analyze_video(
     homographies_to_parquet(homographies, out / "homographies.parquet")
 
     resolved_fps, total_frames = _resolve_fps_and_frames(trajectories_px)
+
+    if own_kit is not None:
+        # Lazy import: hygiene.run imports homographies_from_parquet from THIS module,
+        # so a top-level import would be circular (mirrors the lazy RoboflowBackend above).
+        from soccer_vision.hygiene.run import run_hygiene
+
+        report = run_hygiene(
+            traj_path=out / "trajectories_px.parquet",
+            homographies_path=out / "homographies.parquet",
+            video_path=video_path,
+            out_dir=out,
+            own_kit=own_kit,
+        )
+        balance = report.get("balance") or {}
+        if not balance.get("passed", False):
+            logger.warning(
+                "hygiene balance gate FAILED (own:opp ratio=%s) — own/opp grounding may be "
+                "unreliable; inspect %s and the team_cluster_*.png contact sheets",
+                balance.get("ratio"), out / "hygiene_report.json",
+            )
+        if report.get("warning"):
+            logger.warning("hygiene grounding warning: %s", report["warning"])
+        trajectories_for_assembly = pd.read_parquet(out / "trajectories_px_clean.parquet")
+    else:
+        logger.warning(
+            "own/opp UNGROUNDED: team labels come from an arbitrary KMeans cluster index and "
+            "may be GLOBALLY INVERTED. Pass own_kit=\"<your shirt colour>\" (or run "
+            "`python -m soccer_vision.hygiene`) for trustworthy own-team analytics."
+        )
+        trajectories_for_assembly = trajectories_px
+
     result = assemble_phases(
-        trajectories_px, keypoints, fps=resolved_fps, total_frames=total_frames,
+        trajectories_for_assembly, keypoints, fps=resolved_fps, total_frames=total_frames,
         homographies=homographies, **assemble_opts,  # type: ignore[arg-type]
     )
     _write_deliverables(result, out)

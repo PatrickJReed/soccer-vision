@@ -33,6 +33,11 @@ class _MockBackend:
             }
         )
 
+    def process_with_pitch(self, video_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+        return self.process(video_path), pd.DataFrame(
+            columns=["frame", "kp_idx", "x_px", "y_px", "conf"]
+        )
+
 
 def test_mock_backend_is_a_tracking_backend() -> None:
     backend: TrackingBackend = _MockBackend()
@@ -50,3 +55,16 @@ def test_protocol_is_runtime_checkable() -> None:
     """The protocol should be runtime-checkable for adapter conformance."""
     backend = _MockBackend()
     assert isinstance(backend, TrackingBackend)
+
+
+def test_protocol_requires_process_with_pitch() -> None:
+    """A backend lacking process_with_pitch is NOT a TrackingBackend (runtime_checkable)."""
+
+    class _ProcessOnly:
+        name = "x"
+        version = "0"
+
+        def process(self, video_path: Path) -> pd.DataFrame:  # pragma: no cover - structural
+            return pd.DataFrame()
+
+    assert not isinstance(_ProcessOnly(), TrackingBackend)

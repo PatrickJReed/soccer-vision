@@ -40,3 +40,17 @@ def test_mock_emits_two_teams_with_eight_players_each(tiny_video: Path) -> None:
     frame0 = df[df["frame"] == 0]
     assert (frame0["team"] == "own").sum() == 8
     assert (frame0["team"] == "opp").sum() == 8
+
+
+def test_mock_process_with_pitch_returns_schema_conformant_pair(tiny_video: Path) -> None:
+    backend = MockBackend()
+    df, kp_df = backend.process_with_pitch(tiny_video)
+    validate_trajectories(df)
+    assert list(kp_df.columns) == ["frame", "kp_idx", "x_px", "y_px", "conf"]
+    assert len(kp_df) == 0  # mock emits no keypoints, but the frame is schema-conformant
+
+
+def test_mock_satisfies_extended_protocol() -> None:
+    backend = MockBackend()
+    assert isinstance(backend, TrackingBackend)  # now requires process_with_pitch too
+    assert hasattr(backend, "process_with_pitch")

@@ -13,13 +13,17 @@
   .kp { padding:3px 6px; border-radius:4px; font-size:12px; cursor:pointer; }
   .kp.armed { background:#2a3550; outline:1px solid #4aa8ff; }
   .kp.placed { color:#7ee0a6; }
-  #timeline { height:24px; display:flex; border:1px solid #2a2f3a; border-radius:4px; overflow:hidden; margin-top:10px; }
-  #timeline div { height:100%; }
+  #timeline { position:relative; height:24px; display:flex; border:1px solid #2a2f3a; border-radius:4px; overflow:hidden; margin-top:6px; cursor:pointer; }
+  #timeline > div { height:100%; }
+  #tlmarker { position:absolute; top:0; width:2px; height:100%; background:#fff; box-shadow:0 0 3px #000; transform:translateX(-1px); pointer-events:none; z-index:2; }
+  #ticks { position:relative; height:14px; margin-top:2px; font-size:10px; color:#8a94a3; }
+  #ticks .tick { position:absolute; transform:translateX(-50%); white-space:nowrap; }
+  #ticks .tick::before { content:""; position:absolute; top:-3px; left:50%; width:1px; height:3px; background:#3a424f; }
   .stats { font-size:13px; margin-top:8px; display:flex; gap:18px; }
   .btn { background:#222a36; border:1px solid #313a48; color:#dfe7ee; padding:5px 10px; border-radius:5px; font-size:12px; cursor:pointer; }
   .btn.primary { background:#1f6f43; border-color:#2a8a55; }
   #controls { margin-top:8px; display:flex; gap:6px; align-items:center; }
-  input[type=range] { flex:1; }
+  #scrub { width:100%; margin:8px 0 0; display:block; }
 </style>
 </head>
 <body>
@@ -28,11 +32,12 @@
       <div id="frame"><canvas id="canvas" width="960" height="540"></canvas></div>
       <div id="controls">
         <button class="btn" id="prevRed">◀ red</button>
-        <input type="range" id="scrub" min="0" value="0">
         <button class="btn" id="nextRed">red ▶</button>
-        <span id="frameNum">0</span>
+        <span style="font-size:13px">frame <b id="frameNum">0</b> / <span id="frameMax">0</span></span>
       </div>
-      <div id="timeline"></div>
+      <input type="range" id="scrub" min="0" value="0">
+      <div id="timeline" title="click to jump to a frame"></div>
+      <div id="ticks"></div>
       <div class="stats">
         <span>coverage <b id="cov">0%</b></span>
         <span>residual <b id="res">—</b></span>

@@ -181,3 +181,44 @@ def test_score_by_split_groups() -> None:
     assert set(reps) == {"unseen_field", "unseen_time"}
     assert reps["unseen_time"].accurate_coverage == 1.0   # perfect frame
     assert reps["unseen_field"].accurate_coverage == 0.0   # bad frame
+
+
+def _one_end_gt_homography() -> np.ndarray:
+    # full frame maps to the OWN HALF only: pitch x in [0,0.6], y in [0,0.5].
+    img = np.array([[0, 0], [_W, 0], [_W, _H], [0, _H]], dtype=float)
+    pitch = np.array([[0.0, 0.0], [0.6, 0.0], [0.6, 0.5], [0.0, 0.5]])
+    return fit_homography(img, pitch)
+
+
+def test_single_end_gt_never_scores_far_end_landmarks() -> None:
+    # Characterization of the blind spot: a one-end GT cannot score the far end at all.
+    h_gt = _one_end_gt_homography()
+    far = [i for i in range(len(PITCH_LANDMARKS)) if PITCH_LANDMARKS[i, 1] > 0.5 and i != 5]
+    near = [i for i in range(len(PITCH_LANDMARKS)) if PITCH_LANDMARKS[i, 1] < 0.5 and i != 5]
+    fs = score_frame(0, h_gt, _perfect_model(h_gt), frame_size=(_W, _H), match_threshold_feet=2.0)
+    assert all(i not in fs.per_kp_feet for i in far)   # far end is never scored
+    assert any(i in fs.gt_visible for i in near)        # near end is scored
+
+
+def test_whole_field_signal_flags_sky_model() -> None:
+    h_gt = _gt_homography()
+    plausible = _perfect_model(h_gt)
+    fs_ok = score_frame(0, h_gt, plausible, frame_size=(_W, _H), match_threshold_feet=2.0)
+
+    sky = plausible.copy()
+    sky[:, 2] = 2.0          # all confident...
+    sky[:, :2] = -9999.0     # ...but all off-frame ("lines in the sky")
+    fs_sky = score_frame(0, h_gt, sky, frame_size=(_W, _H), match_threshold_feet=2.0)
+
+    assert fs_sky.model_in_frame == 0
+    assert fs_ok.model_in_frame >= 4
+    assert fs_ok.model_in_frame > fs_sky.model_in_frame
+
+
+def test_eval_report_aggregates_model_in_frame_median() -> None:
+    h_gt = _gt_homography()
+    gt_homs = {0: h_gt, 1: h_gt}
+    preds = {0: _perfect_model(h_gt), 1: _perfect_model(h_gt)}
+    rep = score_benchmark(gt_homs, preds, frame_size=(_W, _H), match_threshold_feet=2.0)
+    assert rep.model_in_frame_median is not None
+    assert rep.model_in_frame_median >= 4

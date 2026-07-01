@@ -14,15 +14,11 @@ import urllib.request
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast
+from typing import Final, cast
 
 import pandas as pd
 
 from soccer_vision.io.schema import validate_trajectories
-
-if TYPE_CHECKING:
-    # Only imported for type-checking; never executed at runtime at module level.
-    pass
 
 # ---------------------------------------------------------------------------
 # Weight registry
@@ -269,17 +265,38 @@ class RoboflowBackend:
         interpolation of the ball position. Defaults to 15 (~0.5s at 30fps).
         Longer gaps are left as holes (sustained losses, not flicker).
     pitch_weights_path:
-        Optional path to a fine-tuned pitch keypoint detector weights file (.pt).
-        When provided, this model is used instead of the default pitch detector.
-        If the path does not exist, raises FileNotFoundError.
+        Optional opt-in override: path to a custom pitch-keypoint detector (.pt). When
+        None (default), the v1 path loads the registry pitch model (WEIGHTS["pitch"]);
+        no CALLER-supplied weights are loaded unless this is set. analyze_video builds
+        RoboflowBackend(detect_pitch=True) WITHOUT this, so the v1 deliverable never
+        depends on a caller-supplied finetune. If a path is given but does not exist,
+        raises FileNotFoundError.
     detect_pitch:
         When True, download and load the pitch keypoint detection model.
         Required to call process_with_pitch(). Defaults to False to avoid
         downloading the extra weights file unless pitch detection is needed.
+    tracker_kwargs:
+        Extra keyword args forwarded to supervision's ByteTrack constructor.
+        Intentionally empty by default (today's behaviour) and NOT tuned: there is
+        no per-session tracking ground truth to tune against, and track stability
+        is provided downstream by hygiene.stitch_tracks (the 867->400-track result),
+        which the grounded analyze_video path now chains in.
+
+    Notes
+    -----
+    own/opp and goalkeeper team labels emitted here are NOT kit-grounded: the
+    ``sports`` classifier assigns an arbitrary cluster index per track, and
+    goalkeepers go through the same outfield kit classifier so their team may be
+    wrong. The canonical grounded path is ``pipeline.analyze_video(..., own_kit=...)``
+    (or ``python -m soccer_vision.hygiene``), which runs ``hygiene.assign_goalkeepers``
+    positionally and ``hygiene.map_own_cluster`` against the kit hint.
     """
 
     name: Final = "roboflow-sports"
-    version: Final = "main@2026-05-28"
+    # UNPINNED: the real roboflow/sports git ref this adapter wraps is a human input —
+    # replace with the installed commit SHA (e.g. from the uv lockfile) or release tag
+    # before any release. A SHA or vX.Y tag both satisfy the version regex test.
+    version: Final = "UNPINNED"
 
     def __init__(
         self,
@@ -291,6 +308,7 @@ class RoboflowBackend:
         ball_max_gap_frames: int = 15,
         pitch_weights_path: Path | None = None,
         detect_pitch: bool = False,
+        tracker_kwargs: dict[str, object] | None = None,
     ) -> None:
         self._device_override = device
         self._weights_dir = Path(weights_cache_dir) if weights_cache_dir else DEFAULT_CACHE_DIR
@@ -304,6 +322,7 @@ class RoboflowBackend:
             raise FileNotFoundError(f"pitch_weights_path does not exist: {pitch_weights_path}")
         self.pitch_weights_path: Path | None = pitch_weights_path
         self.detect_pitch: bool = detect_pitch
+        self.tracker_kwargs: dict[str, object] = dict(tracker_kwargs or {})
 
     # ------------------------------------------------------------------
     # Weight download helper (lazy gdown import)
@@ -431,35 +450,15 @@ class RoboflowBackend:
         fps: float = cap.get(cv2.CAP_PROP_FPS) or 30.0
         cap.release()
 
-        # ---- Pass 1: collect player crops for TeamClassifier ----------
-        crops: list[object] = []
-        for frame_idx, frame in enumerate(
-            sv.get_video_frames_generator(source_path=str(video_path))
-        ):
-            if frame_idx % 60 != 0:
-                continue
-            result = player_model(frame, device=device, verbose=False)[0]
-            dets = sv.Detections.from_ultralytics(result)
-            # Keep only player/GK class IDs for team classification
-            player_mask = (dets.class_id == _CLS_PLAYER) | (dets.class_id == _CLS_GK)
-            player_dets = dets[player_mask]
-            for xyxy in player_dets.xyxy:
-                x1, y1, x2, y2 = (int(v) for v in xyxy)
-                crop = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
-                if crop.size > 0:
-                    crops.append(crop)
-
-        # Fit TeamClassifier (needs at least 2 crops; skip if blank video)
-        team_classifier: TeamClassifier | None = None
-        if len(crops) >= 2:
-            team_classifier = TeamClassifier(device=device)
-            team_classifier.fit(crops)
-
-        # ---- Pass 2: full detection, tracking, team prediction --------
-        tracker = sv.ByteTrack()
+        # ---- Single streaming pass: detection, tracking, crops, ball, keypoints ----
+        # ByteTrack defaults are intentionally untuned; track stability comes from
+        # downstream hygiene.stitch_tracks. tracker_kwargs defers any tuning to data.
+        tracker = sv.ByteTrack(**self.tracker_kwargs)
         rows: list[dict[str, float | int | str]] = []
         kp_records: list[dict[str, float | int]] = []
-        # Per-track player/GK crops (area, crop); classified in one batch after the pass.
+        # Per-track player/GK crops (area, crop): the TeamClassifier is fit on these
+        # clearest (largest-area) crops AFTER the pass, then predicts per track. This
+        # replaces the old whole-video Pass-1 decode with an equal-or-better fit sample.
         track_crops: dict[int, list[tuple[float, object]]] = {}
 
         for frame_idx, frame in enumerate(
@@ -494,7 +493,7 @@ class RoboflowBackend:
                     team = "ref"
                 else:
                     team = "unknown"
-                    if cls_name in ("player", "goalkeeper") and team_classifier is not None:
+                    if cls_name in ("player", "goalkeeper"):
                         crop = frame[max(0, int(y1)):max(0, int(y2)), max(0, int(x1)):max(0, int(x2))]
                         if crop.size > 0:
                             _keep_top_crop(track_crops, track_id, crop, (x2 - x1) * (y2 - y1))
@@ -527,15 +526,20 @@ class RoboflowBackend:
             )[0]
             b_dets = sv.Detections.from_ultralytics(b_result)
 
-            for j in range(len(b_dets)):
+            # Emit ONLY the highest-conf ball this frame: the synthetic id
+            # (_BALL_TRACK_ID_BASE - frame_idx) is then unique by construction, and
+            # downstream already keeps the top-conf ball per frame, so no consumer impact.
+            n_balls = len(b_dets)
+            if n_balls > 0:
+                if b_dets.confidence is not None:
+                    j = max(range(n_balls), key=lambda k: float(b_dets.confidence[k]))
+                else:
+                    j = 0
                 x1, y1, x2, y2 = b_dets.xyxy[j]
                 x_px = (x1 + x2) / 2.0
                 y_px = (y1 + y2) / 2.0  # center for ball
-
                 conf_val = float(b_dets.confidence[j]) if b_dets.confidence is not None else 0.5
-                # Synthetic track ID: negative space, collision-proof with ByteTrack IDs
                 synthetic_id = _BALL_TRACK_ID_BASE - frame_idx
-
                 rows.append({
                     "frame":    frame_idx,
                     "t_seconds": t_sec,
@@ -573,9 +577,14 @@ class RoboflowBackend:
                             "conf":   c,
                         })
 
-        # ---- Per-track team classification (single batched call) -------
-        # A track's team is effectively constant; classify each track once from
-        # its clearest crops instead of every detection on every frame.
+        # ---- Fit the TeamClassifier on the collected crops, then classify per track --
+        # Single-pass fit: the per-track clearest (largest-area) crops are an equal-or-
+        # better unsupervised 2-cluster sample than the old temporally-subsampled Pass 1.
+        team_classifier: TeamClassifier | None = None
+        all_crops = [crop for lst in track_crops.values() for _, crop in lst]
+        if len(all_crops) >= 2:
+            team_classifier = TeamClassifier(device=device)
+            team_classifier.fit(all_crops)
         if team_classifier is not None and track_crops:
             sampled = {tid: [c for _, c in lst] for tid, lst in track_crops.items()}
             team_map = _classify_teams_per_track(sampled, team_classifier.predict, _CLUSTER_TEAM)

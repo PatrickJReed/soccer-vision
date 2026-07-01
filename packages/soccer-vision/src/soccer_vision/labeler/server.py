@@ -7,6 +7,7 @@ video (chain precompute + JPEG frames) and serves the static UI.
 
 from __future__ import annotations
 
+import functools
 import json
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -18,6 +19,32 @@ import numpy as np
 from soccer_vision.labeler.state import LabelerState
 
 _STATIC = Path(__file__).parent / "static"
+
+
+def make_frame_jpeg(
+    cap: Any, downscale_display: float = 0.5, *, cache_size: int = 64
+) -> Callable[[int], bytes]:
+    """JPEG-bytes provider for a shared VideoCapture, with an LRU cache + sequential
+    fast-path. Assumes ALL-INTRA clips (the documented Trace operating mode), so a
+    per-frame seek is cheap and decode order is stable: when the requested index is the
+    next one in order we read() without an expensive cap.set() seek, and repeat requests
+    for the same index are served from the LRU cache (no re-decode)."""
+    import cv2
+
+    last_pos = {"i": -1}
+
+    def _decode(idx: int) -> bytes:
+        if idx != last_pos["i"] + 1:          # only seek when not reading the next frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        last_pos["i"] = idx
+        if not ok:
+            return b""
+        small = cv2.resize(frame, None, fx=downscale_display, fy=downscale_display)
+        ok2, buf = cv2.imencode(".jpg", small)
+        return bytes(buf.tobytes()) if ok2 else b""
+
+    return functools.lru_cache(maxsize=cache_size)(_decode)
 
 
 def make_handler(
@@ -52,16 +79,18 @@ def make_handler(
             self._send(code, json.dumps(obj).encode(), "application/json")
 
         def _state_payload(self) -> dict[str, Any]:
-            buckets, bucket_size = state.status_buckets()
+            coverage, buckets, bucket_size = state.status_summary()  # one status pass
             return {
                 "n_frames": state.n_frames,
-                "coverage": state.coverage(),
+                "coverage": coverage,
                 "status_buckets": buckets,
                 "bucket_size": bucket_size,
                 "n_clicks": len(state.clicks),
                 "landmark_names": landmark_names,
                 "landmark_xy": xy,
                 "line_names": lines,
+                "pending": state.pending(),
+                "residual_px_threshold": state.residual_px_threshold,
             }
 
         def do_GET(self) -> None:
@@ -140,13 +169,55 @@ def make_handler(
     return LabelerHandler
 
 
+def restore_session(
+    state: LabelerState, *, sidecar: Path, resume: Path | None, size: tuple[int, int]
+) -> None:
+    """Restore point + line clicks into a fresh LabelerState.
+
+    CRITICAL ORDERING: read BOTH points and lines from the source BEFORE any state.add_*
+    call. add_clicks autosaves, and if the lines have not been restored yet it writes
+    line_clicks=[] over the sidecar -- destroying the user's line clicks on disk. Reading
+    both up front makes the intermediate autosave harmless (the lines are re-added and
+    re-saved immediately). This function is unit-tested precisely to lock that ordering.
+    """
+    from soccer_vision.labeler.state import (
+        clicks_from_keypoints_parquet,
+        clicks_from_sidecar,
+        line_clicks_from_parquet,
+        line_clicks_from_sidecar,
+    )
+
+    if resume is not None:
+        if sidecar.exists():
+            backup = sidecar.parent / (sidecar.name + ".bak")
+            sidecar.replace(backup)
+            print(f"existing autosave backed up to {backup}")
+        lc_path = Path(resume).parent / "line_clicks.parquet"
+        pts = clicks_from_keypoints_parquet(resume, size)
+        lns = line_clicks_from_parquet(lc_path, size) if lc_path.exists() else []
+        src = str(resume)
+    elif sidecar.exists():
+        # Insurance: snapshot the sidecar before restoring, so a bug in the restore/autosave
+        # path can never silently destroy a session with no recoverable copy.
+        import shutil
+        shutil.copy2(sidecar, sidecar.with_suffix(sidecar.suffix + ".bak"))
+        pts = clicks_from_sidecar(sidecar)
+        lns = line_clicks_from_sidecar(sidecar)
+        src = str(sidecar)
+    else:
+        return
+    state.add_clicks(pts)
+    if lns:
+        state.add_line_clicks(lns)
+    print(f"restored {len(state.clicks)} clicks + {len(state.line_clicks)} lines from {src}")
+
+
 def run(
     video_path: Path,
     *,
     port: int = 8000,
     downscale_display: float = 0.5,
     export_dir: Path | None = None,
-    window: int = 360,
     resume: Path | None = None,
     workers: int | None = None,
 ) -> None:  # pragma: no cover - launches a blocking server
@@ -160,47 +231,18 @@ def run(
 
     from soccer_vision.calib.field_model import FIELD_LINES
     from soccer_vision.labeler.chain import compute_chain
-    from soccer_vision.labeler.state import (
-        clicks_from_keypoints_parquet,
-        clicks_from_sidecar,
-        line_clicks_from_parquet,
-        line_clicks_from_sidecar,
-    )
     from soccer_vision.pitch.landmarks import LANDMARK_NAMES, PITCH_LANDMARKS
 
     interframe, n_frames, size = compute_chain(video_path, workers=workers)
     cache_dir = Path(video_path).parent / ".sv_labeler_cache"
     sidecar = cache_dir / f"{Path(video_path).stem}.clicks.json"
     state = LabelerState(
-        interframe=interframe, n_frames=n_frames, size=size, window=window,
+        interframe=interframe, n_frames=n_frames, size=size,
         autosave_path=sidecar,
     )
-    if resume is not None:
-        if sidecar.exists():
-            backup = sidecar.parent / (sidecar.name + ".bak")
-            sidecar.replace(backup)
-            print(f"existing autosave backed up to {backup}")
-        state.add_clicks(clicks_from_keypoints_parquet(resume, size))
-        print(f"resumed {len(state.clicks)} clicks from {resume}")
-    elif sidecar.exists():
-        state.add_clicks(clicks_from_sidecar(sidecar))
-        print(f"restored {len(state.clicks)} clicks from autosave {sidecar}")
-    if resume is not None:
-        lc_path = Path(resume).parent / "line_clicks.parquet"
-        if lc_path.exists():
-            state.add_line_clicks(line_clicks_from_parquet(lc_path, size))
-    elif sidecar.exists():
-        state.add_line_clicks(line_clicks_from_sidecar(sidecar))
+    restore_session(state, sidecar=sidecar, resume=resume, size=size)
     cap = cv2.VideoCapture(str(video_path))
-
-    def frame_jpeg(idx: int) -> bytes:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, frame = cap.read()
-        if not ok:
-            return b""
-        small = cv2.resize(frame, None, fx=downscale_display, fy=downscale_display)
-        ok2, buf = cv2.imencode(".jpg", small)
-        return buf.tobytes() if ok2 else b""
+    frame_jpeg = make_frame_jpeg(cap, downscale_display)
 
     names = list(LANDMARK_NAMES)
     xy = [[float(x), float(y)] for x, y in PITCH_LANDMARKS]
@@ -212,3 +254,4 @@ def run(
         httpd.serve_forever()
     finally:
         cap.release()
+        state.stop_worker()

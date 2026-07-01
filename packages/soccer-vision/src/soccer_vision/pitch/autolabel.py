@@ -1,5 +1,9 @@
 """Project canonical pitch landmarks into image pixels to seed keypoint labels.
 
+DEFERRED ML — the Phase 3.5b active-learning loop is deferred. NOTE project_landmarks
+itself is NOT orphaned: it is used LIVE by eval (eval/pitch_metrics.score_frame) and by
+viz/pitch_overlay — do not delete it.
+
 The active-learning loop (Phase 3.5b) runs the current pitch model to get sparse
 anchors, propagates homographies into neighboring frames (pitch/propagation.py),
 then uses this module to project the canonical landmarks BACK into each frame as

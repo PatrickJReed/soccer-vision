@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import cast
 
 import pandas as pd
+import pytest
 from soccer_vision.pipeline import PipelineResult, assemble_phases
 from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 
@@ -41,7 +42,8 @@ def _scene() -> pd.DataFrame:
     # opp player track 101: opp end, always "opp"
     for f in range(3):
         rows.append(_det(f, 101, 0.50, 0.85, "player", "opp"))
-    # ball: f0 near own (build), f1 mid loose, f2 near opp (defend_high)
+    # ball: f0 near own (build), f1 mid loose, f2 near opp (defend_high underlying,
+    # but overlaid as transition: own->loose->opp is a committed own->opp turnover).
     rows.append(_det(0, -1, 0.50, 0.27, "ball", "unknown"))
     rows.append(_det(1, -2, 0.50, 0.55, "ball", "unknown"))
     rows.append(_det(2, -3, 0.50, 0.80, "ball", "unknown"))
@@ -73,7 +75,11 @@ def test_assemble_phases_end_to_end() -> None:
     assert phases.loc[1, "possession_state"] == "loose_ball"
     assert phases.loc[1, "phase"] == "loose_ball"
     assert phases.loc[2, "possession_state"] == "opp"
-    assert phases.loc[2, "phase"] == "defend_high"
+    # §3.3 corrected turnover: own (f0) -> loose_ball (f1) -> opp (f2) is a change of
+    # the last COMMITTED label, so f2 starts the transition window (overlaying the
+    # underlying defend_high). possession_state stays "opp" (above) — only the phase
+    # sub-label is overlaid. (Was "defend_high" under the old direct-adjacency logic.)
+    assert phases.loc[2, "phase"] == "transition"
     # Coverage stats.
     assert result.homography_coverage == 1.0
     assert result.ball_coverage == 1.0
@@ -182,3 +188,117 @@ def test_assemble_phases_legacy_path_marks_anchors() -> None:
     assert set(ph["homography_source"]) <= {"anchor", "none"}
     assert result.propagated_coverage == 0.0
     assert result.anchor_coverage == 1.0   # all 3 frames are landmark anchors in the fixture
+
+
+def test_assemble_from_parquet_reads_sibling_homographies(tmp_path: Path) -> None:
+    import numpy as np
+    from soccer_vision.pipeline import (
+        assemble_from_homographies,
+        assemble_from_parquet,
+        homographies_to_parquet,
+    )
+    from soccer_vision.pitch.propagation import HomographyEntry
+
+    traj = _scene()
+    kp = _identity_keypoints(3)
+    traj_path = tmp_path / "trajectories_px.parquet"
+    kp_path = tmp_path / "keypoints.parquet"
+    traj.to_parquet(traj_path, index=False)
+    kp.to_parquet(kp_path, index=False)
+    # source="manual" distinguishes the parquet path from the keypoint branch ("anchor").
+    homs = {f: HomographyEntry(np.eye(3), "manual", 1.0) for f in range(3)}
+    hom_path = tmp_path / "homographies.parquet"
+    homographies_to_parquet(homs, hom_path)
+
+    result = assemble_from_parquet(traj_path, kp_path, tmp_path / "out_pq")
+
+    ph = result.phases.set_index("frame")
+    # provenance is "manual" (read from parquet), NOT "anchor" (keypoint branch).
+    assert set(ph["homography_source"]) == {"manual"}
+
+    # and it matches assemble_from_homographies on the same parquet, frame-for-frame.
+    result2 = assemble_from_homographies(traj_path, hom_path, tmp_path / "out_hom")
+    pd.testing.assert_frame_equal(result.phases, result2.phases)
+
+
+def test_assemble_from_parquet_falls_back_without_sibling(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    from soccer_vision.pipeline import assemble_from_parquet
+
+    traj = _scene()
+    kp = _identity_keypoints(3)
+    traj_path = tmp_path / "trajectories_px.parquet"
+    kp_path = tmp_path / "keypoints.parquet"
+    traj.to_parquet(traj_path, index=False)
+    kp.to_parquet(kp_path, index=False)
+
+    with caplog.at_level(logging.WARNING):
+        result = assemble_from_parquet(traj_path, kp_path, tmp_path / "out")
+
+    ph = result.phases.set_index("frame")
+    assert set(ph["homography_source"]) <= {"anchor", "none"}  # keypoint-branch fallback
+    assert any("homographies.parquet not found" in r.message for r in caplog.records)
+
+
+def test_highest_conf_ball_pick_is_atomic() -> None:
+    import numpy as np
+    from soccer_vision.pipeline import _highest_conf_ball_per_frame
+
+    # Degenerate case the pitch filter normally prevents: the highest-conf row has
+    # y_pitch NaN. groupby().last() would borrow y_pitch=0.20 from the low-conf row
+    # (a "Frankenstein" ball); the atomic pick must keep y_pitch NaN.
+    ball = pd.DataFrame([
+        {"frame": 0, "conf": 0.9, "x_pitch": 0.50, "y_pitch": np.nan},
+        {"frame": 0, "conf": 0.2, "x_pitch": 0.10, "y_pitch": 0.20},
+    ])
+    out = _highest_conf_ball_per_frame(ball)
+    assert out.loc[0, "x_pitch"] == 0.50
+    assert np.isnan(float(cast(float, out.loc[0, "y_pitch"])))
+
+
+def test_highest_conf_ball_pick_normal_case() -> None:
+    from soccer_vision.pipeline import _highest_conf_ball_per_frame
+
+    ball = pd.DataFrame([
+        {"frame": 0, "conf": 0.9, "x_pitch": 0.50, "y_pitch": 0.60},
+        {"frame": 0, "conf": 0.2, "x_pitch": 0.10, "y_pitch": 0.20},
+        {"frame": 1, "conf": 0.7, "x_pitch": 0.30, "y_pitch": 0.40},
+    ])
+    out = _highest_conf_ball_per_frame(ball)
+    assert out.loc[0, "x_pitch"] == 0.50 and out.loc[0, "y_pitch"] == 0.60
+    assert out.loc[1, "x_pitch"] == 0.30 and out.loc[1, "y_pitch"] == 0.40
+
+
+def test_highest_conf_ball_pick_empty() -> None:
+    ball = pd.DataFrame(
+        columns=["frame", "conf", "x_pitch", "y_pitch"]
+    ).astype({"frame": "int64", "conf": "float64", "x_pitch": "float64", "y_pitch": "float64"})
+    from soccer_vision.pipeline import _highest_conf_ball_per_frame
+    out = _highest_conf_ball_per_frame(ball)
+    assert out.empty
+    assert list(out.columns) == ["x_pitch", "y_pitch"]
+    assert out.index.name == "frame"
+
+
+def test_assemble_phases_halftime_frame_flips_second_half() -> None:
+    """own possession + ball in own third throughout: build before halftime,
+    attack after; default (no kwarg) leaves it build."""
+    rows = []
+    for f in range(4):
+        rows.append(_det(f, 1, 0.50, 0.20, "player", "own"))      # own player by ball
+        rows.append(_det(f, 101, 0.50, 0.95, "player", "opp"))    # opp far away
+        rows.append(_det(f, -1 - f, 0.50, 0.22, "ball", "unknown"))  # ball in own third
+    traj = pd.DataFrame(rows).astype({"frame": "int64", "track_id": "int64"})
+    kp = _identity_keypoints(4)
+
+    flipped = assemble_phases(traj, kp, fps=FPS, total_frames=4, halftime_frame=2)
+    fp = flipped.phases.set_index("frame")
+    assert fp.loc[0, "phase"] == "build"     # before halftime
+    assert fp.loc[2, "phase"] == "attack"    # reflected y=0.78 -> opp 2/3
+    assert set(fp["possession_state"]) == {"own"}  # possession unchanged by the flip
+
+    default = assemble_phases(traj, kp, fps=FPS, total_frames=4)
+    assert default.phases.set_index("frame").loc[2, "phase"] == "build"

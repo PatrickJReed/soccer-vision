@@ -282,6 +282,11 @@ def test_possession_agreement_counts_team_frames_only() -> None:
     assert len(res.disagreements) == 1
     _t0, _t1, gt_s, pred_s = res.disagreements[0]
     assert (gt_s, pred_s) == ("opp", "own")
+    # coverage fields (§3.6): all 6 GT frames attribute a team; pred commits on 5,
+    # abstains via loose_ball on 1.
+    assert res.n_gt_team == 6
+    assert np.isclose(res.pred_commit_rate, 5 / 6)
+    assert np.isclose(res.pred_contested_frac, 1 / 6)
 
 
 def test_possession_agreement_empty_when_nothing_comparable() -> None:
@@ -333,3 +338,55 @@ def test_balance_gate_no_opp_returns_inf_false() -> None:
     ratio, passed = balance_gate(df)
     assert ratio == float("inf")
     assert not passed
+
+
+def test_map_own_cluster_invariant_to_kmeans_label_order() -> None:
+    """KMeans labels its clusters in an arbitrary order; map_own_cluster must pick the SAME
+    physical kit regardless. Same two kits, two centroid orderings -> identical chosen centroid."""
+    white = [250.0, 128.0, 128.0, 100.0, 128.0, 128.0]
+    blue = [40.0, 130.0, 80.0, 180.0, 120.0, 190.0]
+    c01 = np.array([white, blue])
+    c10 = np.array([blue, white])
+    own01, _ = map_own_cluster(c01, "white")
+    own10, _ = map_own_cluster(c10, "white")
+    assert own01 != own10                       # index flips with the label order
+    assert np.allclose(c01[own01], c10[own10])  # but the chosen physical centroid is identical
+
+
+def test_possession_agreement_exposes_abstention() -> None:
+    """Conditional agreement can stay high while the model abstains; pred_commit_rate
+    is the anti-gaming number that drops as abstention widens."""
+    gt = pd.DataFrame({"t_seconds": [0.0], "possession": ["own"]})  # all 'own'
+    base = pd.DataFrame({
+        "frame": range(10),
+        "t_seconds": [float(i) for i in range(10)],
+        "possession_state": ["own"] * 6 + ["contested"] * 4,
+    })
+    res = possession_agreement(gt, base)
+    assert np.isclose(res.agreement, 1.0)          # every committed frame agrees
+    assert np.isclose(res.pred_commit_rate, 0.6)   # 6 / 10 GT-team frames committed
+    assert np.isclose(res.pred_contested_frac, 0.4)
+
+    wider = base.copy()
+    wider["possession_state"] = ["own"] * 4 + ["contested"] * 6
+    res2 = possession_agreement(gt, wider)
+    assert np.isclose(res2.agreement, 1.0)         # still 100% conditional
+    assert res2.pred_commit_rate < res.pred_commit_rate  # abstention is visible
+    assert np.isclose(res2.pred_commit_rate, 0.4)
+
+
+def test_possession_agreement_no_gt_team_frames_no_div_by_zero() -> None:
+    """GT covers no team frames (all 'none' before the first change): coverage
+    fields are defined (0.0), no ZeroDivisionError."""
+    gt = pd.DataFrame({"t_seconds": [5.0], "possession": ["own"]})
+    phases = pd.DataFrame({
+        "frame": range(3),
+        "t_seconds": [0.0, 1.0, 2.0],
+        "possession_state": ["own", "opp", "contested"],
+    })
+    res = possession_agreement(gt, phases)
+    assert res.n_compared == 0
+    assert res.n_gt_team == 0
+    assert res.pred_commit_rate == 0.0
+    assert res.pred_contested_frac == 0.0
+    assert res.disagreements == []

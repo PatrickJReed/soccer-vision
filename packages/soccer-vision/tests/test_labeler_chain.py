@@ -73,3 +73,23 @@ def test_parallel_chain_equals_serial(tmp_path: Path) -> None:
     assert set(serial_if) == set(par_if)
     for k in serial_if:
         assert np.allclose(serial_if[k], par_if[k], atol=1e-9)
+
+
+def test_chain_uses_threads_not_process_pool() -> None:
+    import inspect
+
+    import soccer_vision.labeler.chain as chain_mod
+    src = inspect.getsource(chain_mod)
+    assert "multiprocessing" not in src              # the spawn/pickle hang source is gone
+    assert "ThreadPoolExecutor" in src
+
+
+def test_chain_workers2_equals_serial(tmp_path: Path) -> None:
+    video = tmp_path / "pan.mp4"
+    _write_pan_video(video)
+    serial_if, n1, size1 = compute_chain(video, cache_dir=tmp_path / "s", workers=1)
+    thr_if, n2, size2 = compute_chain(video, cache_dir=tmp_path / "t", workers=2)
+    assert (n1, size1) == (n2, size2)
+    assert set(serial_if) == set(thr_if)            # completing == no hang
+    for k in serial_if:
+        assert np.allclose(serial_if[k], thr_if[k], atol=1e-9)

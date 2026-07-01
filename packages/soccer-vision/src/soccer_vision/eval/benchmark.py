@@ -1,5 +1,9 @@
 """Frozen-benchmark manifest: which held-out fields/frames define the eval set.
 
+DEFERRED ML — defines the eval set for a pitch-keypoint model that is not on the v1
+path. Kept for the ML flywheel (deferred, not cancelled). NOTE the frozen benchmark
+fields the notebook expects (carlsbad / rebels / surf) do not yet exist.
+
 Versioned so every retrain scores the identical frames. Paths are relative to the
 manifest file's directory (portable across machines/Colab).
 """

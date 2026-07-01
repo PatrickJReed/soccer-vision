@@ -323,11 +323,20 @@ def balance_gate(
 
 @dataclass(frozen=True)
 class AgreementResult:
-    """Frame-level possession agreement vs hand-labeled ground truth."""
+    """Frame-level possession agreement vs hand-labeled ground truth.
 
-    n_compared: int
-    agreement: float
+    `agreement` is CONDITIONAL on both sides committing a team (own/opp); the
+    coverage fields expose the abstention that conditional number hides, so the
+    gate cannot be gamed by widening the contested margin (which moves hard frames
+    out of the conditional set and mechanically raises `agreement`).
+    """
+
+    n_compared: int                                     # GT∈{own,opp} AND pred∈{own,opp}
+    agreement: float                                    # conditional agreement over n_compared
     disagreements: list[tuple[float, float, str, str]]  # (t_start, t_end, gt, pred)
+    n_gt_team: int                                      # GT∈{own,opp} (the attributable denom)
+    pred_commit_rate: float                             # n_compared / n_gt_team (drops with abstention)
+    pred_contested_frac: float                          # pred∈{contested,loose_ball} over GT-team frames
 
 
 def expand_ground_truth(gt: pd.DataFrame, t_seconds: pd.Series) -> pd.Series:
@@ -351,15 +360,26 @@ def expand_ground_truth(gt: pd.DataFrame, t_seconds: pd.Series) -> pd.Series:
 def possession_agreement(gt: pd.DataFrame, phases: pd.DataFrame) -> AgreementResult:
     """Compare predicted possession_state with ground truth on team-attributed frames.
 
-    Only frames where BOTH sides say own/opp are compared (loose/contested/
-    unknown/none excluded). Disagreements are merged into contiguous spans.
+    Conditional `agreement` is over frames where BOTH sides say own/opp
+    (loose/contested/unknown/none excluded); disagreements merge into contiguous
+    spans. The coverage fields make abstention visible: `pred_commit_rate` is the
+    share of GT-attributed frames the model also committed (drops as the contested
+    margin widens), and `pred_contested_frac` is the model's contested/loose share
+    over the same GT-attributed frames — a human sanity-check on §6.8 pct_contested,
+    which the {own,opp,none} GT cannot validate directly.
     """
     pred = phases["possession_state"]
     gt_states = expand_ground_truth(gt, phases["t_seconds"])
-    both = pred.isin(["own", "opp"]) & gt_states.isin(["own", "opp"])
+    gt_team = gt_states.isin(["own", "opp"])
+    n_gt_team = int(gt_team.sum())
+    contested_pred = pred.isin(["contested", "loose_ball"]) & gt_team
+    pred_contested_frac = float(contested_pred.sum()) / n_gt_team if n_gt_team else 0.0
+
+    both = pred.isin(["own", "opp"]) & gt_team
     n = int(both.sum())
+    pred_commit_rate = n / n_gt_team if n_gt_team else 0.0
     if n == 0:
-        return AgreementResult(0, 0.0, [])
+        return AgreementResult(0, 0.0, [], n_gt_team, pred_commit_rate, pred_contested_frac)
     agree = pred[both] == gt_states[both]
     spans: list[tuple[float, float, str, str]] = []
     cur: tuple[float, str, str] | None = None
@@ -379,4 +399,6 @@ def possession_agreement(gt: pd.DataFrame, phases: pd.DataFrame) -> AgreementRes
         last_t = t
     if cur is not None:
         spans.append((cur[0], last_t, cur[1], cur[2]))
-    return AgreementResult(n, float(agree.mean()), spans)
+    return AgreementResult(
+        n, float(agree.mean()), spans, n_gt_team, pred_commit_rate, pred_contested_frac
+    )

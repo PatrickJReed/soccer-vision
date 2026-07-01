@@ -15,6 +15,8 @@ from soccer_vision.pitch.manual_anchor import (
     fit_frame_homographies,
     frame_status,
     map_point,
+    propagate_clicks,
+    propagate_clicks_with_distance,
     propagate_line_clicks,
     to_homography_entries,
 )
@@ -270,3 +272,30 @@ def test_propagate_line_clicks_respects_segments() -> None:
     prop = propagate_line_clicks(lcs, transforms, seg, window=10)
     assert 1 in prop                                         # same segment
     assert 4 not in prop                                     # other segment
+
+
+def test_propagate_clicks_with_distance_reports_source_distance() -> None:
+    interframe = {i: np.eye(3) for i in range(6)}
+    seg = build_segments(interframe, 6)
+    transforms = cumulative_transforms(interframe, seg)
+    prop = propagate_clicks_with_distance(
+        [Click(frame=2, kp_idx=3, x=0.4, y=0.6)], transforms, seg, window=10)
+    assert prop[2][3] == (0.4, 0.6, 0.0)   # at source -> distance 0
+    assert prop[5][3] == (0.4, 0.6, 3.0)   # 3 frames away -> distance 3
+
+
+def test_propagate_clicks_with_distance_nearest_source_wins() -> None:
+    interframe = {i: np.eye(3) for i in range(6)}
+    seg = build_segments(interframe, 6)
+    transforms = cumulative_transforms(interframe, seg)
+    clicks = [Click(0, 3, 0.1, 0.1), Click(4, 3, 0.9, 0.9)]
+    prop = propagate_clicks_with_distance(clicks, transforms, seg, window=10)
+    assert prop[3][3] == (0.9, 0.9, 1.0)   # frame 3 nearer to 4 (d=1) than to 0 (d=3)
+
+
+def test_propagate_clicks_delegates_and_drops_distance() -> None:
+    interframe = {i: np.eye(3) for i in range(4)}
+    seg = build_segments(interframe, 4)
+    transforms = cumulative_transforms(interframe, seg)
+    prop = propagate_clicks([Click(0, 3, 0.4, 0.6)], transforms, seg, window=10)
+    assert prop[2][3] == (0.4, 0.6)   # still a 2-tuple, unchanged

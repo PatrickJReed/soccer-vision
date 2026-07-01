@@ -1,4 +1,10 @@
-"""Phase 3a tests: shared propagation + calibration registration engines."""
+"""Tests for the retained fixed-camera calib helpers.
+
+The per-frame propagation engines (Engine A/B + gated) and the calib_compare harness were
+retired in favour of the physical per-frame calibration (pitch.physical_calib); what remains
+here is flag_outlier_clicks / _robust_sqpnp plus the pose -> homography / reprojection
+helpers (and the shared manual_anchor click-propagation primitives).
+"""
 
 from __future__ import annotations
 
@@ -10,14 +16,10 @@ from soccer_vision.calib.calibrate import homography_from_pose, pitch_homography
 from soccer_vision.calib.field_model import field_points_3d
 from soccer_vision.labeler.chain import normalize_homography
 from soccer_vision.pitch.calib_anchor import (
-    FramePose,
     _reproj_rms_px,
     _robust_sqpnp,
-    _rotation_from_chain,
-    calibrate_clicked_frames,
+    flag_outlier_clicks,
     frame_homography,
-    poses_by_click_propagation,
-    poses_by_pose_propagation,
 )
 from soccer_vision.pitch.manual_anchor import (
     Click,
@@ -86,31 +88,6 @@ def test_frame_homography_round_trips_pixel_to_pitch() -> None:
     assert np.hypot(back[0] - 0.3, back[1] - 0.6) < 1e-9
 
 
-def test_calibrate_clicked_frames_recovers_focal() -> None:
-    # synthetic clicks (NORMALIZED) on several elevated views -> shared focal ~1400
-    eyes = [(8.0, 4, 70), (33, 14, 80), (18, 59, 75), (40, 44, 85), (23, -1, 90), (3, 34, 78)]
-    fp = field_points_3d()
-    clicks: list[Click] = []
-    for fidx, e in enumerate(eyes):
-        rvec, tvec = _look_at(e, (22.85, 34.25, 0.0))
-        px = cv2.projectPoints(fp, rvec, tvec, _K, np.zeros(5))[0].reshape(-1, 2)
-        for j in range(21):
-            # 5 = halfway_near, hidden under the camera -> never labeled
-            if j != 5 and 0 < px[j, 0] < 1920 and 0 < px[j, 1] < 1080:
-                clicks.append(Click(fidx, j, float(px[j, 0]) / 1920, float(px[j, 1]) / 1080))
-    k, poses = calibrate_clicked_frames(clicks, (1920, 1080), min_points=6)
-    assert abs(k[0, 0] - 1400.0) < 40.0
-    assert len(poses) >= 3
-    f0 = sorted(poses)[0]
-    assert poses[f0][0].shape == (3, 1) and poses[f0][1].shape == (3, 1)
-
-
-def test_frame_pose_dataclass_fields() -> None:
-    fp_ = FramePose(rvec=np.zeros((3, 1)), tvec=np.zeros((3, 1)),
-                    residual_px=1.5, n_points=7, fold_count=9)
-    assert fp_.residual_px == 1.5 and fp_.n_points == 7 and fp_.fold_count == 9
-
-
 def test_reproj_rms_px_zero_for_exact_and_nan_for_empty() -> None:
     import math
     rvec, tvec = _look_at((-8.0, 34.0, 8.0), (22.85, 34.0, 0.0))
@@ -129,8 +106,7 @@ def _pan_sequence(
 
     Returns ({frame: (rvec, tvec)}, {i: normalized inter-frame homography}); the
     chain is the physically-correct pan homography G = K R_{i+1} R_i^-1 K^-1, so
-    clicks/poses propagate consistently (unlike an identity chain over different
-    views).
+    clicks propagate consistently (unlike an identity chain over different views).
     """
     center = (-8.0, 34.0, 9.0)
     poses: dict[int, tuple[np.ndarray, np.ndarray]] = {}
@@ -163,85 +139,6 @@ def _clicks_at(
     return clicks
 
 
-def test_engine_a_recovers_clicked_and_propagated_frames() -> None:
-    # Realistic fixed-camera pan: a VALID chain links all frames. Clicks at a few
-    # frames calibrate the focal; Engine A propagates to recover EVERY frame's pose
-    # (clicked AND unclicked) against the field -- no fold, no drift.
-    poses, interframe = _pan_sequence(13)
-    clicks = _clicks_at(poses, [0, 4, 8, 12])
-    seg = build_segments(interframe, 13)
-    transforms = cumulative_transforms(interframe, seg)
-    k, _kp = calibrate_clicked_frames(clicks, (1920, 1080), min_points=6)
-    out = poses_by_click_propagation(clicks, transforms, seg, k, (1920, 1080),
-                                     window=360, min_points=4)
-    assert len(out) == 13  # every frame covered (clicked + propagated)
-    fp = field_points_3d()
-    for f in range(13):
-        truth = cv2.projectPoints(fp, poses[f][0], poses[f][1], _K, np.zeros(5))[0].reshape(-1, 2)
-        rec = cv2.projectPoints(fp, out[f].rvec, out[f].tvec, _K, np.zeros(5))[0].reshape(-1, 2)
-        assert np.median(np.linalg.norm(truth - rec, axis=1)) < 1.0  # recovered ~= truth
-        assert out[f].fold_count < 21  # not a fold
-
-
-def test_engine_a_line_obs_path_runs() -> None:
-    # an extra line observation at a frame still solves (refine_pose line path
-    # exercised; real line propagation is Phase 3b).
-    poses, interframe = _pan_sequence(9)
-    clicks = _clicks_at(poses, [0, 4, 8])
-    seg = build_segments(interframe, 9)
-    transforms = cumulative_transforms(interframe, seg)
-    k, _kp = calibrate_clicked_frames(clicks, (1920, 1080), min_points=6)
-    line_obs = {0: [("midline", 960.0, 540.0)]}
-    out = poses_by_click_propagation(clicks, transforms, seg, k, (1920, 1080),
-                                     window=360, min_points=4, line_obs=line_obs)
-    assert 0 in out
-
-
-def test_engine_b_recovers_panned_poses_from_one_clicked_frame() -> None:
-    poses, interframe = _pan_sequence(7)
-    seg = build_segments(interframe, 7)
-    transforms = cumulative_transforms(interframe, seg)
-    # only frame 0 is "clicked" (calibrated); propagate its pose to all others
-    clicked_poses = {0: poses[0]}
-    out = poses_by_pose_propagation(transforms, seg, _K, clicked_poses, (1920, 1080))
-    fp = field_points_3d()
-    for f in range(7):
-        assert f in out
-        truth = cv2.projectPoints(fp, poses[f][0], poses[f][1], _K, np.zeros(5))[0].reshape(-1, 2)
-        rec = cv2.projectPoints(fp, out[f].rvec, out[f].tvec, _K, np.zeros(5))[0].reshape(-1, 2)
-        assert np.max(np.linalg.norm(truth - rec, axis=1)) < 0.5  # prototype: ~1e-11
-        assert out[f].n_points == 0
-
-
-def test_rotation_from_chain_clamps_reflection_to_proper_rotation() -> None:
-    # a reflection (det -1) must be clamped to a PROPER rotation in SO(3) (det +1) --
-    # this exercises the det-sign-flip branch of _rotation_from_chain.
-    g_px = _K @ np.diag([-1.0, 1.0, 1.0]) @ np.linalg.inv(_K)
-    r = _rotation_from_chain(g_px, _K)
-    assert abs(np.linalg.det(r) - 1.0) < 1e-9          # proper rotation
-    assert np.allclose(r @ r.T, np.eye(3), atol=1e-9)  # orthonormal
-
-
-def test_engine_b_uncovered_without_clicked_neighbor() -> None:
-    _poses, interframe = _pan_sequence(5)
-    seg = build_segments(interframe, 5)
-    transforms = cumulative_transforms(interframe, seg)
-    # no clicked frames at all -> nothing covered
-    out = poses_by_pose_propagation(transforms, seg, _K, {}, (1920, 1080))
-    assert out == {}
-
-
-def test_engine_b_nonrotation_chain_does_not_crash() -> None:
-    # a degenerate inter-frame transform -> SVD nearest-rotation, still returns a pose
-    poses, interframe = _pan_sequence(3)
-    interframe[1] = normalize_homography(
-        np.array([[1.0, 0.3, 5.0], [0.0, 1.2, 2.0], [1e-4, 0.0, 1.0]]), (1920, 1080))
-    seg = build_segments(interframe, 3)
-    transforms = cumulative_transforms(interframe, seg)
-    out = poses_by_pose_propagation(transforms, seg, _K, {0: poses[0]}, (1920, 1080))
-    assert all(np.all(np.isfinite(p.rvec)) and np.all(np.isfinite(p.tvec)) for p in out.values())
-
-
 def test_robust_sqpnp_drops_a_gross_outlier_click() -> None:
     # 8 in-frame landmarks from a known pose; corrupt one click by 400px -> the helper
     # must drop exactly that landmark and return a clean inlier pose.
@@ -272,29 +169,16 @@ def test_robust_sqpnp_keeps_all_clean_clicks() -> None:
     assert outliers == [] and set(inliers) == set(ids)
 
 
-def test_engine_a_frames_restricts_targets() -> None:
-    # frames= recomputes only the requested targets (windowed recompute path).
-    poses, interframe = _pan_sequence(9)
-    clicks = _clicks_at(poses, [0, 4, 8])
-    seg = build_segments(interframe, 9)
-    transforms = cumulative_transforms(interframe, seg)
-    k, _kp = calibrate_clicked_frames(clicks, (1920, 1080), min_points=6)
-    out = poses_by_click_propagation(clicks, transforms, seg, k, (1920, 1080),
-                                     window=360, min_points=4, frames=[2, 4])
-    assert set(out) == {2, 4}
-
-
 def test_flag_outlier_clicks_removes_and_flags_a_mislabel() -> None:
     # one clicked landmark corrupted at frame 4 -> flag_outlier_clicks removes it from
-    # clean_clicks and records it; other frames are untouched.
-    from soccer_vision.pitch.calib_anchor import flag_outlier_clicks
+    # clean_clicks and records it; other frames are untouched. The clicks are projected
+    # with _K, so the true intrinsics are passed directly (no separate focal recovery).
     poses, _interframe = _pan_sequence(9)
     clicks = _clicks_at(poses, [0, 4, 8])
     assert any(c.frame == 4 and c.kp_idx == 6 for c in clicks)
     clicks = [c if not (c.frame == 4 and c.kp_idx == 6)
               else Click(c.frame, c.kp_idx, c.x + 0.25, c.y) for c in clicks]
-    k, _kp = calibrate_clicked_frames(clicks, (1920, 1080), min_points=6)
-    clean, flagged = flag_outlier_clicks(clicks, k, (1920, 1080), thr=40.0)
+    clean, flagged = flag_outlier_clicks(clicks, _K, (1920, 1080), thr=40.0)
     assert flagged.get(4) == [6]                                  # mislabel flagged
     assert not any(c.frame == 4 and c.kp_idx == 6 for c in clean)  # removed from clean
     assert len(clean) == len(clicks) - 1                          # only that one dropped

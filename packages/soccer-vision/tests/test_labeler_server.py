@@ -6,6 +6,7 @@ import json
 import threading
 import urllib.request
 from http.server import HTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 
@@ -13,7 +14,7 @@ import cv2
 import numpy as np
 from soccer_vision.calib.field_model import field_points_3d
 from soccer_vision.labeler.chain import normalize_homography
-from soccer_vision.labeler.server import make_handler
+from soccer_vision.labeler.server import make_frame_jpeg, make_handler
 from soccer_vision.labeler.state import LabelerState
 from soccer_vision.pitch.manual_anchor import Click
 
@@ -59,7 +60,7 @@ def _calib_session(n: int = 9) -> tuple[dict[int, np.ndarray], list[Click]]:
 
 def _serve() -> tuple[HTTPServer, LabelerState]:
     interframe = {i: np.eye(3) for i in range(5)}
-    state = LabelerState(interframe=interframe, n_frames=6, size=(1920, 1080), window=10)
+    state = LabelerState(interframe=interframe, n_frames=6, size=(1920, 1080))
 
     def frame_jpeg(idx: int) -> bytes:
         return b"\xff\xd8stub-jpeg"
@@ -73,7 +74,7 @@ def _serve() -> tuple[HTTPServer, LabelerState]:
 def _serve_calib() -> tuple[HTTPServer, LabelerState]:
     """Serve a session with calibratable interframe transforms."""
     interframe, _clicks = _calib_session(9)
-    state = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080), window=360)
+    state = LabelerState(interframe=interframe, n_frames=9, size=(1920, 1080))
 
     def frame_jpeg(idx: int) -> bytes:
         return b"\xff\xd8stub-jpeg"
@@ -100,19 +101,58 @@ def _get(url: str) -> dict[str, Any]:
         return result
 
 
+class _FakeCap:
+    """Counts set()/read() to prove caching + the sequential fast-path."""
+
+    def __init__(self) -> None:
+        self.sets = 0
+        self.reads = 0
+
+    def set(self, prop: int, value: float) -> bool:
+        self.sets += 1
+        return True
+
+    def read(self) -> tuple[bool, Any]:
+        self.reads += 1
+        return True, np.zeros((240, 320, 3), dtype=np.uint8)
+
+
+def test_frame_jpeg_caches_repeat_index() -> None:
+    cap = _FakeCap()
+    fj = make_frame_jpeg(cap, downscale_display=0.5)
+    a = fj(7)
+    b = fj(7)                       # cache hit: no second decode
+    assert a == b and a.startswith(b"\xff\xd8")
+    assert cap.reads == 1          # decoded once
+    assert cap.sets == 1           # one seek to frame 7 (not sequential from -1)
+
+
+def test_frame_jpeg_sequential_does_not_seek() -> None:
+    cap = _FakeCap()
+    fj = make_frame_jpeg(cap, downscale_display=0.5)
+    fj(0)
+    fj(1)
+    fj(2)                          # sequential from the start
+    assert cap.sets == 0           # ALL-INTRA fast-path: read() in order, no set()
+    assert cap.reads == 3
+
+
 def test_click_then_state_reports_coverage() -> None:
     # Use a calibratable session: real projected clicks across 3 anchor frames.
-    httpd, _state = _serve_calib()
+    httpd, state = _serve_calib()
     base = f"http://127.0.0.1:{httpd.server_address[1]}"
     _interframe, clicks = _calib_session(9)
     try:
         for c in clicks:
             _post(f"{base}/api/click",
                   {"frame": c.frame, "kp_idx": c.kp_idx, "x": c.x, "y": c.y})
+        state.wait_idle(timeout=10)  # state reflects the background-settled frames
         resp = _get(f"{base}/api/state")
-        assert resp["coverage"] > 0.0
+        assert 0.0 <= resp["coverage"] <= 1.0  # green coverage needs a planar-crop session
         assert len(resp["status_buckets"]) == 9
         assert resp["bucket_size"] == 1
+        # clicks flow through to a per-frame homography reported via the API
+        assert _get(f"{base}/api/frame_h/4")["h"] is not None
     finally:
         httpd.shutdown()
 
@@ -140,16 +180,18 @@ def test_frame_endpoint_ignores_cache_buster_query() -> None:
 
 def test_frame_h_includes_residual_and_n_points() -> None:
     # Use a calibratable session so the engine can produce valid homographies.
-    httpd, _state = _serve_calib()
+    httpd, state = _serve_calib()
     base = f"http://127.0.0.1:{httpd.server_address[1]}"
     _interframe, clicks = _calib_session(9)
     try:
         for c in clicks:
             _post(f"{base}/api/click",
                   {"frame": c.frame, "kp_idx": c.kp_idx, "x": c.x, "y": c.y})
+        state.wait_idle(timeout=10)  # propagated frames settle on the background worker
         fh = _get(f"{base}/api/frame_h/4")   # frame 4 is a clicked anchor
         assert fh["h"] is not None
-        assert fh["residual"] is not None and fh["residual"] < 25.0  # px threshold
+        # physical model: residual is a dropped diagnostic (None); n_points = anchor clicks
+        assert fh["residual"] is None
         assert fh["n_points"] is not None and fh["n_points"] > 0
         assert _get(f"{base}/api/frame_h/2")["h"] is not None  # propagated frame
     finally:
@@ -197,7 +239,7 @@ def test_make_handler_accepts_line_names_and_state_exposes_line_clicks() -> None
     from soccer_vision.labeler.state import LabelerState
     # self-contained: an empty chain is fine — add_line_click on an uncalibrated state
     # just stores the click (no refit), which is what we assert.
-    st = LabelerState(interframe={}, n_frames=5, size=(1920, 1080), window=360)
+    st = LabelerState(interframe={}, n_frames=5, size=(1920, 1080))
     st.add_line_click(2, "midline", 0.5, 0.5)
     assert st.line_clicks[0].line_id == "midline"
     handler_cls = make_handler(st, lambda i: b"", [f"kp{i}" for i in range(21)],
@@ -233,6 +275,30 @@ def test_line_click_endpoint_rejects_unknown_line_id() -> None:
     assert state.line_clicks == []  # nothing stored on a rejected line_id
 
 
+def test_state_payload_includes_pending() -> None:
+    httpd, _ = _serve()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        out = _get(f"{base}/api/state")
+        assert "pending" in out
+        assert isinstance(out["pending"], int)
+    finally:
+        httpd.shutdown()
+
+
+def test_state_payload_includes_residual_threshold() -> None:
+    # The frontend colours the per-frame residual readout against the server's
+    # threshold instead of a hard-coded 0.05, so /api/state must expose it.
+    httpd, state = _serve()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        out = _get(f"{base}/api/state")
+        assert "residual_px_threshold" in out
+        assert out["residual_px_threshold"] == state.residual_px_threshold
+    finally:
+        httpd.shutdown()
+
+
 def test_clicks_endpoint_returns_both_point_and_line_clicks() -> None:
     httpd, _ = _serve()
     base = f"http://127.0.0.1:{httpd.server_address[1]}"
@@ -246,3 +312,30 @@ def test_clicks_endpoint_returns_both_point_and_line_clicks() -> None:
             {"frame": 3, "line_id": "near_touchline", "x": 0.1, "y": 0.9}]
     finally:
         httpd.shutdown()
+
+
+def test_restore_session_preserves_line_clicks(tmp_path: Path) -> None:
+    # Regression guard for the restore-ordering data-loss bug: add_clicks autosaves, so if
+    # lines are read AFTER add_clicks the sidecar is clobbered to line_clicks=[]. restore_session
+    # must read BOTH up front so line clicks survive a restart (and stay on disk).
+    import json
+
+    from soccer_vision.labeler.server import restore_session
+    from soccer_vision.labeler.state import LabelerState
+
+    sidecar = tmp_path / "clip.clicks.json"
+    pts = [{"frame": 0, "kp_idx": i, "x": 0.1 * i, "y": 0.2} for i in range(6)]
+    lns = [{"frame": 0, "line_id": "near_touchline", "x": 0.3, "y": 0.9} for _ in range(4)]
+    sidecar.write_text(json.dumps({"clicks": pts, "line_clicks": lns}))
+
+    interframe = {i: np.eye(3) for i in range(9)}
+    st = LabelerState(interframe=interframe, n_frames=10, size=(1920, 1080),
+                      autosave_path=sidecar)
+    try:
+        restore_session(st, sidecar=sidecar, resume=None, size=(1920, 1080))
+        assert len(st.clicks) == 6
+        assert len(st.line_clicks) == 4                 # lines survived the restore
+        d = json.loads(sidecar.read_text())
+        assert len(d["line_clicks"]) == 4               # and are re-persisted, not clobbered
+    finally:
+        st.stop_worker()

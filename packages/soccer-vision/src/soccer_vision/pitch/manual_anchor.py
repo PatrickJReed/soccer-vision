@@ -112,25 +112,18 @@ def _apply(H: NDArray[np.floating], pts: NDArray[np.floating]) -> NDArray[np.flo
     return out[:, :2] / out[:, 2:3]
 
 
-def propagate_clicks(
+def propagate_clicks_with_distance(
     clicks: Sequence[Click],
     transforms: Mapping[int, NDArray[np.floating]],
     segment_of: Mapping[int, int],
     *,
     window: int,
     frames: Sequence[int] | None = None,
-) -> dict[int, dict[int, tuple[float, float]]]:
-    """For each target frame, the propagated pixel of each landmark.
-
-    A click maps into a target frame g iff they share a segment and
-    |click.frame - g| <= window; for each landmark the nearest such click wins
-    (first in click order on ties). Returns {frame: {kp_idx: (x, y)}} in the same
-    (normalized) image space as the clicks/transforms.
-
-    frames: restrict the TARGET frames in the output (None = all frames in
-        transforms); candidate clicks are still drawn from the full click list.
+) -> dict[int, dict[int, tuple[float, float, float]]]:
+    """Like propagate_clicks, but each landmark also carries the frame-distance to its
+    winning source click (`|source.frame - target|`). Returns {frame: {kp: (x, y, dist)}}.
     """
-    out: dict[int, dict[int, tuple[float, float]]] = {}
+    out: dict[int, dict[int, tuple[float, float, float]]] = {}
     if not clicks or not transforms:
         return out
     if frames is None:
@@ -150,7 +143,7 @@ def propagate_clicks(
     click_seg = np.array([segment_of.get(c.frame, -1) for c in clicks], dtype=np.int64)
     click_kp = np.array([c.kp_idx for c in clicks], dtype=np.int64)
 
-    pos = np.full((k, n, 2), np.nan)  # pos[j, g] = click j's pixel in frame g
+    pos = np.full((k, n, 2), np.nan)
     for j, c in enumerate(clicks):
         src_m = transforms.get(c.frame)
         if src_m is None:
@@ -167,13 +160,39 @@ def propagate_clicks(
     for kp in sorted({int(v) for v in click_kp}):
         rows = np.where(click_kp == kp)[0]
         d = np.where(usable[rows], dist[rows], big)
-        choice = d.argmin(axis=0)  # first minimal row wins ties (click order)
-        ok = d[choice, np.arange(n)] != big
+        choice = d.argmin(axis=0)            # first minimal row wins ties (click order)
+        chosen_dist = d[choice, np.arange(n)]
+        ok = chosen_dist != big
         chosen = pos[rows[choice], np.arange(n)]
         for gi in np.where(ok)[0]:
             out.setdefault(int(frame_arr[gi]), {})[kp] = (
-                float(chosen[gi, 0]), float(chosen[gi, 1]))
+                float(chosen[gi, 0]), float(chosen[gi, 1]), float(chosen_dist[gi]))
     return out
+
+
+def propagate_clicks(
+    clicks: Sequence[Click],
+    transforms: Mapping[int, NDArray[np.floating]],
+    segment_of: Mapping[int, int],
+    *,
+    window: int,
+    frames: Sequence[int] | None = None,
+) -> dict[int, dict[int, tuple[float, float]]]:
+    """For each target frame, the propagated pixel of each landmark.
+
+    A click maps into a target frame g iff they share a segment and
+    |click.frame - g| <= window; for each landmark the nearest such click wins
+    (first in click order on ties). Returns {frame: {kp_idx: (x, y)}} in the same
+    (normalized) image space as the clicks/transforms.
+
+    frames: restrict the TARGET frames in the output (None = all frames in
+        transforms); candidate clicks are still drawn from the full click list.
+    """
+    return {
+        g: {kp: (xyd[0], xyd[1]) for kp, xyd in kps.items()}
+        for g, kps in propagate_clicks_with_distance(
+            clicks, transforms, segment_of, window=window, frames=frames).items()
+    }
 
 
 def propagate_line_clicks(

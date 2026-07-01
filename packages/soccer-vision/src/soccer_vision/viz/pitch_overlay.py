@@ -24,6 +24,40 @@ _EDGES: tuple[tuple[int, int], ...] = (
 )
 
 
+def clipped_polyline(
+    h_pitch_to_px: NDArray[np.floating],
+    pts: NDArray[np.floating],
+    *,
+    size: tuple[int, int],
+    margin: int = 80,
+) -> list[tuple[int, int]]:
+    """Project pitch points through a pitch->pixel homography, keeping only those
+    in front of the camera (homogeneous w>0) and within the frame + margin.
+
+    Args:
+        h_pitch_to_px: (3, 3) pitch-coordinate -> pixel homography.
+        pts: (N, 2) array of pitch points.
+        size: (width, height) of the frame in pixels.
+        margin: Extra pixel margin around the frame within which points are kept.
+
+    Returns:
+        list of (x, y) integer pixel coordinates, in input order, for points that
+        pass both the in-front-of-camera and in-frame+margin tests.
+    """
+    width, height = size
+    result: list[tuple[int, int]] = []
+    h = np.asarray(h_pitch_to_px, dtype=np.float64)
+    for px, py in np.asarray(pts, dtype=np.float64):
+        v = h @ np.array([px, py, 1.0])
+        if v[2] <= 1e-9:
+            continue
+        x = v[0] / v[2]
+        y = v[1] / v[2]
+        if -margin <= x <= width + margin and -margin <= y <= height + margin:
+            result.append((int(x), int(y)))
+    return result
+
+
 def reproject_landmarks(
     image_points: NDArray[np.floating],
     kp_indices: NDArray[np.integer],

@@ -57,3 +57,16 @@ class MockBackend:
         df = df.astype({"frame": "int64", "track_id": "int64"})
         validate_trajectories(df)
         return df
+
+    def process_with_pitch(self, video_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Mock trajectories + an empty (but schema-conformant) keypoints frame.
+
+        The mock has no pitch model, so keypoints are intentionally empty; downstream
+        homography building yields no anchors, which is the correct mock behaviour.
+        """
+        traj = self.process(video_path)
+        kp = pd.DataFrame(columns=["frame", "kp_idx", "x_px", "y_px", "conf"]).astype(
+            {"frame": "int64", "kp_idx": "int64",
+             "x_px": "float64", "y_px": "float64", "conf": "float64"}
+        )
+        return traj, kp

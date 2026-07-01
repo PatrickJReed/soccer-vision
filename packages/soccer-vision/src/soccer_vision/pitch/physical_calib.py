@@ -30,6 +30,11 @@ from soccer_vision.pitch.manual_anchor import Click, LineClick
 
 FOLD_MIN, FOLD_MAX = 4, 15
 DEFAULT_GAP_GUARD = 200
+# A propagated (unclicked) frame within this many frames of a GREEN anchor is itself graded
+# green: at short range the bracket propagation stays within the green foreground tolerance
+# (~5 ft), so it is as trustworthy as a clicked anchor. Beyond it (but within the gap guard)
+# the frame is yellow (propagated, less certain). Smaller than the gap guard on purpose.
+GREEN_RADIUS = 100
 FOREGROUND_OK_FT = 8.0
 GRID_N = 9
 _FT = METRES_TO_FEET
@@ -232,10 +237,12 @@ class PhysicalCalib:
         return _shift_h(self.anchor_h[a], self.transforms[a], self.transforms[frame])
 
     def status(self, frame: int) -> str:
-        """green = anchor that passed its own held-out foreground self-check and projects
-        plausibly; yellow = anchor with unverified foreground OR a propagated (unclicked)
-        frame within the gap guard; red = no homography (beyond gap / uncalibrated) or an
-        implausible whole-field projection (fold_count out of range)."""
+        """green = an anchor that passed its held-out foreground self-check, OR a propagated
+        frame within GREEN_RADIUS of such an anchor (propagation stays within the green
+        tolerance at short range) — in both cases the whole-field projection is plausible
+        (fold_count in range). yellow = anchor with unverified foreground, or a propagated
+        frame within the gap guard but beyond a green anchor's radius. red = no homography
+        (beyond gap / uncalibrated) or an implausible projection (fold_count out of range)."""
         h = self.frame_homography(frame)
         if h is None:
             return "red"
@@ -243,6 +250,11 @@ class PhysicalCalib:
             return "red"
         if frame in self.anchor_h:
             return self.coverage_grade.get(frame, "yellow")
+        seg = self._segment(frame)
+        green_anchors = [a for a in self.anchor_h
+                         if self._segment(a) == seg and self.coverage_grade.get(a) == "green"]
+        if green_anchors and min(abs(frame - a) for a in green_anchors) <= GREEN_RADIUS:
+            return "green"
         return "yellow"
 
 

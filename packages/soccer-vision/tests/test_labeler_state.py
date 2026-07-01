@@ -126,7 +126,10 @@ def test_anchor_is_green_with_near_touchline() -> None:
         st.add_line_clicks(_near_tl_clicks(poses, anchors))
         st.wait_idle(timeout=10)
         greens = [f for f in range(9) if st._status_of(f) == "green"]
-        assert set(greens) == set(anchors)   # exactly the anchors pass the foreground check
+        # every anchor passes its foreground check -> green; green also extends to nearby
+        # propagated frames (within GREEN_RADIUS), so coverage exceeds the anchors alone.
+        assert set(anchors).issubset(set(greens))
+        assert len(greens) > len(anchors)
     finally:
         st.stop_worker()
 

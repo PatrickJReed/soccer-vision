@@ -187,16 +187,21 @@ def test_status_anchor_grade_and_fold() -> None:
     assert mk({5: h_wide}, {5: "green"}).status(5) == "red"   # implausible fold -> red
 
 
-def test_status_propagated_yellow_and_gap_red() -> None:
+def test_status_propagated_green_radius_then_yellow_then_gap_red() -> None:
+    # A propagated frame is GREEN within GREEN_RADIUS of a green anchor, YELLOW beyond that
+    # radius but within the gap guard, RED beyond the gap guard. Tiny per-frame translations
+    # keep the fold plausible across the range.
+    from soccer_vision.pitch.physical_calib import GREEN_RADIUS
     rv, tv = POSES[20]
     h0 = _pose_h(3000.0, rv, tv)
-    transforms = {f: _trans(-0.002 * f) for f in range(0, 410)}
-    anchor_h = {0: h0, 10: h0 @ transforms[10]}
-    calib = PhysicalCalib(K=np.eye(3), poses={}, anchor_h=anchor_h,
-                          coverage_grade={0: "green", 10: "green"},
-                          transforms=transforms, size=SIZE, gap_guard=200)
-    assert calib.status(5) == "yellow"    # propagated within gap, plausible fold
-    assert calib.status(400) == "red"     # beyond gap -> no homography
+    transforms = {f: _trans(-0.0004 * f) for f in range(0, 400)}
+    calib = PhysicalCalib(K=np.eye(3), poses={}, anchor_h={0: h0},
+                          coverage_grade={0: "green"}, transforms=transforms,
+                          size=SIZE, gap_guard=200)
+    assert calib.status(0) == "green"                    # the anchor
+    assert calib.status(GREEN_RADIUS - 20) == "green"    # propagated, within green radius
+    assert calib.status(GREEN_RADIUS + 50) == "yellow"   # propagated, beyond radius, in gap
+    assert calib.status(350) == "red"                    # beyond gap -> no homography
 
 
 # ---- T4: acceptance gate ----

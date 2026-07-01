@@ -10,7 +10,10 @@ const LINE_COLORS = {near_touchline:"#ff5ca8", far_touchline:"#5cc8ff",
 const img = new Image();
 
 // canonical pitch edges (landmark index pairs) for the reprojected overlay
-const EDGES = [[0,1],[1,3],[3,2],[2,0],[4,6],[9,10],[11,12],[9,11],[10,12],
+// midline is drawn as two halves through the centre mark: far half [4,6] (halfway_far ->
+// center) AND near half [6,5] (center -> halfway_near). halfway_near (5) is not clickable
+// but its canonical position is known, so the FULL midline can still be overlaid.
+const EDGES = [[0,1],[1,3],[3,2],[2,0],[4,6],[6,5],[9,10],[11,12],[9,11],[10,12],
                [13,14],[15,16],[13,15],[14,16],[17,18],[19,20]];
 
 async function api(path, opts){ const r = await fetch(path, opts); return r.json(); }

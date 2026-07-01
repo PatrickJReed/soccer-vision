@@ -35,7 +35,13 @@ DEFAULT_GAP_GUARD = 200
 # (~5 ft), so it is as trustworthy as a clicked anchor. Beyond it (but within the gap guard)
 # the frame is yellow (propagated, less certain). Smaller than the gap guard on purpose.
 GREEN_RADIUS = 100
-FOREGROUND_OK_FT = 8.0
+# Per-frame GREEN tolerances (IN-SAMPLE): an anchor is green iff its foreground is OBSERVED
+# (near touchline clicked) AND its own clicks fit its solved pose within these. This rewards
+# a clicked, self-consistent foreground rather than held-out extrapolation, which unfairly
+# fails well-labeled oblique frames for the inherent thin-band difficulty. The held-out
+# metric (_foreground_errors) remains the stricter SESSION acceptance gate (evaluate_gate).
+POINT_OK_FT = 6.0
+NEAR_TL_OK_FT = 4.0
 GRID_N = 9
 _FT = METRES_TO_FEET
 _SCALE = np.array([WIDTH_M, LENGTH_M])
@@ -140,18 +146,35 @@ def _foreground_errors(
     return errs or None
 
 
+def _point_feet(qpitch: NDArray[np.floating[Any]], kp_idx: int) -> float:
+    d = (np.asarray(qpitch) - PITCH_LANDMARKS[kp_idx]) * _SCALE
+    return float(math.hypot(float(d[0]), float(d[1])) * _FT)
+
+
 def _grade(
     k: NDArray[np.floating[Any]],
+    rvec: NDArray[np.floating[Any]],
+    tvec: NDArray[np.floating[Any]],
     po: list[tuple[int, float, float]],
     line_clicks: Sequence[LineClick],
     size: tuple[int, int],
 ) -> str:
-    """green if the anchor's held-out near-touchline foreground error is within tolerance;
-    yellow otherwise (including no near-touchline click -> foreground unverified)."""
-    errs = _foreground_errors(k, po, line_clicks, size)
-    if errs is None:
-        return "yellow"
-    return "green" if float(np.median(errs)) <= FOREGROUND_OK_FT else "yellow"
+    """green iff the FOREGROUND IS OBSERVED (near touchline clicked) AND the anchor's own
+    clicks fit its solved pose IN-SAMPLE within tolerance (points <= POINT_OK_FT, near
+    touchline <= NEAR_TL_OK_FT). Rewards a clicked, self-consistent foreground instead of
+    held-out extrapolation. yellow otherwise; fold plausibility is enforced in status()."""
+    ntl = [lc for lc in line_clicks if lc.line_id == "near_touchline"]
+    if not ntl:
+        return "yellow"  # foreground not observed
+    w, h = size
+    h_norm = np.asarray(frame_homography(k, rvec, tvec), dtype=np.float64) @ np.diag(
+        [float(w), float(h), 1.0])
+    pt = [_point_feet(_apply(h_norm, np.array([[x / w, y / h]]))[0], kp) for kp, x, y in po]
+    ntl_ft = [_line_perp_feet(_apply(h_norm, np.array([[lc.x, lc.y]]))[0], "near_touchline")
+              for lc in ntl]
+    if pt and float(np.median(pt)) <= POINT_OK_FT and float(np.median(ntl_ft)) <= NEAR_TL_OK_FT:
+        return "green"
+    return "yellow"
 
 
 def _grid(n: int) -> NDArray[np.float64]:
@@ -310,7 +333,7 @@ def solve_session(
         rv, tv = pose
         poses[f] = (rv, tv)
         anchor_h[f] = np.asarray(frame_homography(K, rv, tv), dtype=np.float64) @ diag
-        grade[f] = _grade(K, po, lcs, size)
+        grade[f] = _grade(K, rv, tv, po, lcs, size)
     return PhysicalCalib(K, poses, anchor_h, grade, tf, size, gap_guard, seg_of)
 
 

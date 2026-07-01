@@ -257,9 +257,9 @@ def test_gate_fails_without_foreground() -> None:
 
 
 def test_grade_yellow_when_near_touchline_is_wrong() -> None:
-    # The foreground hold-out is GENUINE: a deliberately-displaced near-touchline must not
-    # pass (its endpoints are held out of the refit too), so the anchor stays yellow while
-    # the honestly-clicked anchors go green.
+    # Green is in-sample self-consistency: a deliberately-displaced near-touchline can't fit
+    # the solved pose together with the points, so its in-sample residual exceeds tolerance
+    # and the anchor stays yellow, while the honestly-clicked anchors go green.
     pts, lns, transforms = _gate_fixture()
     bad_frame = min(GATE_POSES)
     corrupted = [LineClick(lc.frame, lc.line_id, lc.x + 0.3, lc.y)

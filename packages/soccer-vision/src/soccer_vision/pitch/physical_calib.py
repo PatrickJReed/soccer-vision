@@ -23,8 +23,6 @@ from soccer_vision.calib.field_model import (
 )
 from soccer_vision.calib.validate import fold_count
 from soccer_vision.pitch.calib_anchor import flag_outlier_clicks, frame_homography
-from soccer_vision.pitch.homography import HomographyError, fit_homography
-from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 from soccer_vision.pitch.manual_anchor import Click, LineClick
 
 FOLD_MIN, FOLD_MAX = 4, 15
@@ -142,23 +140,12 @@ def solve_session(
     try:
         K = calibrate_camera(obs, size, min_points=6).K
     except CalibError:
-        # Not enough views for shared-focal calibration (need >= 3 frames).
-        # Fall back to direct per-frame homography fits so single-frame anchor sessions work.
-        K = np.array([[float(w), 0.0, w / 2.0], [0.0, float(w), h / 2.0], [0.0, 0.0, 1.0]],
-                     dtype=np.float64)
-        direct_h: dict[int, NDArray[np.float64]] = {}
-        direct_grade: dict[int, str] = {}
-        for f, pcs in sorted(by_pt.items()):
-            if len({c.kp_idx for c in pcs}) < min_points:
-                continue
-            img_pts = np.array([[c.x, c.y] for c in pcs], dtype=np.float64)
-            lm_pts = PITCH_LANDMARKS[np.array([c.kp_idx for c in pcs])]
-            try:
-                direct_h[f] = np.asarray(fit_homography(img_pts, lm_pts), dtype=np.float64)
-                direct_grade[f] = "yellow"
-            except HomographyError:
-                continue
-        return PhysicalCalib(K, {}, direct_h, direct_grade, tf, size, gap_guard)
+        # A physical calibration needs a shared focal from >= 3 diverse views. With fewer,
+        # there is no physical solution yet -> return an empty calib (no anchors); the
+        # labeler bootstrap simply waits for more clicked frames. We deliberately do NOT
+        # fall back to a free per-frame homography -- that is exactly the model this engine
+        # replaces (it is non-physical and folds the field into the sky).
+        return PhysicalCalib(np.eye(3), {}, {}, {}, tf, size, gap_guard)
     clean, _flagged = flag_outlier_clicks(points, K, size)
     by_clean = _group(clean)
     diag = np.diag([float(w), float(h), 1.0])

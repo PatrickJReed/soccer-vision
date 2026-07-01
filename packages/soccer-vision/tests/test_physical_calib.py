@@ -2,45 +2,58 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 from soccer_vision.calib.field_model import field_points_3d
+from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 from soccer_vision.pitch.manual_anchor import Click
 from soccer_vision.pitch.physical_calib import solve_session
 
 SIZE = (1920, 1080)
+IDS = [0, 1, 4, 9, 10, 13, 14]
+
+# One shared camera (focal 1460) panning across the field: three DISTINCT poses. A physical
+# calibration needs >= 3 diverse views to estimate the shared focal, so the test supplies that.
+K_TRUE = np.array([[1460.0, 0, SIZE[0] / 2], [0, 1460.0, SIZE[1] / 2], [0, 0, 1.0]])
+POSES: dict[int, tuple[NDArray[np.float64], NDArray[np.float64]]] = {
+    10: (np.array([[1.15], [-0.30], [0.02]]), np.array([[-20.0], [-3.0], [42.0]])),
+    20: (np.array([[1.20], [0.00], [0.00]]), np.array([[-22.0], [-3.0], [40.0]])),
+    30: (np.array([[1.18], [0.30], [-0.02]]), np.array([[-24.0], [-3.0], [41.0]])),
+}
 
 
-def _project(
-    fp_ids: list[int],
-    K: NDArray[np.float64],
-    rvec: NDArray[np.float64],
-    tvec: NDArray[np.float64],
-    size: tuple[int, int],
-) -> list[tuple[int, float, float]]:
+def _pose_clicks(frame: int, rvec: NDArray[np.float64], tvec: NDArray[np.float64]) -> list[Click]:
     fp = field_points_3d()
-    img = cv2.projectPoints(fp[fp_ids], rvec, tvec, K, None)[0].reshape(-1, 2)
-    w, h = size
-    return [(i, x / w, y / h) for i, (x, y) in zip(fp_ids, img, strict=True)]
+    img = cv2.projectPoints(fp[IDS], rvec, tvec, K_TRUE, None)[0].reshape(-1, 2)
+    w, h = SIZE
+    return [Click(frame=frame, kp_idx=i, x=float(x) / w, y=float(y) / h)
+            for i, (x, y) in zip(IDS, img, strict=True)]
 
 
-def _synthetic_clicks(
-    size: tuple[int, int],
-) -> tuple[list[Click], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-    K = np.array([[1460.0, 0, size[0] / 2], [0, 1460.0, size[1] / 2], [0, 0, 1]])
-    rvec = np.array([[1.2], [0.0], [0.0]])
-    tvec = np.array([[-22.0], [-3.0], [40.0]])
-    ids = [0, 1, 4, 9, 10, 13, 14]
-    proj = _project(ids, K, rvec, tvec, size)
-    return [Click(frame=100, kp_idx=i, x=x, y=y) for i, x, y in proj], K, rvec, tvec
+def test_solve_session_recovers_physical_anchors() -> None:
+    clicks: list[Click] = []
+    for f, (rv, tv) in POSES.items():
+        clicks += _pose_clicks(f, rv, tv)
+    transforms = {f: np.eye(3) for f in POSES}
+    calib = solve_session(clicks, [], SIZE, transforms)
 
+    for f in POSES:
+        assert calib.is_anchor(f)
+        H = calib.frame_homography(f)
+        assert H is not None
+        for c in (c for c in clicks if c.frame == f):
+            q = H @ np.array([c.x, c.y, 1.0])
+            q = q[:2] / q[2]
+            # clicked landmark maps back to its canonical pitch position (<~1.4 ft)
+            assert np.linalg.norm(q - PITCH_LANDMARKS[c.kp_idx]) < 0.02
 
-def test_solve_session_recovers_anchor() -> None:
-    clicks, _K, _rvec, _tvec = _synthetic_clicks(SIZE)
-    calib = solve_session(clicks, [], SIZE, {100: np.eye(3)})
-    assert calib.is_anchor(100)
-    H = calib.frame_homography(100)
-    assert H is not None
-    from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
-    for c in clicks:
-        q = H @ np.array([c.x, c.y, 1.0])
-        q = q[:2] / q[2]
-        assert np.linalg.norm(q - PITCH_LANDMARKS[c.kp_idx]) < 0.02
+    # a frame with no clicks is not an anchor; T1 has no propagation yet -> None
+    assert not calib.is_anchor(15)
+    assert calib.frame_homography(15) is None
     assert calib.frame_homography(999) is None
+
+
+def test_too_few_views_returns_empty_not_free_homography() -> None:
+    # One clicked frame cannot yield a shared focal -> physical-or-nothing (no anchors),
+    # NOT a free-homography fallback.
+    rv, tv = POSES[20]
+    calib = solve_session(_pose_clicks(20, rv, tv), [], SIZE, {20: np.eye(3)})
+    assert calib.anchor_h == {}
+    assert calib.frame_homography(20) is None

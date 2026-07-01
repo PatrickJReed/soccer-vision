@@ -192,7 +192,6 @@ def test_assemble_phases_legacy_path_marks_anchors() -> None:
 
 def test_assemble_from_parquet_reads_sibling_homographies(tmp_path: Path) -> None:
     import numpy as np
-
     from soccer_vision.pipeline import (
         assemble_from_homographies,
         assemble_from_parquet,
@@ -246,7 +245,6 @@ def test_assemble_from_parquet_falls_back_without_sibling(
 
 def test_highest_conf_ball_pick_is_atomic() -> None:
     import numpy as np
-
     from soccer_vision.pipeline import _highest_conf_ball_per_frame
 
     # Degenerate case the pitch filter normally prevents: the highest-conf row has

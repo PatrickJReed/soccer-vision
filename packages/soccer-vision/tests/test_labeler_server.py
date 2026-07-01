@@ -6,6 +6,7 @@ import json
 import threading
 import urllib.request
 from http.server import HTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 
@@ -311,3 +312,30 @@ def test_clicks_endpoint_returns_both_point_and_line_clicks() -> None:
             {"frame": 3, "line_id": "near_touchline", "x": 0.1, "y": 0.9}]
     finally:
         httpd.shutdown()
+
+
+def test_restore_session_preserves_line_clicks(tmp_path: Path) -> None:
+    # Regression guard for the restore-ordering data-loss bug: add_clicks autosaves, so if
+    # lines are read AFTER add_clicks the sidecar is clobbered to line_clicks=[]. restore_session
+    # must read BOTH up front so line clicks survive a restart (and stay on disk).
+    import json
+
+    from soccer_vision.labeler.server import restore_session
+    from soccer_vision.labeler.state import LabelerState
+
+    sidecar = tmp_path / "clip.clicks.json"
+    pts = [{"frame": 0, "kp_idx": i, "x": 0.1 * i, "y": 0.2} for i in range(6)]
+    lns = [{"frame": 0, "line_id": "near_touchline", "x": 0.3, "y": 0.9} for _ in range(4)]
+    sidecar.write_text(json.dumps({"clicks": pts, "line_clicks": lns}))
+
+    interframe = {i: np.eye(3) for i in range(9)}
+    st = LabelerState(interframe=interframe, n_frames=10, size=(1920, 1080),
+                      autosave_path=sidecar)
+    try:
+        restore_session(st, sidecar=sidecar, resume=None, size=(1920, 1080))
+        assert len(st.clicks) == 6
+        assert len(st.line_clicks) == 4                 # lines survived the restore
+        d = json.loads(sidecar.read_text())
+        assert len(d["line_clicks"]) == 4               # and are re-persisted, not clobbered
+    finally:
+        st.stop_worker()

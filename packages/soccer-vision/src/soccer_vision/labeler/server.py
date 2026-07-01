@@ -169,6 +169,45 @@ def make_handler(
     return LabelerHandler
 
 
+def restore_session(
+    state: LabelerState, *, sidecar: Path, resume: Path | None, size: tuple[int, int]
+) -> None:
+    """Restore point + line clicks into a fresh LabelerState.
+
+    CRITICAL ORDERING: read BOTH points and lines from the source BEFORE any state.add_*
+    call. add_clicks autosaves, and if the lines have not been restored yet it writes
+    line_clicks=[] over the sidecar -- destroying the user's line clicks on disk. Reading
+    both up front makes the intermediate autosave harmless (the lines are re-added and
+    re-saved immediately). This function is unit-tested precisely to lock that ordering.
+    """
+    from soccer_vision.labeler.state import (
+        clicks_from_keypoints_parquet,
+        clicks_from_sidecar,
+        line_clicks_from_parquet,
+        line_clicks_from_sidecar,
+    )
+
+    if resume is not None:
+        if sidecar.exists():
+            backup = sidecar.parent / (sidecar.name + ".bak")
+            sidecar.replace(backup)
+            print(f"existing autosave backed up to {backup}")
+        lc_path = Path(resume).parent / "line_clicks.parquet"
+        pts = clicks_from_keypoints_parquet(resume, size)
+        lns = line_clicks_from_parquet(lc_path, size) if lc_path.exists() else []
+        src = str(resume)
+    elif sidecar.exists():
+        pts = clicks_from_sidecar(sidecar)
+        lns = line_clicks_from_sidecar(sidecar)
+        src = str(sidecar)
+    else:
+        return
+    state.add_clicks(pts)
+    if lns:
+        state.add_line_clicks(lns)
+    print(f"restored {len(state.clicks)} clicks + {len(state.line_clicks)} lines from {src}")
+
+
 def run(
     video_path: Path,
     *,
@@ -188,12 +227,6 @@ def run(
 
     from soccer_vision.calib.field_model import FIELD_LINES
     from soccer_vision.labeler.chain import compute_chain
-    from soccer_vision.labeler.state import (
-        clicks_from_keypoints_parquet,
-        clicks_from_sidecar,
-        line_clicks_from_parquet,
-        line_clicks_from_sidecar,
-    )
     from soccer_vision.pitch.landmarks import LANDMARK_NAMES, PITCH_LANDMARKS
 
     interframe, n_frames, size = compute_chain(video_path, workers=workers)
@@ -203,27 +236,7 @@ def run(
         interframe=interframe, n_frames=n_frames, size=size,
         autosave_path=sidecar,
     )
-    if resume is not None:
-        if sidecar.exists():
-            backup = sidecar.parent / (sidecar.name + ".bak")
-            sidecar.replace(backup)
-            print(f"existing autosave backed up to {backup}")
-        lc_path = Path(resume).parent / "line_clicks.parquet"
-        restore_lines = line_clicks_from_parquet(lc_path, size) if lc_path.exists() else []
-        state.add_clicks(clicks_from_keypoints_parquet(resume, size))
-        if restore_lines:
-            state.add_line_clicks(restore_lines)
-        print(f"resumed {len(state.clicks)} clicks + {len(state.line_clicks)} lines from {resume}")
-    elif sidecar.exists():
-        # Read BOTH points and lines from the sidecar BEFORE any add_*, because add_clicks
-        # autosaves and would otherwise clobber the (not-yet-restored) lines to [] on disk.
-        restore_pts = clicks_from_sidecar(sidecar)
-        restore_lns = line_clicks_from_sidecar(sidecar)
-        state.add_clicks(restore_pts)
-        if restore_lns:
-            state.add_line_clicks(restore_lns)
-        print(f"restored {len(state.clicks)} clicks + {len(state.line_clicks)} lines "
-              f"from autosave {sidecar}")
+    restore_session(state, sidecar=sidecar, resume=resume, size=size)
     cap = cv2.VideoCapture(str(video_path))
     frame_jpeg = make_frame_jpeg(cap, downscale_display)
 

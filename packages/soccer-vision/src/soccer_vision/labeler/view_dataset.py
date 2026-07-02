@@ -295,7 +295,9 @@ class ViewAssignment:
 
     @property
     def n_views(self) -> int:
-        return int(self.manifest["view_id"].nunique())
+        # exclude the -1 "unassigned" sentinel so it is not counted as a real view
+        vid = self.manifest["view_id"]
+        return int(vid[vid != -1].nunique())
 
     @property
     def n_ambiguous(self) -> int:
@@ -326,12 +328,11 @@ def _viewassign_cache_path(
     min_keypoints: int,
     reps_fingerprint: str,
 ) -> Path:
-    # Key on the resolved path + params + reps only — NOT on file content — so the
-    # cache survives a content change (the cache-hit test corrupts the video after the
-    # first call and must still be served without decoding). Provenance (_video_hash)
-    # is stored INSIDE the npz instead.
+    # Key on the video CONTENT hash (path+size+mtime, like compute_view_digest) + scoring
+    # params + reps, so a re-encode at the same path AUTO-INVALIDATES the cache instead of
+    # serving a stale match matrix into training data.
     key = (
-        f"{video_path.resolve()}|{assign_stride}|{n_features}|{downscale}"
+        f"{_video_hash(video_path)}|{assign_stride}|{n_features}|{downscale}"
         f"|{min_match_dist}|{min_keypoints}|{reps_fingerprint}"
     )
     digest = hashlib.sha1(key.encode()).hexdigest()[:16]
@@ -393,17 +394,14 @@ def build_view_assignment(
 
     match: NDArray[np.float64] | None = None
     keypoint_counts: NDArray[np.int32] = np.zeros(0, dtype=np.int32)
-    stored_video_hash: str | None = None
 
     if player_boxes is None and cache_path.exists():
         data = np.load(cache_path)
-        match = np.asarray(data["match"], dtype=np.float64)
-        keypoint_counts = np.asarray(data["keypoint_counts"], dtype=np.int32)
-        # Trust the cache's own query_frames: the key already pins path + stride + params
-        # + reps (NOT file content), so an incidental content change -> serve the cached
-        # assignment without decoding (provenance video_hash stays in the npz).
-        query_frames = data["query_frames"].tolist()
-        stored_video_hash = str(data["video_hash"]) if "video_hash" in data else None
+        # Belt-and-suspenders (like compute_view_digest): the content-hashed key already
+        # guarantees same pixels, but re-verify the sampled frames before trusting it.
+        if data["query_frames"].tolist() == query_frames:
+            match = np.asarray(data["match"], dtype=np.float64)
+            keypoint_counts = np.asarray(data["keypoint_counts"], dtype=np.int32)
 
     if match is None:
         # Decode representatives only on a cache miss (the fingerprint above needs just
@@ -413,18 +411,37 @@ def build_view_assignment(
             rep_imgs, n_features=n_features, downscale=downscale)
         match_rows: list[NDArray[np.float64]] = []
         kp_all: list[int] = []
-        for start in range(0, len(query_frames), chunk):
-            chunk_frames = query_frames[start:start + chunk]
-            imgs = _read_frames(video_path, chunk_frames)
-            masks = (_build_masks(player_boxes, chunk_frames, (width, height))
-                     if player_boxes is not None else None)
-            descs, counts = frame_descriptors(
-                imgs, n_features=n_features, downscale=downscale, masks=masks)
-            m = cross_match_fractions(
-                descs, counts, rep_desc, rep_counts,
-                min_match_dist=min_match_dist, min_keypoints=min_keypoints)
-            match_rows.append(m)
-            kp_all.extend(counts)
+        # One persistent capture, forward-read across ALL chunks. query_frames is ascending
+        # (a strided range), so reads never rewind — O(n_frames) grabs total, not O(chunks x
+        # chunk_start). Only one chunk of pixels is held at a time (bounded memory).
+        cap = cv2.VideoCapture(str(video_path))
+        pos = 0
+        try:
+            for start in range(0, len(query_frames), chunk):
+                chunk_frames = query_frames[start:start + chunk]
+                imgs: list[NDArray[np.uint8] | None] = []
+                for idx in chunk_frames:
+                    if idx < pos:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                        pos = idx
+                    while pos < idx:
+                        if not cap.grab():
+                            break
+                        pos += 1
+                    ok, frame = cap.read()
+                    pos += 1
+                    imgs.append(frame if ok else None)  # type: ignore[arg-type]
+                masks = (_build_masks(player_boxes, chunk_frames, (width, height))
+                         if player_boxes is not None else None)
+                descs, counts = frame_descriptors(
+                    imgs, n_features=n_features, downscale=downscale, masks=masks)
+                m = cross_match_fractions(
+                    descs, counts, rep_desc, rep_counts,
+                    min_match_dist=min_match_dist, min_keypoints=min_keypoints)
+                match_rows.append(m)
+                kp_all.extend(counts)
+        finally:
+            cap.release()
         match = (np.concatenate(match_rows, axis=0) if match_rows
                  else np.zeros((0, len(ref_view_ids)), dtype=np.float64))
         keypoint_counts = np.asarray(kp_all, dtype=np.int32)
@@ -450,7 +467,8 @@ def build_view_assignment(
         ambiguity_margin=ambiguity_margin, smooth_window=smooth_window,
         val_frac=val_frac, split_policy=split_policy)
 
-    provenance_hash = stored_video_hash or _video_hash(video_path)
+    # A cache hit means identical pixels (content-hashed key), so the live hash is correct.
+    provenance_hash = _video_hash(video_path)
     representatives = {int(v): int(f) for v, f in digest.representatives.items()}
     meta: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,

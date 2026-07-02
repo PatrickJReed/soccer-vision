@@ -217,13 +217,35 @@ def test_build_view_assignment_manifest(tmp_path: Path) -> None:
     assert va.n_frames == len(m) and va.n_views >= 1
 
 
-def test_build_view_assignment_cache_hit(tmp_path: Path) -> None:
+def test_build_view_assignment_cache_hit(tmp_path: Path,
+                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    # Prove the 2nd call is served from cache WITHOUT decoding: make the decode entry
+    # point raise, and confirm the assignment still comes back identical.
     video, digest = _digest_video(tmp_path)
     va1 = build_view_assignment(video, digest, game="synth", assign_stride=2, cache_dir=tmp_path)
-    video.write_bytes(b"broken")   # 2nd call must NOT decode — served from cache
+    import soccer_vision.labeler.view_dataset as vd
+
+    def _boom(*a: object, **k: object) -> None:
+        raise AssertionError("decoded on cache hit")
+
+    monkeypatch.setattr(vd, "_read_frames", _boom)
     va2 = build_view_assignment(video, digest, game="synth", assign_stride=2, cache_dir=tmp_path)
     assert list(va1.manifest["view_id_raw"]) == list(va2.manifest["view_id_raw"])
     assert np.allclose(va1.manifest["confidence"], va2.manifest["confidence"])
+
+
+def test_viewassign_cache_key_is_content_sensitive(tmp_path: Path,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    # A re-encode at the same path (different content hash) must map to a DIFFERENT cache
+    # file, so stale assignments are never served into training data.
+    import soccer_vision.labeler.view_dataset as vd
+    kw = dict(cache_dir=tmp_path, assign_stride=2, n_features=1200, downscale=0.5,
+              min_match_dist=48, min_keypoints=10, reps_fingerprint="abc")
+    monkeypatch.setattr(vd, "_video_hash", lambda p: "HASH_A")
+    p_a = vd._viewassign_cache_path(Path("/x/clip.mp4"), **kw)  # type: ignore[arg-type]
+    monkeypatch.setattr(vd, "_video_hash", lambda p: "HASH_B")
+    p_b = vd._viewassign_cache_path(Path("/x/clip.mp4"), **kw)  # type: ignore[arg-type]
+    assert p_a != p_b
 
 
 def test_build_view_assignment_masking_records_boxes(tmp_path: Path) -> None:

@@ -3,8 +3,14 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import pandas as pd
 from numpy.typing import NDArray
-from soccer_vision.labeler.view_dataset import cross_match_fractions
+from soccer_vision.labeler.view_dataset import (
+    assign_nearest_view,
+    assign_splits,
+    cross_match_fractions,
+    smooth_view_sequence,
+)
 from soccer_vision.labeler.view_digest import (
     _pair_match_fraction,
     frame_descriptors,
@@ -51,3 +57,59 @@ def test_cross_match_fractions_low_keypoints_zero() -> None:
     rd, _rc = frame_descriptors([_pattern(1)])
     cross = cross_match_fractions(qd, qc, rd, [3], min_keypoints=10)  # ref "blind"
     assert cross[0, 0] == 0.0
+
+
+def test_assign_nearest_view_fields() -> None:
+    match = np.array([
+        [0.8, 0.3, 0.1],   # -> view 0, second view 1, conf .8, margin .5
+        [0.2, 0.2, 0.9],   # -> view 2, conf .9, margin .7
+        [0.0, 0.0, 0.0],   # -> unassigned
+    ])
+    df = assign_nearest_view(match, [0, 1, 2])
+    assert list(df["view_id_raw"]) == [0, 2, -1]
+    assert df.loc[0, "view_second"] == 1
+    assert abs(df.loc[0, "confidence"] - 0.8) < 1e-9
+    assert abs(df.loc[0, "margin"] - 0.5) < 1e-9      # best - best-of-a-different-view
+    assert df.loc[2, "confidence"] == 0.0 and df.loc[2, "view_second"] == -1
+
+
+def test_assign_margin_is_best_minus_other_view_not_other_rep() -> None:
+    # two reps share view 0; a third is view 1. margin compares across VIEWS.
+    match = np.array([[0.8, 0.75, 0.1]])
+    df = assign_nearest_view(match, [0, 0, 1])
+    assert df.loc[0, "view_id_raw"] == 0
+    assert abs(df.loc[0, "margin"] - (0.8 - 0.1)) < 1e-9
+
+
+def test_smooth_view_sequence_removes_singleton() -> None:
+    seq = [0, 0, 0, 1, 0, 0, 0]
+    out = smooth_view_sequence(seq, window=5)
+    assert list(out) == [0, 0, 0, 0, 0, 0, 0]
+
+
+def test_smooth_window_one_is_identity() -> None:
+    seq = [0, 1, 0, 2]
+    assert list(smooth_view_sequence(seq, window=1)) == seq
+
+
+def test_smooth_tie_keeps_original() -> None:
+    seq = [0, 0, 1, 1]
+    out = smooth_view_sequence(seq, window=3)
+    assert list(out) == [0, 0, 1, 1]
+
+
+def test_assign_splits_per_view_tail_every_view_in_both() -> None:
+    df = pd.DataFrame({"frame": list(range(20)), "view_id": [0]*10 + [1]*10})
+    out = assign_splits(df, val_frac=0.2, policy="per_view_tail")
+    for v in (0, 1):
+        sub = out[out["view_id"] == v]
+        assert (sub["split"] == "train").any() and (sub["split"] == "val").any()
+        assert (sub["split"] == "val").sum() == 2
+    assert set(out[(out["view_id"] == 0) & (out["split"] == "val")]["frame"]) == {8, 9}
+
+
+def test_assign_splits_holdout_views() -> None:
+    df = pd.DataFrame({"frame": list(range(20)), "view_id": [0]*10 + [1]*10})
+    out = assign_splits(df, policy="holdout_views", holdout_views={1})
+    assert (out[out["view_id"] == 1]["split"] == "val").all()
+    assert (out[out["view_id"] == 0]["split"] == "train").all()

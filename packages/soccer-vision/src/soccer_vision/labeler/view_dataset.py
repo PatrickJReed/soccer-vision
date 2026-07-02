@@ -18,6 +18,7 @@ docs/superpowers/specs/2026-07-02-view-dataset-exporter-design.md.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
@@ -43,6 +44,7 @@ from soccer_vision.labeler.view_digest import (
     _Descriptor,
     _pair_match_fraction,
     _read_frames,
+    compute_view_digest,
     frame_descriptors,
 )
 
@@ -649,6 +651,12 @@ class ViewFrameReader:
             int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080,
         )
 
+    def __enter__(self) -> ViewFrameReader:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
     def __len__(self) -> int:
         return len(self._manifest)
 
@@ -683,3 +691,107 @@ class ViewFrameReader:
 
     def close(self) -> None:
         self._cap.release()
+
+
+# --- Using the export in Colab ---------------------------------------------
+# from soccer_vision.labeler.view_dataset import load_manifest, ViewFrameReader
+# m, meta = load_manifest("view_dataset_out/")
+# with ViewFrameReader("oceanside_clip.mp4", m,
+#                       expected_video_hash=meta["video"]["video_hash"]) as reader:
+#     # contrastive: positives share row.view_key (or view_id); loss weight = row.weight
+#     # MAE: frame, keep_mask, _row = reader.read(i); mask players via keep_mask when present
+#     frame, keep_mask, row = reader.read(0)
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="python -m soccer_vision.labeler.view_dataset",
+        description="Export a video + its ViewDigest into a manifest-first view dataset.")
+    p.add_argument("--video", type=Path, required=True,
+                   help="input mp4 (ideally ALL-INTRA)")
+    p.add_argument("--out", type=Path, default=None,
+                   help="output dir (default: <video>.parent/view_dataset_out)")
+    p.add_argument("--game", type=str, default=None,
+                   help="game/clip id for view_key (default: video stem)")
+    p.add_argument("--digest-json", type=Path, default=None,
+                   help="reuse a render_digest view_digest.json instead of recomputing")
+    p.add_argument("--stride", type=int, default=25,
+                   help="DIGEST sampling stride for compute_view_digest")
+    p.add_argument("--dist-threshold", type=float, default=0.5,
+                   help="clustering distance threshold for compute_view_digest")
+    p.add_argument("--assign-stride", type=int, default=DEFAULT_ASSIGN_STRIDE,
+                   help="dense per-frame assignment stride")
+    p.add_argument("--smooth-window", type=int, default=DEFAULT_SMOOTH_WINDOW,
+                   help="temporal majority-vote window for view smoothing")
+    p.add_argument("--ambiguity-margin", type=float, default=DEFAULT_AMBIGUITY_MARGIN,
+                   help="flag frames whose across-view margin is below this")
+    p.add_argument("--val-frac", type=float, default=DEFAULT_VAL_FRAC,
+                   help="per-view temporal-tail validation fraction")
+    p.add_argument("--boxes", type=Path, default=None,
+                   help="optional player trajectories parquet (enables masking)")
+    p.add_argument("--cache-dir", type=Path, default=None,
+                   help="dir for the .npz similarity/match caches")
+    p.add_argument("--materialize", action="store_true",
+                   help="also write a portable ImageFolder tree of decoded frames")
+    p.add_argument("--image-downscale", type=float, default=0.5,
+                   help="downscale factor for materialized JPEGs")
+    p.add_argument("--jpeg-quality", type=int, default=90,
+                   help="JPEG quality for materialized frames")
+    return p
+
+
+def _digest_from_json(path: Path) -> ViewDigest:
+    """Rebuild a ViewDigest from a render_digest ``view_digest.json``.
+
+    Only ``.representatives`` (and the derived ``.n_views``) are needed by the exporter,
+    so ``similarity`` is a zero placeholder and ``view_of`` is restored for completeness.
+    """
+    data = json.loads(path.read_text())
+    representatives = {int(k): int(v) for k, v in data["representatives"].items()}
+    view_of = {int(k): int(v) for k, v in data.get("view_of", {}).items()}
+    sample_frames = [int(f) for f in data.get("sample_frames", sorted(view_of))]
+    n = len(sample_frames)
+    return ViewDigest(
+        sample_frames=sample_frames, view_of=view_of, representatives=representatives,
+        similarity=np.zeros((n, n), dtype=np.float64))
+
+
+def main(argv: list[str] | None = None) -> None:
+    """CLI entry point: video (+ optional digest json / boxes) -> manifest-first export."""
+    args = _build_arg_parser().parse_args(argv)
+    video: Path = args.video
+    out: Path = args.out or (video.parent / "view_dataset_out")
+
+    if args.digest_json is not None:
+        digest = _digest_from_json(args.digest_json)
+    else:
+        digest = compute_view_digest(
+            video, stride=args.stride, dist_threshold=args.dist_threshold,
+            cache_dir=args.cache_dir)
+
+    player_boxes = pd.read_parquet(args.boxes) if args.boxes else None
+
+    va = build_view_assignment(
+        video, digest, game=args.game, assign_stride=args.assign_stride,
+        smooth_window=args.smooth_window, ambiguity_margin=args.ambiguity_margin,
+        val_frac=args.val_frac, player_boxes=player_boxes, cache_dir=args.cache_dir)
+
+    write_export(va, out, video_path=video)
+    if args.materialize:
+        va.materialize(
+            out / "frames_export", video_path=video,
+            image_downscale=args.image_downscale, jpeg_quality=args.jpeg_quality,
+            boxes=player_boxes)
+
+    split_counts = va.manifest["split"].value_counts()
+    n_train = int(split_counts.get("train", 0))
+    n_val = int(split_counts.get("val", 0))
+    print(
+        f"view-dataset export -> {out}\n"
+        f"  n_frames={va.n_frames}  n_views={va.n_views}  "
+        f"switch_rate={va.switch_rate:.4f}  n_ambiguous={va.n_ambiguous}\n"
+        f"  train={n_train}  val={n_val}")
+
+
+if __name__ == "__main__":
+    main()

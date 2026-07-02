@@ -300,6 +300,31 @@ def test_frame_reader_wrong_video_raises(tmp_path: Path) -> None:
         ViewFrameReader(other, m)          # video_hash mismatch
 
 
+def test_cli_writes_export(tmp_path: Path) -> None:
+    from soccer_vision.labeler.view_dataset import main
+    frames = [_pattern(v) for v in ([0]*10 + [1]*10 + [2]*10)]
+    video = tmp_path / "clip.mp4"
+    if not _write_video(video, frames):
+        pytest.skip("no mp4 writer")
+    out = tmp_path / "cli_out"
+    main(["--video", str(video), "--out", str(out), "--game", "synth",
+          "--assign-stride", "2", "--stride", "3", "--dist-threshold", "0.5",
+          "--cache-dir", str(tmp_path)])
+    assert (out / "view_dataset.parquet").exists()
+    assert (out / "view_dataset.json").exists()
+
+
+def test_view_frame_reader_context_manager(tmp_path: Path) -> None:
+    video, digest = _digest_video(tmp_path)
+    va = build_view_assignment(video, digest, game="synth", assign_stride=2, cache_dir=tmp_path)
+    out = tmp_path / "export"
+    write_export(va, out, video_path=video)
+    m, _meta = load_manifest(out)
+    with ViewFrameReader(video, m) as reader:
+        frame, _mask, _row = reader.read(0)
+    assert frame.shape == (H, W, 3)
+
+
 def test_materialize_folders_relative_paths(tmp_path: Path) -> None:
     video, digest = _digest_video(tmp_path)
     va = build_view_assignment(video, digest, game="synth", assign_stride=2, cache_dir=tmp_path)

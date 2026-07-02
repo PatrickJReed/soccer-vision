@@ -125,7 +125,9 @@ def smooth_view_sequence(
     """Odd sliding-window majority (mode) vote centered on each index.
 
     The window is truncated at the sequence edges. ``window <= 1`` returns the input
-    unchanged. On a tie for the mode, the ORIGINAL center label is kept.
+    unchanged. On a tie for the mode the ORIGINAL center label is kept when it is among
+    the tied winners, else the smallest winning label (deterministic). ``half = window //
+    2``, so an even ``window`` behaves like the next odd size (e.g. 4 acts like 5).
     """
     seq = np.asarray(view_ids, dtype=np.int_)
     n = seq.shape[0]
@@ -160,6 +162,9 @@ def assign_splits(
       else "train".
 
     Deterministic; the returned frame keeps the input row order (assigned by index).
+    Note: a view with a single frame (``ceil(val_frac*1) == 1``) lands entirely in "val"
+    with no train row — unavoidable for a 1-frame view and a non-issue under dense
+    per-view sampling.
     """
     out = manifest.copy()
     split = pd.Series("train", index=out.index, dtype=object)

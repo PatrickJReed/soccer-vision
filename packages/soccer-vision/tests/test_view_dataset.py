@@ -98,6 +98,19 @@ def test_smooth_tie_keeps_original() -> None:
     assert list(out) == [0, 0, 1, 1]
 
 
+def test_smooth_real_tie_keeps_center_when_among_winners() -> None:
+    # window=3 at idx1 sees {0,1,2}: all tie at count 1; center label 1 is a winner -> kept.
+    out = smooth_view_sequence([0, 1, 2], window=3)
+    assert out[1] == 1
+
+
+def test_smooth_tie_center_not_winner_falls_back_to_min() -> None:
+    # window=5 at idx2 sees {4,4,7,5,5}: 4 and 5 tie at count 2, center 7 is NOT a winner
+    # -> deterministic fallback to the smallest winner, 4.
+    out = smooth_view_sequence([4, 4, 7, 5, 5], window=5)
+    assert out[2] == 4
+
+
 def test_assign_splits_per_view_tail_every_view_in_both() -> None:
     df = pd.DataFrame({"frame": list(range(20)), "view_id": [0]*10 + [1]*10})
     out = assign_splits(df, val_frac=0.2, policy="per_view_tail")

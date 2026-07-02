@@ -110,6 +110,23 @@ def frame_descriptors(
     return descriptors, counts
 
 
+def _pair_match_fraction(
+    da: _Descriptor,
+    db: _Descriptor,
+    ca: int,
+    cb: int,
+    *,
+    min_match_dist: int = DEFAULT_MIN_MATCH_DIST,
+    min_keypoints: int = DEFAULT_MIN_KEYPOINTS,
+) -> float:
+    """Fraction of cross-checked ORB matches (dist < min_match_dist) / min(keypoints)."""
+    if da is None or db is None or ca < min_keypoints or cb < min_keypoints:
+        return 0.0
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    good = sum(1 for m in matcher.match(da, db) if m.distance < min_match_dist)
+    return good / max(1, min(ca, cb))
+
+
 def similarity_matrix(
     descriptors: list[_Descriptor],
     keypoint_counts: list[int],
@@ -124,19 +141,13 @@ def similarity_matrix(
     diagonal is 1.0 (a frame is identical to itself).
     """
     n = len(descriptors)
-    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     sim = np.zeros((n, n), dtype=np.float64)
     for a in range(n):
         for b in range(a + 1, n):
-            da, db = descriptors[a], descriptors[b]
-            if (da is None or db is None
-                    or keypoint_counts[a] < min_keypoints
-                    or keypoint_counts[b] < min_keypoints):
-                score = 0.0
-            else:
-                matches = matcher.match(da, db)
-                good = sum(1 for m in matches if m.distance < min_match_dist)
-                score = good / max(1, min(keypoint_counts[a], keypoint_counts[b]))
+            score = _pair_match_fraction(
+                descriptors[a], descriptors[b],
+                keypoint_counts[a], keypoint_counts[b],
+                min_match_dist=min_match_dist, min_keypoints=min_keypoints)
             sim[a, b] = sim[b, a] = score
     np.fill_diagonal(sim, 1.0)
     return sim

@@ -163,3 +163,17 @@ def test_build_manifest_records_boxes() -> None:
     match = np.array([[0.8, 0.2]])
     df = build_manifest([0], match, [0, 1], [300], game="g", fps=30.0, n_boxes=[4])
     assert df.loc[0, "n_boxes"] == 4
+
+
+def test_build_manifest_unsorted_input_matches_sorted() -> None:
+    # smoothing must run in frame order: scrambling the Q-aligned rows must not change
+    # the per-frame smoothed view_id / view_key / split.
+    frames = list(range(7))
+    match = np.array([[0.9, 0.1]] * 3 + [[0.1, 0.9]] + [[0.9, 0.1]] * 3)  # lone view1 at idx3
+    kp = [300, 301, 302, 303, 304, 305, 306]
+    sorted_df = build_manifest(frames, match, [0, 1], kp, game="g", fps=30.0, smooth_window=5)
+    perm = [3, 0, 6, 1, 5, 2, 4]
+    scrambled = build_manifest([frames[i] for i in perm], match[perm], [0, 1],
+                               [kp[i] for i in perm], game="g", fps=30.0, smooth_window=5)
+    for col in ("frame", "view_id", "view_id_raw", "view_key", "n_keypoints", "split"):
+        assert list(sorted_df[col]) == list(scrambled[col]), col

@@ -211,21 +211,28 @@ def build_manifest(
 
     ``ambiguous`` flags frames whose across-view ``margin`` is below ``ambiguity_margin``.
     ``view_key`` and ``weight`` use the SMOOTHED ``view_id`` and the ``confidence``
-    respectively. The result is sorted by ``frame`` ascending and index-reset, with a
+    respectively. Rows are sorted by ``frame`` ascending BEFORE smoothing (so the
+    temporal neighborhood is correct even for unsorted input) and index-reset, with a
     fixed column order matching the manifest schema. Deterministic; no video I/O.
     """
+    # Sort every Q-aligned input by frame up front: smoothing is order-sensitive, so the
+    # temporal neighborhood must be in frame order regardless of how the caller ordered rows.
+    frame = np.asarray(query_frames, dtype=np.int64)
+    order = np.argsort(frame, kind="stable")
+    frame = frame[order]
+    match = np.asarray(match, dtype=np.float64)[order]
+    n_kp = np.asarray(keypoint_counts, dtype=np.int32)[order]
+    boxes = (
+        np.zeros(len(frame), dtype=np.int32)
+        if n_boxes is None
+        else np.asarray(n_boxes, dtype=np.int32)[order]
+    )
+
     base = assign_nearest_view(match, ref_view_ids)
     view_id = smooth_view_sequence(
         base["view_id_raw"].tolist(), window=smooth_window
     ).astype(np.int32)
-
-    frame = np.asarray(query_frames, dtype=np.int64)
-    n_kp = np.asarray(keypoint_counts, dtype=np.int32)
-    boxes = (
-        np.zeros(len(frame), dtype=np.int32)
-        if n_boxes is None
-        else np.asarray(n_boxes, dtype=np.int32)
-    )
+    conf = base["confidence"].to_numpy().astype(np.float32)
     margin = base["margin"].to_numpy()
 
     df = pd.DataFrame(
@@ -237,8 +244,8 @@ def build_manifest(
             "view_id_raw": base["view_id_raw"].to_numpy().astype(np.int32),
             "view_second": base["view_second"].to_numpy().astype(np.int32),
             "view_key": pd.Series([f"{game}:{v}" for v in view_id], dtype=object),
-            "confidence": base["confidence"].to_numpy().astype(np.float32),
-            "weight": base["confidence"].to_numpy().astype(np.float32),
+            "confidence": conf,
+            "weight": conf,
             "margin": margin.astype(np.float32),
             "ambiguous": margin < ambiguity_margin,
             "n_keypoints": n_kp,

@@ -10,12 +10,15 @@ import pytest
 from numpy.typing import NDArray
 from soccer_vision.labeler.view_dataset import (
     ViewAssignment,
+    ViewFrameReader,
     assign_nearest_view,
     assign_splits,
     build_manifest,
     build_view_assignment,
     cross_match_fractions,
+    load_manifest,
     smooth_view_sequence,
+    write_export,
 )
 from soccer_vision.labeler.view_digest import (
     _pair_match_fraction,
@@ -257,3 +260,53 @@ def test_build_view_assignment_masking_records_boxes(tmp_path: Path) -> None:
                                player_boxes=boxes, cache_dir=tmp_path)
     row0 = va.manifest[va.manifest["frame"] == 0].iloc[0]
     assert row0["n_boxes"] == 2
+
+
+def test_write_and_load_roundtrip(tmp_path: Path) -> None:
+    video, digest = _digest_video(tmp_path)
+    va = build_view_assignment(video, digest, game="synth", assign_stride=2, cache_dir=tmp_path)
+    out = tmp_path / "export"
+    write_export(va, out, video_path=video)
+    assert (out / "view_dataset.parquet").exists() and (out / "view_dataset.json").exists()
+    m, meta = load_manifest(out)
+    assert len(m) == va.n_frames
+    assert meta["schema_version"] == 1
+    assert meta["video"]["video_hash"] and meta["stats"]["n_frames"] == va.n_frames
+    assert set(str(k) for k in meta["digest"]["representatives"])  # view->frame present
+
+
+def test_frame_reader_roundtrip(tmp_path: Path) -> None:
+    video, digest = _digest_video(tmp_path)
+    va = build_view_assignment(video, digest, game="synth", assign_stride=2, cache_dir=tmp_path)
+    out = tmp_path / "export"
+    write_export(va, out, video_path=video)
+    m, _meta = load_manifest(out)
+    reader = ViewFrameReader(video, m)
+    frame, mask, row = reader.read(0)
+    assert frame.shape == (H, W, 3) and mask is None
+    assert int(row["frame"]) == int(m.iloc[0]["frame"])
+    reader.close()
+
+
+def test_frame_reader_wrong_video_raises(tmp_path: Path) -> None:
+    video, digest = _digest_video(tmp_path)
+    va = build_view_assignment(video, digest, game="synth", assign_stride=2, cache_dir=tmp_path)
+    out = tmp_path / "export"
+    write_export(va, out, video_path=video)
+    m, _ = load_manifest(out)
+    other = tmp_path / "other.mp4"
+    _write_video(other, [_pattern(9) for _ in range(30)])
+    with pytest.raises(ValueError):
+        ViewFrameReader(other, m)          # video_hash mismatch
+
+
+def test_materialize_folders_relative_paths(tmp_path: Path) -> None:
+    video, digest = _digest_video(tmp_path)
+    va = build_view_assignment(video, digest, game="synth", assign_stride=2, cache_dir=tmp_path)
+    out = tmp_path / "mat"
+    paths = va.materialize(out, video_path=video, image_downscale=0.5)
+    assert paths and all(p.exists() for p in paths)
+    for p in paths:
+        rel = p.relative_to(out)
+        assert rel.parts[0] == "frames" and rel.parts[1] in {"train", "val"}
+        assert rel.parts[2].startswith("view_")

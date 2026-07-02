@@ -19,12 +19,13 @@ docs/superpowers/specs/2026-07-02-view-dataset-exporter-design.md.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -311,6 +312,54 @@ class ViewAssignment:
             return 0.0
         return float((v[1:] != v[:-1]).mean())
 
+    def materialize(
+        self,
+        out_dir: str | Path,
+        *,
+        video_path: str | Path,
+        image_downscale: float = 0.5,
+        jpeg_quality: int = 90,
+        boxes: pd.DataFrame | None = None,
+    ) -> list[Path]:
+        """Write a portable ImageFolder tree by re-decoding the manifest's frames.
+
+        Escape hatch off the manifest-first default: for every manifest row, decode the
+        frame (optionally player-masked + downscaled) and write a JPEG under
+        ``out_dir/frames/<split>/view_XX/<game>_f<frame>.jpg``; when ``boxes`` is given
+        the keep-mask is also written under ``out_dir/masks/<split>/view_XX/...png``.
+        Returns the list of written IMAGE paths (all under ``out_dir``). Pure
+        re-materialization: no scoring, deterministic from the manifest + video.
+
+        The reader is given ``expected_video_hash`` explicitly (a fresh in-memory
+        manifest may carry no ``video_hash`` attr) so the wrong-video guard still fires.
+        """
+        out_dir = Path(out_dir)
+        reader = ViewFrameReader(
+            video_path, self.manifest, boxes=boxes, downscale=image_downscale,
+            expected_video_hash=self.meta["video"]["video_hash"])
+        written: list[Path] = []
+        try:
+            for i in range(len(reader)):
+                img, keep_mask, row = reader.read(i)
+                split = str(row["split"])
+                view_id = int(row["view_id"])
+                game = str(row["game"])
+                frame_idx = int(row["frame"])
+                view_dir = f"view_{view_id:02d}"
+                stem = f"{game}_f{frame_idx:06d}"
+                img_path = out_dir / "frames" / split / view_dir / f"{stem}.jpg"
+                img_path.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(
+                    str(img_path), img, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+                written.append(img_path)
+                if keep_mask is not None:
+                    mask_path = out_dir / "masks" / split / view_dir / f"{stem}.png"
+                    mask_path.parent.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(mask_path), keep_mask)
+        finally:
+            reader.close()
+        return written
+
 
 def _reps_fingerprint(rep_frames: Sequence[int], ref_view_ids: Sequence[int]) -> str:
     """Short stable hash of the representative frame indices + their view ids."""
@@ -501,3 +550,136 @@ def build_view_assignment(
     }
 
     return ViewAssignment(manifest=manifest, representatives=representatives, meta=meta)
+
+
+# ---------------------------------------------------------------------------
+# Persist + Colab reader
+# ---------------------------------------------------------------------------
+
+
+def write_export(
+    assignment: ViewAssignment,
+    out_dir: str | Path,
+    *,
+    video_path: str | Path,
+) -> list[Path]:
+    """Persist the manifest-first export: a parquet manifest + a self-describing JSON.
+
+    Writes no image files (that is ``materialize``'s job). The sidecar is a copy of
+    ``assignment.meta`` augmented with a ``dataset_fingerprint`` (a stable hash of the
+    scoring params) and a ``stats`` block computed from the manifest, all cast to plain
+    Python / JSON-safe types. Returns ``[parquet_path, json_path]``.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    m = assignment.manifest
+
+    stats: dict[str, Any] = {
+        "n_frames": len(m),
+        "per_view_counts": {
+            str(int(cast(int, v))): int(c)
+            for v, c in m["view_id"].value_counts().sort_index().items()
+        },
+        "n_ambiguous": int(m["ambiguous"].sum()),
+        "n_train": int((m["split"] == "train").sum()),
+        "n_val": int((m["split"] == "val").sum()),
+        "confidence_median": float(m["confidence"].median()) if len(m) else 0.0,
+        "margin_median": float(m["margin"].median()) if len(m) else 0.0,
+        "switch_rate": float(assignment.switch_rate),
+    }
+    dataset_fingerprint = hashlib.sha1(
+        json.dumps(assignment.meta["params"], sort_keys=True).encode()).hexdigest()[:16]
+
+    sidecar = dict(assignment.meta)
+    sidecar["dataset_fingerprint"] = dataset_fingerprint
+    sidecar["stats"] = stats
+
+    parquet_path = out_dir / "view_dataset.parquet"
+    json_path = out_dir / "view_dataset.json"
+    m.to_parquet(parquet_path, index=False)
+    json_path.write_text(json.dumps(sidecar, indent=2))
+    return [parquet_path, json_path]
+
+
+def load_manifest(export_dir: str | Path) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Read back a ``write_export`` bundle -> ``(manifest, meta)``.
+
+    Attaches the sidecar's ``video_hash`` to ``df.attrs`` so a downstream
+    ``ViewFrameReader`` can verify it decodes the RIGHT video for this manifest.
+    """
+    export_dir = Path(export_dir)
+    df = pd.read_parquet(export_dir / "view_dataset.parquet")
+    meta: dict[str, Any] = json.loads((export_dir / "view_dataset.json").read_text())
+    df.attrs["video_hash"] = meta["video"]["video_hash"]
+    return df, meta
+
+
+class ViewFrameReader:
+    """Colab-side on-demand decoder — yields ``(frame, keep_mask, row)`` per manifest row.
+
+    Keeps the manifest-first export small: instead of shipping images, the trainer opens
+    the same ALL-INTRA mp4 and decodes each frame as needed. Guards against decoding the
+    WRONG video (a re-encode / different clip) by comparing ``_video_hash`` to the
+    expected hash (from ``expected_video_hash`` or ``manifest.attrs['video_hash']``).
+    """
+
+    def __init__(
+        self,
+        video_path: str | Path,
+        manifest: pd.DataFrame,
+        *,
+        boxes: pd.DataFrame | None = None,
+        downscale: float = 1.0,
+        expected_video_hash: str | None = None,
+    ) -> None:
+        # Guard against decoding the WRONG video for a manifest. The expected hash comes
+        # from the caller or from manifest.attrs (set by load_manifest).
+        expected = expected_video_hash or manifest.attrs.get("video_hash")
+        if expected is not None and _video_hash(Path(video_path)) != expected:
+            raise ValueError(
+                "video_hash mismatch: this manifest was built for a different video")
+        self._manifest = manifest.reset_index(drop=True)
+        self._boxes = boxes
+        self._downscale = downscale
+        self._cap = cv2.VideoCapture(str(video_path))
+        self._pos = 0
+        # (width,height) for masks: probe from the capture
+        self._size = (
+            int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920,
+            int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080,
+        )
+
+    def __len__(self) -> int:
+        return len(self._manifest)
+
+    def read(
+        self, i: int,
+    ) -> tuple[NDArray[np.uint8], NDArray[np.uint8] | None, pd.Series]:
+        row = self._manifest.iloc[i]
+        frame_idx = int(row["frame"])
+        # forward-grab fast path + seek fallback (mirror view_digest._read_frames)
+        if frame_idx < self._pos:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            self._pos = frame_idx
+        while self._pos < frame_idx:
+            if not self._cap.grab():
+                break
+            self._pos += 1
+        ok, frame = self._cap.read()
+        self._pos += 1
+        if not ok:
+            raise IndexError(f"could not decode frame {frame_idx}")
+        keep_mask: NDArray[np.uint8] | None = None
+        if self._boxes is not None:
+            masks = _build_masks(self._boxes, [frame_idx], self._size)
+            keep_mask = masks[0]
+        if self._downscale != 1.0:
+            frame = cv2.resize(frame, None, fx=self._downscale, fy=self._downscale)
+            if keep_mask is not None:
+                keep_mask = cv2.resize(  # type: ignore[assignment]
+                    keep_mask, (frame.shape[1], frame.shape[0]),
+                    interpolation=cv2.INTER_NEAREST)
+        return frame, keep_mask, row  # type: ignore[return-value]
+
+    def close(self) -> None:
+        self._cap.release()

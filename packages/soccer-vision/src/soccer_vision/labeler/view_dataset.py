@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import math
+import warnings
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -54,6 +55,41 @@ DEFAULT_SMOOTH_WINDOW = 5
 DEFAULT_VAL_FRAC = 0.1
 DEFAULT_CHUNK = 512
 SCHEMA_VERSION = 1
+
+
+def _content_hash(video_path: str | Path, *, edge_bytes: int = 1 << 20) -> str:
+    """Path/mtime-independent content fingerprint: sha1 of size + first & last edge_bytes.
+
+    Survives relocation (local -> Colab upload) but changes on any re-encode. Cheap (~2 MB
+    read), not a full-file hash — collisions require identical size AND identical head+tail."""
+    p = Path(video_path)
+    size = p.stat().st_size
+    h = hashlib.sha1()
+    h.update(str(size).encode())
+    with open(p, "rb") as f:
+        h.update(f.read(edge_bytes))
+        if size > edge_bytes:
+            f.seek(max(0, size - edge_bytes))
+            h.update(f.read(edge_bytes))
+    return h.hexdigest()[:16]
+
+
+def _decode_at(
+    cap: cv2.VideoCapture, idx: int, pos: int,
+) -> tuple[NDArray[np.uint8] | None, int]:
+    """Read frame ``idx`` from an open capture positioned at ``pos``; return
+    ``(frame_or_None, new_pos)``. Forward-grabs from ``pos`` to ``idx`` (seek fallback on
+    rewind), then reads one frame. Undecodable (tail over-report / corrupt) -> ``None``."""
+    if idx < pos:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        pos = idx
+    while pos < idx:
+        if not cap.grab():
+            break
+        pos += 1
+    ok, frame = cap.read()
+    pos += 1
+    return (frame if ok else None), pos  # type: ignore[return-value]
 
 
 def cross_match_fractions(
@@ -330,18 +366,21 @@ class ViewAssignment:
         ``out_dir/frames/<split>/view_XX/<game>_f<frame>.jpg``; when ``boxes`` is given
         the keep-mask is also written under ``out_dir/masks/<split>/view_XX/...png``.
         Returns the list of written IMAGE paths (all under ``out_dir``). Pure
-        re-materialization: no scoring, deterministic from the manifest + video.
+        re-materialization: no scoring, deterministic from the manifest + video. Rows with
+        ``view_id == -1`` (unassigned / unlabelable) are skipped, so no ``view_-1/`` folder.
 
-        The reader is given ``expected_video_hash`` explicitly (a fresh in-memory
-        manifest may carry no ``video_hash`` attr) so the wrong-video guard still fires.
+        The reader is given ``expected_content_hash`` explicitly (a fresh in-memory
+        manifest may carry no ``content_hash`` attr) so the wrong-video guard still fires.
         """
         out_dir = Path(out_dir)
         reader = ViewFrameReader(
             video_path, self.manifest, boxes=boxes, downscale=image_downscale,
-            expected_video_hash=self.meta["video"]["video_hash"])
+            expected_content_hash=self.meta["video"]["content_hash"])
         written: list[Path] = []
         try:
             for i in range(len(reader)):
+                if int(self.manifest.iloc[i]["view_id"]) == -1:
+                    continue  # unassigned: no valid positive/class, skip (no view_-1/ dir)
                 img, keep_mask, row = reader.read(i)
                 split = str(row["split"])
                 view_id = int(row["view_id"])
@@ -408,6 +447,7 @@ def build_view_assignment(
     val_frac: float = DEFAULT_VAL_FRAC,
     split_policy: str = "per_view_tail",
     player_boxes: pd.DataFrame | None = None,
+    boxes_source: str | None = None,
     chunk: int = DEFAULT_CHUNK,
     cache_dir: str | Path | None = None,
 ) -> ViewAssignment:
@@ -424,6 +464,11 @@ def build_view_assignment(
     """
     video_path = Path(video_path)
 
+    # Raw trajectories include the ball + referee(s); mask/count PLAYERS only so the field
+    # is what survives (and n_boxes is a true player count). Guard the column's presence.
+    if player_boxes is not None and "class" in player_boxes.columns:
+        player_boxes = player_boxes[player_boxes["class"] == "player"]
+
     cap = cv2.VideoCapture(str(video_path))
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -431,7 +476,15 @@ def build_view_assignment(
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
     cap.release()
 
-    query_frames = list(range(0, max(n_frames, 1), assign_stride))
+    # The FULL strided range we intend to sample; undecodable frames (incl. the macOS
+    # CAP_PROP_FRAME_COUNT tail over-report) are dropped below, so query_frames (the kept,
+    # decodable subset that every manifest row is built from) may be shorter.
+    requested_frames = list(range(0, max(n_frames, 1), assign_stride))
+    if len(requested_frames) <= 1:
+        warnings.warn(
+            f"view_dataset: only {len(requested_frames)} query frame(s) — "
+            f"check the video/stride", stacklevel=2)
+    query_frames: list[int] = list(requested_frames)
 
     rep_items = sorted(digest.representatives.items())
     ref_view_ids = [v for v, _ in rep_items]
@@ -449,8 +502,12 @@ def build_view_assignment(
     if player_boxes is None and cache_path.exists():
         data = np.load(cache_path)
         # Belt-and-suspenders (like compute_view_digest): the content-hashed key already
-        # guarantees same pixels, but re-verify the sampled frames before trusting it.
-        if data["query_frames"].tolist() == query_frames:
+        # guarantees same pixels, but re-verify the FULL requested range before trusting it.
+        # The cache stores both the requested range (validity guard) and the kept/decodable
+        # subset (query_frames) — a stride change re-derives a different requested range.
+        if ("requested_frames" in data.files
+                and data["requested_frames"].tolist() == requested_frames):
+            query_frames = data["query_frames"].tolist()
             match = np.asarray(data["match"], dtype=np.float64)
             keypoint_counts = np.asarray(data["keypoint_counts"], dtype=np.int32)
 
@@ -460,29 +517,29 @@ def build_view_assignment(
         rep_imgs = _read_frames(video_path, rep_frames)
         rep_desc, rep_counts = frame_descriptors(
             rep_imgs, n_features=n_features, downscale=downscale)
+        kept_frames: list[int] = []
         match_rows: list[NDArray[np.float64]] = []
         kp_all: list[int] = []
-        # One persistent capture, forward-read across ALL chunks. query_frames is ascending
-        # (a strided range), so reads never rewind — O(n_frames) grabs total, not O(chunks x
-        # chunk_start). Only one chunk of pixels is held at a time (bounded memory).
+        # One persistent capture, forward-read across ALL chunks. requested_frames is
+        # ascending (a strided range), so reads never rewind — O(n_frames) grabs total, not
+        # O(chunks x chunk_start). Only one chunk of pixels is held at a time (bounded mem).
+        # Undecodable frames are DROPPED (no row, no all-zero match) so every emitted
+        # manifest row is guaranteed to decode in ViewFrameReader / materialize.
         cap = cv2.VideoCapture(str(video_path))
         pos = 0
         try:
-            for start in range(0, len(query_frames), chunk):
-                chunk_frames = query_frames[start:start + chunk]
+            for start in range(0, len(requested_frames), chunk):
+                chunk_frames = requested_frames[start:start + chunk]
                 imgs: list[NDArray[np.uint8] | None] = []
+                chunk_kept: list[int] = []
                 for idx in chunk_frames:
-                    if idx < pos:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                        pos = idx
-                    while pos < idx:
-                        if not cap.grab():
-                            break
-                        pos += 1
-                    ok, frame = cap.read()
-                    pos += 1
-                    imgs.append(frame if ok else None)  # type: ignore[arg-type]
-                masks = (_build_masks(player_boxes, chunk_frames, (width, height))
+                    frame, pos = _decode_at(cap, idx, pos)
+                    if frame is not None:
+                        imgs.append(frame)
+                        chunk_kept.append(idx)
+                if not chunk_kept:
+                    continue
+                masks = (_build_masks(player_boxes, chunk_kept, (width, height))
                          if player_boxes is not None else None)
                 descs, counts = frame_descriptors(
                     imgs, n_features=n_features, downscale=downscale, masks=masks)
@@ -491,8 +548,10 @@ def build_view_assignment(
                     min_match_dist=min_match_dist, min_keypoints=min_keypoints)
                 match_rows.append(m)
                 kp_all.extend(counts)
+                kept_frames.extend(chunk_kept)
         finally:
             cap.release()
+        query_frames = kept_frames
         match = (np.concatenate(match_rows, axis=0) if match_rows
                  else np.zeros((0, len(ref_view_ids)), dtype=np.float64))
         keypoint_counts = np.asarray(kp_all, dtype=np.int32)
@@ -500,6 +559,7 @@ def build_view_assignment(
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             np.savez(
                 cache_path,
+                requested_frames=np.array(requested_frames, dtype=np.int64),
                 query_frames=np.array(query_frames, dtype=np.int64),
                 match=match,
                 keypoint_counts=keypoint_counts,
@@ -518,8 +578,19 @@ def build_view_assignment(
         ambiguity_margin=ambiguity_margin, smooth_window=smooth_window,
         val_frac=val_frac, split_policy=split_policy)
 
+    if len(manifest) and float((manifest["view_id"] == -1).mean()) > 0.2:
+        warnings.warn(
+            f"view_dataset: {float((manifest['view_id'] == -1).mean()):.0%} of frames are "
+            f"unassigned (view_id == -1) — check digest coverage / min_keypoints",
+            stacklevel=2)
+
     # A cache hit means identical pixels (content-hashed key), so the live hash is correct.
     provenance_hash = _video_hash(video_path)
+    # boxes_source is non-None iff masking actually ran (players present): the CLI-supplied
+    # parquet path when given, else a marker for in-memory boxes. Feeds dataset_fingerprint
+    # so masked and unmasked exports of the same video never collide.
+    meta_boxes_source = (
+        (boxes_source or "<in-memory boxes>") if player_boxes is not None else None)
     representatives = {int(v): int(f) for v, f in digest.representatives.items()}
     meta: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -527,6 +598,7 @@ def build_view_assignment(
             "path": str(video_path),
             "abspath": str(video_path.resolve()),
             "video_hash": provenance_hash,
+            "content_hash": _content_hash(video_path),
             "n_frames": int(n_frames),
             "fps": float(fps),
             "width": int(width),
@@ -548,7 +620,7 @@ def build_view_assignment(
             "n_views": int(digest.n_views),
             "representatives": representatives,
         },
-        "boxes_source": None,
+        "boxes_source": meta_boxes_source,
     }
 
     return ViewAssignment(manifest=manifest, representatives=representatives, meta=meta)
@@ -589,8 +661,17 @@ def write_export(
         "margin_median": float(m["margin"].median()) if len(m) else 0.0,
         "switch_rate": float(assignment.switch_rate),
     }
+    # Fold in the video content hash + masked flag so different videos / masked-vs-unmasked
+    # exports never collide on the same params.
     dataset_fingerprint = hashlib.sha1(
-        json.dumps(assignment.meta["params"], sort_keys=True).encode()).hexdigest()[:16]
+        json.dumps(
+            {
+                **assignment.meta["params"],
+                "content_hash": assignment.meta["video"].get("content_hash"),
+                "masked": assignment.meta.get("boxes_source") is not None,
+            },
+            sort_keys=True,
+        ).encode()).hexdigest()[:16]
 
     sidecar = dict(assignment.meta)
     sidecar["dataset_fingerprint"] = dataset_fingerprint
@@ -606,13 +687,15 @@ def write_export(
 def load_manifest(export_dir: str | Path) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Read back a ``write_export`` bundle -> ``(manifest, meta)``.
 
-    Attaches the sidecar's ``video_hash`` to ``df.attrs`` so a downstream
-    ``ViewFrameReader`` can verify it decodes the RIGHT video for this manifest.
+    Attaches the sidecar's ``content_hash`` (and legacy ``video_hash``, for provenance) to
+    ``df.attrs`` so a downstream ``ViewFrameReader`` can verify it decodes the RIGHT video
+    for this manifest — the content hash survives an upload/relocation (local -> Colab).
     """
     export_dir = Path(export_dir)
     df = pd.read_parquet(export_dir / "view_dataset.parquet")
     meta: dict[str, Any] = json.loads((export_dir / "view_dataset.json").read_text())
     df.attrs["video_hash"] = meta["video"]["video_hash"]
+    df.attrs["content_hash"] = meta["video"].get("content_hash")
     return df, meta
 
 
@@ -621,8 +704,11 @@ class ViewFrameReader:
 
     Keeps the manifest-first export small: instead of shipping images, the trainer opens
     the same ALL-INTRA mp4 and decodes each frame as needed. Guards against decoding the
-    WRONG video (a re-encode / different clip) by comparing ``_video_hash`` to the
-    expected hash (from ``expected_video_hash`` or ``manifest.attrs['video_hash']``).
+    WRONG video (a re-encode / different clip) by comparing a path/mtime-INDEPENDENT
+    ``_content_hash`` to the expected hash (from ``expected_content_hash`` or
+    ``manifest.attrs['content_hash']``), so the guard survives an upload/relocation (local
+    -> Colab) but still fires on a re-encode. ``expected_video_hash`` is accepted for
+    back-compat but the guard is content-based.
     """
 
     def __init__(
@@ -632,14 +718,19 @@ class ViewFrameReader:
         *,
         boxes: pd.DataFrame | None = None,
         downscale: float = 1.0,
+        expected_content_hash: str | None = None,
         expected_video_hash: str | None = None,
     ) -> None:
-        # Guard against decoding the WRONG video for a manifest. The expected hash comes
-        # from the caller or from manifest.attrs (set by load_manifest).
-        expected = expected_video_hash or manifest.attrs.get("video_hash")
-        if expected is not None and _video_hash(Path(video_path)) != expected:
-            raise ValueError(
-                "video_hash mismatch: this manifest was built for a different video")
+        # Guard against decoding the WRONG video for a manifest. The expected CONTENT hash
+        # comes from the caller or from manifest.attrs (set by load_manifest); it is
+        # path/mtime-independent so the SAME bytes at a new path (Colab upload) still pass.
+        expected = expected_content_hash or manifest.attrs.get("content_hash")
+        if expected is not None:
+            actual = _content_hash(Path(video_path))
+            if actual != expected:
+                raise ValueError(
+                    f"content hash mismatch: this manifest was built for a different video "
+                    f"(expected {expected}, got {actual}); video={video_path}")
         self._manifest = manifest.reset_index(drop=True)
         self._boxes = boxes
         self._downscale = downscale
@@ -697,10 +788,23 @@ class ViewFrameReader:
 # from soccer_vision.labeler.view_dataset import load_manifest, ViewFrameReader
 # m, meta = load_manifest("view_dataset_out/")
 # with ViewFrameReader("oceanside_clip.mp4", m,
-#                       expected_video_hash=meta["video"]["video_hash"]) as reader:
+#                       expected_content_hash=meta["video"]["content_hash"]) as reader:
 #     # contrastive: positives share row.view_key (or view_id); loss weight = row.weight
 #     # MAE: frame, keep_mask, _row = reader.read(i); mask players via keep_mask when present
 #     frame, keep_mask, row = reader.read(0)
+#
+# Contract notes (read before training):
+#   - confidence / weight / margin / view_second describe the RAW nearest-view argmax;
+#     view_id / view_key are the temporally SMOOTHED label. On smoothed transition frames
+#     they can DISAGREE — for a pure contrastive label use view_key, and treat weight as a
+#     soft QC signal, NOT a per-class probability.
+#   - For contrastive, FILTER OUT view_id == -1 rows (unlabelable low-keypoint frames);
+#     they are not valid positives for any class.
+#   - ViewFrameReader.read() returns BGR full-resolution frames (pass downscale= to match
+#     your model; convert BGR->RGB for torch).
+#   - For a shuffled multi-worker DataLoader do NOT share one ViewFrameReader (it holds a
+#     non-picklable cv2.VideoCapture): build one reader PER worker in worker_init_fn, or
+#     use materialize() -> torchvision.ImageFolder for shuffled training.
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -774,7 +878,8 @@ def main(argv: list[str] | None = None) -> None:
     va = build_view_assignment(
         video, digest, game=args.game, assign_stride=args.assign_stride,
         smooth_window=args.smooth_window, ambiguity_margin=args.ambiguity_margin,
-        val_frac=args.val_frac, player_boxes=player_boxes, cache_dir=args.cache_dir)
+        val_frac=args.val_frac, player_boxes=player_boxes,
+        boxes_source=str(args.boxes) if args.boxes else None, cache_dir=args.cache_dir)
 
     write_export(va, out, video_path=video)
     if args.materialize:

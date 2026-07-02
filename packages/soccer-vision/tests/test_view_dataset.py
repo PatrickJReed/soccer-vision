@@ -300,6 +300,50 @@ def test_frame_reader_wrong_video_raises(tmp_path: Path) -> None:
         ViewFrameReader(other, m)          # video_hash mismatch
 
 
+def test_content_hash_survives_relocation(tmp_path: Path) -> None:
+    video, digest = _digest_video(tmp_path)
+    va = build_view_assignment(video, digest, game="synth", assign_stride=2, cache_dir=tmp_path)
+    out = tmp_path / "export"
+    write_export(va, out, video_path=video)
+    m, meta = load_manifest(out)
+    # simulate uploading the SAME bytes to a different path (as in Colab)
+    moved = tmp_path / "sub" / "uploaded.mp4"
+    moved.parent.mkdir()
+    moved.write_bytes(video.read_bytes())
+    with ViewFrameReader(moved, m,
+                         expected_content_hash=meta["video"]["content_hash"]) as reader:
+        frame, _mask, _row = reader.read(0)   # must NOT raise despite the new path
+    assert frame.shape == (H, W, 3)
+
+
+def test_every_manifest_frame_is_decodable(tmp_path: Path) -> None:
+    # producer/consumer contract: no manifest row crashes the reader.
+    video, digest = _digest_video(tmp_path)
+    va = build_view_assignment(video, digest, game="synth", assign_stride=2, cache_dir=tmp_path)
+    with ViewFrameReader(video, va.manifest,
+                         expected_content_hash=va.meta["video"]["content_hash"]) as reader:
+        for i in range(len(reader)):
+            frame, _m, _r = reader.read(i)   # must not raise
+            assert frame is not None
+
+
+def test_undecodable_frames_are_dropped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import soccer_vision.labeler.view_dataset as vd
+    video, digest = _digest_video(tmp_path)
+    real = vd._decode_at
+
+    def flaky(cap, idx, pos):          # drop one specific query frame
+        if idx == 4:
+            _frame, newpos = real(cap, idx, pos)
+            return None, newpos
+        return real(cap, idx, pos)
+
+    monkeypatch.setattr(vd, "_decode_at", flaky)
+    va = build_view_assignment(video, digest, game="synth", assign_stride=2, cache_dir=tmp_path)
+    assert 4 not in set(va.manifest["frame"])     # dropped, not emitted as view_id=-1
+    assert 2 in set(va.manifest["frame"]) and 6 in set(va.manifest["frame"])
+
+
 def test_cli_writes_export(tmp_path: Path) -> None:
     from soccer_vision.labeler.view_dataset import main
     frames = [_pattern(v) for v in ([0]*10 + [1]*10 + [2]*10)]

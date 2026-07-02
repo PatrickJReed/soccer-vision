@@ -18,19 +18,31 @@ docs/superpowers/specs/2026-07-02-view-dataset-exporter-design.md.
 
 from __future__ import annotations
 
+import hashlib
 import math
 from collections import Counter
 from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
+import cv2
 import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
+from soccer_vision.labeler.chain import _video_hash
 from soccer_vision.labeler.view_digest import (
+    DEFAULT_DOWNSCALE,
     DEFAULT_MIN_KEYPOINTS,
     DEFAULT_MIN_MATCH_DIST,
+    DEFAULT_N_FEATURES,
+    ViewDigest,
+    _build_masks,
     _Descriptor,
     _pair_match_fraction,
+    _read_frames,
+    frame_descriptors,
 )
 
 DEFAULT_ASSIGN_STRIDE = 5
@@ -256,3 +268,218 @@ def build_manifest(
     df = assign_splits(df, val_frac=val_frac, policy=split_policy)
     df = df.sort_values("frame", kind="stable").reset_index(drop=True)
     return df
+
+
+# ---------------------------------------------------------------------------
+# Streaming video orchestration
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ViewAssignment:
+    """A video's densely-sampled per-frame view assignment plus provenance.
+
+    manifest:        the per-query-frame training manifest (see build_manifest).
+    representatives: view id -> the medoid frame index labelled for that view.
+    meta:            JSON-serializable provenance (schema, video probe, params, digest)
+                     that the Task-5 sidecar writer consumes.
+    """
+
+    manifest: pd.DataFrame
+    representatives: dict[int, int]
+    meta: dict[str, Any]
+
+    @property
+    def n_frames(self) -> int:
+        return len(self.manifest)
+
+    @property
+    def n_views(self) -> int:
+        return int(self.manifest["view_id"].nunique())
+
+    @property
+    def n_ambiguous(self) -> int:
+        return int(self.manifest["ambiguous"].sum())
+
+    @property
+    def switch_rate(self) -> float:
+        # fraction of consecutive (frame-sorted) rows where view_id changes
+        v = self.manifest.sort_values("frame")["view_id"].to_numpy()
+        if len(v) < 2:
+            return 0.0
+        return float((v[1:] != v[:-1]).mean())
+
+
+def _reps_fingerprint(rep_frames: Sequence[int], ref_view_ids: Sequence[int]) -> str:
+    """Short stable hash of the representative frame indices + their view ids."""
+    payload = repr((tuple(int(f) for f in rep_frames), tuple(int(v) for v in ref_view_ids)))
+    return hashlib.sha1(payload.encode()).hexdigest()[:12]
+
+
+def _viewassign_cache_path(
+    video_path: Path,
+    cache_dir: Path,
+    assign_stride: int,
+    n_features: int,
+    downscale: float,
+    min_match_dist: int,
+    min_keypoints: int,
+    reps_fingerprint: str,
+) -> Path:
+    # Key on the resolved path + params + reps only — NOT on file content — so the
+    # cache survives a content change (the cache-hit test corrupts the video after the
+    # first call and must still be served without decoding). Provenance (_video_hash)
+    # is stored INSIDE the npz instead.
+    key = (
+        f"{video_path.resolve()}|{assign_stride}|{n_features}|{downscale}"
+        f"|{min_match_dist}|{min_keypoints}|{reps_fingerprint}"
+    )
+    digest = hashlib.sha1(key.encode()).hexdigest()[:16]
+    return cache_dir / (
+        f"viewassign_{digest}_s{assign_stride}_n{n_features}_d{downscale}"
+        f"_m{min_match_dist}_k{min_keypoints}_{reps_fingerprint}.npz"
+    )
+
+
+def build_view_assignment(
+    video_path: str | Path,
+    digest: ViewDigest,
+    *,
+    game: str | None = None,
+    assign_stride: int = DEFAULT_ASSIGN_STRIDE,
+    n_features: int = DEFAULT_N_FEATURES,
+    downscale: float = DEFAULT_DOWNSCALE,
+    min_match_dist: int = DEFAULT_MIN_MATCH_DIST,
+    min_keypoints: int = DEFAULT_MIN_KEYPOINTS,
+    ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
+    smooth_window: int = DEFAULT_SMOOTH_WINDOW,
+    val_frac: float = DEFAULT_VAL_FRAC,
+    split_policy: str = "per_view_tail",
+    player_boxes: pd.DataFrame | None = None,
+    chunk: int = DEFAULT_CHUNK,
+    cache_dir: str | Path | None = None,
+) -> ViewAssignment:
+    """Densely sample a video and assign each frame its nearest digest VIEW.
+
+    Streams the query frames in ``chunk``-sized batches (decode -> optional player
+    masking -> ORB descriptors -> rectangular match vs the digest representatives),
+    discarding pixels between chunks so memory stays flat over a full game. The
+    (expensive) (Q, R) match block is cached in an ``.npz`` keyed by the resolved video
+    path + scoring params + a fingerprint of the representatives (NOT file content),
+    so a re-run is instant and survives an incidental content change. Player masking
+    bypasses the cache (the match depends on the masks). Returns a ``ViewAssignment``
+    wrapping the manifest, the labelled representatives, and JSON-safe provenance.
+    """
+    video_path = Path(video_path)
+
+    cap = cv2.VideoCapture(str(video_path))
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+    cap.release()
+
+    query_frames = list(range(0, max(n_frames, 1), assign_stride))
+
+    rep_items = sorted(digest.representatives.items())
+    ref_view_ids = [v for v, _ in rep_items]
+    rep_frames = [f for _, f in rep_items]
+
+    reps_fingerprint = _reps_fingerprint(rep_frames, ref_view_ids)
+    cache_dir = Path(cache_dir or (video_path.parent / ".sv_labeler_cache"))
+    cache_path = _viewassign_cache_path(
+        video_path, cache_dir, assign_stride, n_features, downscale,
+        min_match_dist, min_keypoints, reps_fingerprint)
+
+    match: NDArray[np.float64] | None = None
+    keypoint_counts: NDArray[np.int32] = np.zeros(0, dtype=np.int32)
+    stored_video_hash: str | None = None
+
+    if player_boxes is None and cache_path.exists():
+        data = np.load(cache_path)
+        match = np.asarray(data["match"], dtype=np.float64)
+        keypoint_counts = np.asarray(data["keypoint_counts"], dtype=np.int32)
+        # Trust the cache's own query_frames: the key already pins path + stride + params
+        # + reps (NOT file content), so an incidental content change -> serve the cached
+        # assignment without decoding (provenance video_hash stays in the npz).
+        query_frames = data["query_frames"].tolist()
+        stored_video_hash = str(data["video_hash"]) if "video_hash" in data else None
+
+    if match is None:
+        # Decode representatives only on a cache miss (the fingerprint above needs just
+        # their frame indices + view ids, not their pixels).
+        rep_imgs = _read_frames(video_path, rep_frames)
+        rep_desc, rep_counts = frame_descriptors(
+            rep_imgs, n_features=n_features, downscale=downscale)
+        match_rows: list[NDArray[np.float64]] = []
+        kp_all: list[int] = []
+        for start in range(0, len(query_frames), chunk):
+            chunk_frames = query_frames[start:start + chunk]
+            imgs = _read_frames(video_path, chunk_frames)
+            masks = (_build_masks(player_boxes, chunk_frames, (width, height))
+                     if player_boxes is not None else None)
+            descs, counts = frame_descriptors(
+                imgs, n_features=n_features, downscale=downscale, masks=masks)
+            m = cross_match_fractions(
+                descs, counts, rep_desc, rep_counts,
+                min_match_dist=min_match_dist, min_keypoints=min_keypoints)
+            match_rows.append(m)
+            kp_all.extend(counts)
+        match = (np.concatenate(match_rows, axis=0) if match_rows
+                 else np.zeros((0, len(ref_view_ids)), dtype=np.float64))
+        keypoint_counts = np.asarray(kp_all, dtype=np.int32)
+        if player_boxes is None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(
+                cache_path,
+                query_frames=np.array(query_frames, dtype=np.int64),
+                match=match,
+                keypoint_counts=keypoint_counts,
+                ref_view_ids=np.array(ref_view_ids, dtype=np.int64),
+                video_hash=_video_hash(video_path))
+
+    if player_boxes is not None:
+        counts_by_frame = player_boxes.groupby("frame").size()
+        n_boxes: list[int] | None = [int(counts_by_frame.get(f, 0)) for f in query_frames]
+    else:
+        n_boxes = None
+
+    manifest = build_manifest(
+        query_frames, match, ref_view_ids, keypoint_counts.tolist(),
+        game=game or video_path.stem, fps=fps, n_boxes=n_boxes,
+        ambiguity_margin=ambiguity_margin, smooth_window=smooth_window,
+        val_frac=val_frac, split_policy=split_policy)
+
+    provenance_hash = stored_video_hash or _video_hash(video_path)
+    representatives = {int(v): int(f) for v, f in digest.representatives.items()}
+    meta: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "video": {
+            "path": str(video_path),
+            "abspath": str(video_path.resolve()),
+            "video_hash": provenance_hash,
+            "n_frames": int(n_frames),
+            "fps": float(fps),
+            "width": int(width),
+            "height": int(height),
+        },
+        "params": {
+            "assign_stride": int(assign_stride),
+            "n_features": int(n_features),
+            "downscale": float(downscale),
+            "min_match_dist": int(min_match_dist),
+            "min_keypoints": int(min_keypoints),
+            "ambiguity_margin": float(ambiguity_margin),
+            "smooth_window": int(smooth_window),
+            "val_frac": float(val_frac),
+            "split_policy": str(split_policy),
+            "chunk": int(chunk),
+        },
+        "digest": {
+            "n_views": int(digest.n_views),
+            "representatives": representatives,
+        },
+        "boxes_source": None,
+    }
+
+    return ViewAssignment(manifest=manifest, representatives=representatives, meta=meta)

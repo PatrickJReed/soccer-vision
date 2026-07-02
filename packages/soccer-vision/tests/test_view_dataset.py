@@ -1,19 +1,25 @@
 """Tests for the view-dataset exporter (annotation-scaling Slice 1.5)."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import cv2
 import numpy as np
 import pandas as pd
+import pytest
 from numpy.typing import NDArray
 from soccer_vision.labeler.view_dataset import (
+    ViewAssignment,
     assign_nearest_view,
     assign_splits,
     build_manifest,
+    build_view_assignment,
     cross_match_fractions,
     smooth_view_sequence,
 )
 from soccer_vision.labeler.view_digest import (
     _pair_match_fraction,
+    compute_view_digest,
     frame_descriptors,
     similarity_matrix,
 )
@@ -177,3 +183,55 @@ def test_build_manifest_unsorted_input_matches_sorted() -> None:
                                [kp[i] for i in perm], game="g", fps=30.0, smooth_window=5)
     for col in ("frame", "view_id", "view_id_raw", "view_key", "n_keypoints", "split"):
         assert list(sorted_df[col]) == list(scrambled[col]), col
+
+
+def _write_video(path: Path, frames: list) -> bool:
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # type: ignore[attr-defined]
+    vw = cv2.VideoWriter(str(path), fourcc, 30.0, (W, H))
+    if not vw.isOpened():
+        return False
+    for fr in frames:
+        vw.write(fr)
+    vw.release()
+    return path.exists() and path.stat().st_size > 0
+
+
+def _digest_video(tmp_path: Path):
+    frames = [_pattern(v) for v in ([0]*10 + [1]*10 + [2]*10)]
+    video = tmp_path / "clip.mp4"
+    if not _write_video(video, frames):
+        pytest.skip("platform OpenCV cannot write mp4")
+    digest = compute_view_digest(video, stride=3, dist_threshold=0.5, cache_dir=tmp_path)
+    return video, digest
+
+
+def test_build_view_assignment_manifest(tmp_path: Path) -> None:
+    video, digest = _digest_video(tmp_path)
+    va = build_view_assignment(video, digest, game="synth", assign_stride=2,
+                               smooth_window=1, cache_dir=tmp_path)
+    assert isinstance(va, ViewAssignment)
+    m = va.manifest
+    assert len(m) == len(range(0, 30, 2))
+    assert set(m["view_id"]).issubset(set(digest.view_of.values()))
+    assert 0.0 <= va.switch_rate <= 1.0
+    assert va.n_frames == len(m) and va.n_views >= 1
+
+
+def test_build_view_assignment_cache_hit(tmp_path: Path) -> None:
+    video, digest = _digest_video(tmp_path)
+    va1 = build_view_assignment(video, digest, game="synth", assign_stride=2, cache_dir=tmp_path)
+    video.write_bytes(b"broken")   # 2nd call must NOT decode — served from cache
+    va2 = build_view_assignment(video, digest, game="synth", assign_stride=2, cache_dir=tmp_path)
+    assert list(va1.manifest["view_id_raw"]) == list(va2.manifest["view_id_raw"])
+    assert np.allclose(va1.manifest["confidence"], va2.manifest["confidence"])
+
+
+def test_build_view_assignment_masking_records_boxes(tmp_path: Path) -> None:
+    video, digest = _digest_video(tmp_path)
+    boxes = pd.DataFrame({"frame": [0, 0], "class": ["player", "player"],
+                          "bbox_x1": [0, 100], "bbox_y1": [0, 100],
+                          "bbox_x2": [50, 200], "bbox_y2": [50, 200]})
+    va = build_view_assignment(video, digest, game="synth", assign_stride=2,
+                               player_boxes=boxes, cache_dir=tmp_path)
+    row0 = va.manifest[va.manifest["frame"] == 0].iloc[0]
+    assert row0["n_boxes"] == 2

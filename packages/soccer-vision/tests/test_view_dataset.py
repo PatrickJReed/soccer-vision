@@ -8,6 +8,7 @@ from numpy.typing import NDArray
 from soccer_vision.labeler.view_dataset import (
     assign_nearest_view,
     assign_splits,
+    build_manifest,
     cross_match_fractions,
     smooth_view_sequence,
 )
@@ -126,3 +127,39 @@ def test_assign_splits_holdout_views() -> None:
     out = assign_splits(df, policy="holdout_views", holdout_views={1})
     assert (out[out["view_id"] == 1]["split"] == "val").all()
     assert (out[out["view_id"] == 0]["split"] == "train").all()
+
+
+def test_build_manifest_schema_and_content() -> None:
+    match = np.array([[0.8, 0.2], [0.15, 0.7], [0.75, 0.1]])   # frames -> views [0,1,0]
+    df = build_manifest(query_frames=[0, 5, 10], match=match, ref_view_ids=[0, 1],
+                        keypoint_counts=[300, 280, 310], game="oceanside", fps=30.0,
+                        ambiguity_margin=0.05, smooth_window=1, val_frac=0.34)
+    assert list(df.columns) == ["game", "frame", "t_seconds", "view_id", "view_id_raw",
+        "view_second", "view_key", "confidence", "weight", "margin", "ambiguous",
+        "n_keypoints", "n_boxes", "split"]
+    assert df["view_id"].dtype == np.int32 and df["confidence"].dtype == np.float32
+    assert list(df["view_id"]) == [0, 1, 0]
+    assert list(df["view_key"]) == ["oceanside:0", "oceanside:1", "oceanside:0"]
+    assert (df["weight"].to_numpy() == df["confidence"].to_numpy()).all()
+    assert abs(df.loc[0, "t_seconds"] - 0.0) < 1e-9 and abs(df.loc[2, "t_seconds"] - 10/30) < 1e-6
+    assert list(df["n_boxes"]) == [0, 0, 0]              # None -> 0
+    assert df["frame"].is_monotonic_increasing
+
+
+def test_build_manifest_ambiguous_flag() -> None:
+    match = np.array([[0.50, 0.49]])                    # margin 0.01 < 0.05 -> ambiguous
+    df = build_manifest([0], match, [0, 1], [300], game="g", fps=30.0, ambiguity_margin=0.05)
+    assert bool(df.loc[0, "ambiguous"]) is True
+
+
+def test_build_manifest_smoothing_preserves_raw() -> None:
+    match = np.array([[0.9, 0.1]]*3 + [[0.1, 0.9]] + [[0.9, 0.1]]*3)  # lone view1 at idx3
+    df = build_manifest(list(range(7)), match, [0, 1], [300]*7, game="g", fps=30.0,
+                        smooth_window=5)
+    assert df.loc[3, "view_id_raw"] == 1 and df.loc[3, "view_id"] == 0   # raw kept, smoothed fixed
+
+
+def test_build_manifest_records_boxes() -> None:
+    match = np.array([[0.8, 0.2]])
+    df = build_manifest([0], match, [0, 1], [300], game="g", fps=30.0, n_boxes=[4])
+    assert df.loc[0, "n_boxes"] == 4

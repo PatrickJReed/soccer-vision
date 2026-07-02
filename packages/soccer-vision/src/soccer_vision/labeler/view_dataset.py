@@ -184,3 +184,68 @@ def assign_splits(
 
     out["split"] = split
     return out
+
+
+def build_manifest(
+    query_frames: Sequence[int],
+    match: NDArray[np.float64],
+    ref_view_ids: Sequence[int],
+    keypoint_counts: Sequence[int],
+    *,
+    game: str,
+    fps: float,
+    n_boxes: Sequence[int] | None = None,
+    ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
+    smooth_window: int = DEFAULT_SMOOTH_WINDOW,
+    val_frac: float = DEFAULT_VAL_FRAC,
+    split_policy: str = "per_view_tail",
+) -> pd.DataFrame:
+    """Assemble the training manifest from precomputed cross-view match scores (pure).
+
+    ``match`` is (Q, R) — each query frame vs each reference representative — with
+    ``query_frames``, ``keypoint_counts`` (and optional ``n_boxes``) aligned to the Q
+    rows and ``ref_view_ids`` aligned to the R columns. Each frame is assigned its
+    nearest view (``assign_nearest_view``), the per-frame ``view_id_raw`` sequence is
+    temporally smoothed (``smooth_view_sequence``) into ``view_id`` while the raw label
+    is retained, and rows are split train/val (``assign_splits``).
+
+    ``ambiguous`` flags frames whose across-view ``margin`` is below ``ambiguity_margin``.
+    ``view_key`` and ``weight`` use the SMOOTHED ``view_id`` and the ``confidence``
+    respectively. The result is sorted by ``frame`` ascending and index-reset, with a
+    fixed column order matching the manifest schema. Deterministic; no video I/O.
+    """
+    base = assign_nearest_view(match, ref_view_ids)
+    view_id = smooth_view_sequence(
+        base["view_id_raw"].tolist(), window=smooth_window
+    ).astype(np.int32)
+
+    frame = np.asarray(query_frames, dtype=np.int64)
+    n_kp = np.asarray(keypoint_counts, dtype=np.int32)
+    boxes = (
+        np.zeros(len(frame), dtype=np.int32)
+        if n_boxes is None
+        else np.asarray(n_boxes, dtype=np.int32)
+    )
+    margin = base["margin"].to_numpy()
+
+    df = pd.DataFrame(
+        {
+            "game": pd.Series([game] * len(frame), dtype=object),
+            "frame": frame,
+            "t_seconds": frame.astype(np.float64) / fps,
+            "view_id": view_id,
+            "view_id_raw": base["view_id_raw"].to_numpy().astype(np.int32),
+            "view_second": base["view_second"].to_numpy().astype(np.int32),
+            "view_key": pd.Series([f"{game}:{v}" for v in view_id], dtype=object),
+            "confidence": base["confidence"].to_numpy().astype(np.float32),
+            "weight": base["confidence"].to_numpy().astype(np.float32),
+            "margin": margin.astype(np.float32),
+            "ambiguous": margin < ambiguity_margin,
+            "n_keypoints": n_kp,
+            "n_boxes": boxes,
+        }
+    )
+
+    df = assign_splits(df, val_frac=val_frac, policy=split_policy)
+    df = df.sort_values("frame", kind="stable").reset_index(drop=True)
+    return df

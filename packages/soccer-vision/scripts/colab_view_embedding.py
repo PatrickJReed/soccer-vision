@@ -187,3 +187,52 @@ for epoch in range(5):
 #  - upgrade the loss to SupCon/triplet for a true metric space, or MAE once masks exist.
 #  - to scale cross-game, re-export each game and concatenate manifests (view_key is
 #    game-scoped, so views never collide across clips).
+
+# %% [markdown]
+# ## Embedding quality — does the 128-d space recover the views on its own?
+# Val accuracy says the backbone can classify views; this asks the deeper question:
+# do the embeddings CLUSTER by view unsupervised? (Caveat: the head was trained with
+# view cross-entropy, so high agreement is confirmatory, not independent — the honest
+# generalization test is a time-gapped split / a second game.) Reports KMeans-vs-view
+# ARI + purity (numbers) and a 2D map (to eyeball for a pan manifold).
+
+# %%
+import collections
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+from sklearn.metrics import adjusted_rand_score, silhouette_score
+
+full_ds = ViewFrameDataset(manifest, VIDEO, split=None, img_size=IMG_SIZE, downscale=DOWNSCALE)
+full_dl = DataLoader(full_ds, batch_size=64, shuffle=False, num_workers=2,
+                     worker_init_fn=_worker_init)
+model.eval()
+embs, views = [], []
+with torch.no_grad():
+    for xb, yb, _wb in full_dl:
+        embs.append(model(xb.to(device)).cpu().numpy())
+        views.append(yb.numpy())
+E = np.concatenate(embs); V = np.concatenate(views)
+print("embeddings:", E.shape)
+
+k = len(full_ds.view_ids)
+km = KMeans(n_clusters=k, n_init=10, random_state=0).fit(E)
+ari = adjusted_rand_score(V, km.labels_)
+purity = sum(collections.Counter(V[km.labels_ == c]).most_common(1)[0][1]
+             for c in set(km.labels_)) / len(V)
+sil = silhouette_score(E, V)   # separation of the TRUE view labels in embedding space
+print(f"KMeans({k}) vs view_id:  ARI={ari:.3f}  purity={purity:.3f}  |  "
+      f"silhouette(view_id)={sil:.3f}")
+print("  ARI/purity ~1.0 => embeddings recover the views; silhouette>0 => views are separated")
+
+# 2D map (UMAP if available, else t-SNE) colored by view_id — eyeball for a pan manifold
+try:
+    import umap
+    XY = umap.UMAP(n_neighbors=15, min_dist=0.1, random_state=0).fit_transform(E); proj = "UMAP"
+except Exception:
+    from sklearn.manifold import TSNE
+    XY = TSNE(n_components=2, init="pca", random_state=0).fit_transform(E); proj = "t-SNE"
+plt.figure(figsize=(7, 6))
+sc = plt.scatter(XY[:, 0], XY[:, 1], c=V, cmap="tab20", s=14)
+plt.title(f"{proj} of 128-d embeddings, colored by view_id"); plt.colorbar(sc, label="view")
+plt.tight_layout(); plt.savefig("/content/embedding_map.png", dpi=120); plt.show()
+print("saved /content/embedding_map.png")

@@ -191,17 +191,11 @@ def test_view_consistency_skips_singleton_views() -> None:
     assert view_consistency(calib).empty
 
 
-def test_register_to_best_rep_rejects_collinear() -> None:
-    # a rep and a "frame" whose shared features lie on a single horizontal band -> collinear
-    rep = np.full((H, W, 3), 30, np.uint8)
-    cv2.line(rep, (10, 120), (310, 120), (255, 255, 255), 3)   # one line only
-    for x in range(15, 315, 6):
-        cv2.circle(rep, (x, 120), 2, (0, 200, 255), -1)         # features along the line
-    frame = rep.copy()
-    fkp, fdesc = _orb(frame)
-    rkp, rdesc = _orb(rep)
-    out = register_to_best_rep(fkp, fdesc, [rkp], [rdesc], min_inliers=12)
-    assert out is None                 # collinear inliers -> rejected despite matches
+def test_nondegenerate_rejects_extreme_scale() -> None:
+    from soccer_vision.pitch.view_registration import _nondegenerate
+    assert _nondegenerate(np.eye(3)) is True                  # det 1 -> ok
+    assert _nondegenerate(np.diag([100.0, 100.0, 1.0])) is False   # det 1e4 > 50 -> degenerate
+    assert _nondegenerate(np.diag([1e-3, 1e-3, 1.0])) is False      # det 1e-6 < 0.02 -> degenerate
 
 
 def test_cli_writes_homographies(tmp_path: Path) -> None:

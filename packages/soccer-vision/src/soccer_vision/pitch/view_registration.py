@@ -37,18 +37,19 @@ def compose_pitch_homography(
     return H
 
 
-def _well_conditioned(
-    src_inliers: NDArray[np.floating], G: NDArray[np.floating], *,
-    min_spread_ratio: float = 0.02, det_lo: float = 0.02, det_hi: float = 50.0,
+def _nondegenerate(
+    G: NDArray[np.floating], *, det_lo: float = 0.02, det_hi: float = 50.0,
 ) -> bool:
-    """Reject near-collinear inliers (under-determined perpendicular to the line) and
-    degenerate/extreme-scale homographies. src_inliers: (N,2) inlier source points."""
-    if len(src_inliers) < 3:
-        return False
-    cov = np.cov(src_inliers.T)
-    ev = np.linalg.eigvalsh(cov)                 # ascending, >= 0
-    if ev[-1] <= 1e-9 or ev[0] / ev[-1] < min_spread_ratio:
-        return False                              # inliers ~collinear
+    """Reject degenerate / extreme-scale homographies (a cheap sanity gate on |det(G[:2,:2])|).
+
+    NOTE: an earlier version also rejected near-collinear inlier point clouds (eigenvalue-ratio
+    gate). Measured on real oceanside footage that dropped ~60% of GOOD frames: broadcast
+    background features legitimately concentrate in a horizontal band (the pitch recedes to a
+    thin band; foreground grass is textureless), yet still register with ~1350 inliers and tight
+    within-view consistency (spread shrank when they were included). The within-view consistency
+    validation is the real garbage detector; masked footage (more line-dominated) may warrant a
+    confidence-based conditioning signal later — tracked as a follow-up, not a hard reject.
+    """
     det = abs(float(np.linalg.det(np.asarray(G, np.float64)[:2, :2])))
     return det_lo <= det <= det_hi
 
@@ -62,8 +63,8 @@ def register_to_best_rep(
 
     Ranks reps by cross-checked match count, runs RANSAC findHomography on the top_k,
     and returns (best_rep_index, G frame_px->rep_px, n_inliers) with the most inliers
-    (>= min_inliers) whose inlier geometry is well-conditioned (not near-collinear and
-    not degenerate-scale), or None if none qualify.
+    (>= min_inliers) whose homography is non-degenerate (sane determinant), or None if none
+    qualify.
     """
     if frame_desc is None or len(frame_desc) < min_inliers:
         return None
@@ -88,8 +89,8 @@ def register_to_best_rep(
         n_in = int(inlier_mask.sum())
         if n_in < min_inliers:
             continue
-        if not _well_conditioned(src[inlier_mask], Gf):
-            continue                              # near-collinear / degenerate -> reject
+        if not _nondegenerate(Gf):
+            continue                              # degenerate / extreme-scale H -> reject
         if best is None or n_in > best[2]:
             best = (i, Gf, n_in)
     return best

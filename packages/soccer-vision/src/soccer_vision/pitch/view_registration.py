@@ -37,6 +37,22 @@ def compose_pitch_homography(
     return H
 
 
+def _well_conditioned(
+    src_inliers: NDArray[np.floating], G: NDArray[np.floating], *,
+    min_spread_ratio: float = 0.02, det_lo: float = 0.02, det_hi: float = 50.0,
+) -> bool:
+    """Reject near-collinear inliers (under-determined perpendicular to the line) and
+    degenerate/extreme-scale homographies. src_inliers: (N,2) inlier source points."""
+    if len(src_inliers) < 3:
+        return False
+    cov = np.cov(src_inliers.T)
+    ev = np.linalg.eigvalsh(cov)                 # ascending, >= 0
+    if ev[-1] <= 1e-9 or ev[0] / ev[-1] < min_spread_ratio:
+        return False                              # inliers ~collinear
+    det = abs(float(np.linalg.det(np.asarray(G, np.float64)[:2, :2])))
+    return det_lo <= det <= det_hi
+
+
 def register_to_best_rep(
     frame_kp: list[Any], frame_desc: NDArray[Any] | None,
     rep_kps: list[list[Any]], rep_descs: list[NDArray[Any] | None], *,
@@ -46,7 +62,8 @@ def register_to_best_rep(
 
     Ranks reps by cross-checked match count, runs RANSAC findHomography on the top_k,
     and returns (best_rep_index, G frame_px->rep_px, n_inliers) with the most inliers
-    (>= min_inliers), or None if none qualify.
+    (>= min_inliers) whose inlier geometry is well-conditioned (not near-collinear and
+    not degenerate-scale), or None if none qualify.
     """
     if frame_desc is None or len(frame_desc) < min_inliers:
         return None
@@ -66,9 +83,15 @@ def register_to_best_rep(
         G, mask = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
         if G is None:
             continue
-        n_in = int(mask.sum())
-        if n_in >= min_inliers and (best is None or n_in > best[2]):
-            best = (i, G.astype(np.float64), n_in)
+        Gf = G.astype(np.float64)
+        inlier_mask = mask.ravel().astype(bool)
+        n_in = int(inlier_mask.sum())
+        if n_in < min_inliers:
+            continue
+        if not _well_conditioned(src[inlier_mask], Gf):
+            continue                              # near-collinear / degenerate -> reject
+        if best is None or n_in > best[2]:
+            best = (i, Gf, n_in)
     return best
 
 
@@ -190,51 +213,69 @@ def write_homographies(calib: RegisteredCalib, out_path: str | Path) -> None:
     homographies_to_parquet(calib.homographies, Path(out_path))
 
 
-def cross_registration_error(
-    video_path: str | Path, digest: ViewDigest,
-    rep_homographies: Mapping[int, NDArray[np.floating]], *,
-    n_features: int = DEFAULT_N_FEATURES, min_inliers: int = DEFAULT_MIN_INLIERS,
+def homographies_dict_from_parquet(path: str | Path) -> dict[int, NDArray[np.float64]]:
+    """Load a homographies.parquet (frame->3x3 H) into a dict, e.g. a chain-propagation run."""
+    df = pd.read_parquet(path)
+    return {int(r.frame): np.array([[r.h00, r.h01, r.h02], [r.h10, r.h11, r.h12],  # type: ignore[arg-type]
+                                    [r.h20, r.h21, r.h22]], dtype=np.float64)
+            for r in df.itertuples()}
+
+
+def _project_point(H: NDArray[np.floating], p: NDArray[np.floating]) -> NDArray[np.float64]:
+    """Project a homogeneous image point p=(x,y,1) to pitch (x,y) via H."""
+    q = np.asarray(H, np.float64) @ p
+    return np.asarray(q[:2] / q[2], dtype=np.float64)
+
+
+def view_consistency(
+    calib: RegisteredCalib, *, ref_px: tuple[float, float] = (960.0, 540.0),
+    chain: Mapping[int, NDArray[np.floating]] | None = None,
 ) -> pd.DataFrame:
-    """Drift-free proof: register each labeled rep R to every OTHER rep R', compose, and
-    measure the mean pitch reprojection error of the 4 image corners vs R's own manual H.
-    Returns rows (rep_R, rep_Rprime, temporal_dist=|frame_R-frame_R'|, corner_err_pitch)."""
-    video_path = Path(video_path)
-    view_ids = sorted(rep_homographies)
-    rep_frames = {v: digest.representatives[v] for v in view_ids}
-    imgs = dict(zip(view_ids, _read_frames(video_path, [rep_frames[v] for v in view_ids]),
-                    strict=True))
-    kp: dict[int, list[Any]] = {}
-    desc: dict[int, NDArray[Any] | None] = {}
-    for v in view_ids:
-        im = imgs[v]
-        kp[v], desc[v] = (_orb_full(im, None, n_features) if im is not None else ([], None))
-    first_img = next((im for im in imgs.values() if im is not None), None)
-    if first_img is None:
-        return pd.DataFrame(columns=["rep_R", "rep_Rprime", "temporal_dist", "corner_err_pitch"])
-    h, w = first_img.shape[:2]
-    corners = np.array([[0, 0], [w, 0], [0, h], [w, h]], dtype=np.float64)
+    """Within-view drift-free proof: for each view, project a reference image point to pitch
+    via every frame assigned to that view and measure the spread around the per-view median.
+    A drift-free method keeps this spread small and INDEPENDENT of the view's temporal span
+    (the same camera pose recurs across the clip). Optionally compares the same spread computed
+    from `chain` (frame->H) homographies for contrast.
 
-    def project(hm: NDArray[np.floating], pts: NDArray[np.floating]) -> NDArray[np.float64]:
-        p = (np.asarray(hm, np.float64) @ np.column_stack([pts, np.ones(len(pts))]).T).T
-        return np.asarray(p[:, :2] / p[:, 2:3], dtype=np.float64)
+    Returns one row per view with >=2 frames:
+      view, n_frames, temporal_span (max-min frame), reg_spread (mean L2 pitch dist to the
+      per-view median projected point), chain_spread (same via `chain`, NaN if unavailable).
 
-    cols = ["rep_R", "rep_Rprime", "temporal_dist", "corner_err_pitch"]
+    "Spread" is the mean over the view's frames of the L2 distance from each frame's projected
+    point to the view's component-wise median projected point.
+    """
+    p = np.array([ref_px[0], ref_px[1], 1.0])
+
+    # view id -> frames assigned to it that have an accepted registered/rep homography.
+    frames_by_view: dict[int, list[int]] = {}
+    for f, v in calib.rep_of.items():
+        e = calib.homographies.get(f)
+        if e is None or e.source not in ("registered", "rep"):
+            continue
+        frames_by_view.setdefault(int(v), []).append(int(f))
+
+    def spread(frames: list[int], src: Mapping[int, NDArray[np.floating]]) -> float:
+        pts = [_project_point(src[f], p) for f in frames if f in src]
+        if len(pts) < 2:
+            return float("nan")
+        arr = np.asarray(pts, np.float64)
+        med = np.median(arr, axis=0)                       # component-wise median
+        return float(np.linalg.norm(arr - med, axis=1).mean())
+
     rows: list[dict[str, Any]] = []
-    for r in view_ids:
-        truth = project(rep_homographies[r], corners)
-        for rp in view_ids:
-            if rp == r:
-                continue
-            res = register_to_best_rep(kp[r], desc[r], [kp[rp]], [desc[rp]], min_inliers=min_inliers)
-            if res is None:
-                err = float("nan")                       # views don't overlap -> no proof point
-            else:
-                _, g, _n = res
-                hc = compose_pitch_homography(rep_homographies[rp], g)
-                err = float(np.linalg.norm(project(hc, corners) - truth, axis=1).mean())
-            rows.append({"rep_R": r, "rep_Rprime": rp,
-                         "temporal_dist": abs(rep_frames[r] - rep_frames[rp]),
-                         "corner_err_pitch": err})
+    for v in sorted(frames_by_view):
+        frames = sorted(frames_by_view[v])
+        if len(frames) < 2:
+            continue                                       # no spread defined
+        reg_src = {f: calib.homographies[f].H for f in frames}
+        rows.append({
+            "view": v,
+            "n_frames": len(frames),
+            "temporal_span": frames[-1] - frames[0],
+            "reg_spread": spread(frames, reg_src),
+            "chain_spread": spread(frames, chain) if chain is not None else float("nan"),
+        })
+    cols = ["view", "n_frames", "temporal_span", "reg_spread", "chain_spread"]
     return pd.DataFrame(rows, columns=cols)
 
 
@@ -257,6 +298,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--boxes", type=Path, default=None)
     ap.add_argument("--min-inliers", type=int, default=DEFAULT_MIN_INLIERS)
     ap.add_argument("--validate", action="store_true")
+    ap.add_argument("--chain-homographies", type=Path, default=None,
+                    help="Optional chain-propagation homographies.parquet for drift contrast.")
     args = ap.parse_args(argv)
     out = args.out or (args.video.parent / "view_registration_out")
     Path(out).mkdir(parents=True, exist_ok=True)
@@ -268,15 +311,34 @@ def main(argv: list[str] | None = None) -> None:
     print("view-registration:", {k: calib.stats[k]
                                   for k in ("coverage", "n_registered", "n_gap", "median_inliers")})
     if args.validate:
-        df = cross_registration_error(args.video, digest, rep_h, min_inliers=args.min_inliers)
-        if not df.empty:
-            med = df["temporal_dist"].median()
-            near = df[df.temporal_dist <= med]["corner_err_pitch"].mean()
-            far = df[df.temporal_dist > med]["corner_err_pitch"].mean()
-            print(f"cross-reg corner error (pitch units): median "
-                  f"{df['corner_err_pitch'].median():.2f}")
-            print(f"  near-rep pairs mean {near:.2f}  vs  far-rep pairs mean {far:.2f} "
-                  f"(flat => drift-free)")
+        chain = homographies_dict_from_parquet(args.chain_homographies) \
+            if args.chain_homographies else None
+        vc = view_consistency(calib, chain=chain)
+        n_views = len(vc)
+        print(f"view-consistency: {n_views} views with >=2 frames")
+        if n_views == 0:
+            print("  insufficient multi-frame views to measure within-view drift")
+        else:
+            print(f"  registration within-view spread (pitch units): "
+                  f"median {vc['reg_spread'].median():.3f}  max {vc['reg_spread'].max():.3f}")
+            span_range = vc["temporal_span"].max() - vc["temporal_span"].min()
+            if n_views >= 3 and span_range > 0:
+                med_span = vc["temporal_span"].median()
+                lo = vc[vc.temporal_span <= med_span]
+                hi = vc[vc.temporal_span > med_span]
+                corr = float(vc["reg_spread"].corr(vc["temporal_span"].astype(float)))
+                print(f"  reg_spread vs temporal_span: corr={corr:.2f}  |  "
+                      f"short-span (n={len(lo)}) mean {lo['reg_spread'].mean():.3f}  vs  "
+                      f"long-span (n={len(hi)}) mean {hi['reg_spread'].mean():.3f} "
+                      f"(flat => drift-free)")
+            else:
+                print("  insufficient views to claim flatness; raw per-view table:")
+                print(vc.to_string(index=False))
+            if chain is not None and vc["chain_spread"].notna().any():
+                print(f"  chain within-view spread (pitch units): "
+                      f"median {vc['chain_spread'].median():.3f}  "
+                      f"max {vc['chain_spread'].max():.3f} "
+                      f"(registration should be smaller)")
     print(f"wrote homographies.parquet -> {out}")
 
 

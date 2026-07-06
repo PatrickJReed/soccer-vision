@@ -12,10 +12,10 @@ from soccer_vision.labeler.view_digest import ViewDigest
 from soccer_vision.pitch.view_registration import (
     RegisteredCalib,
     compose_pitch_homography,
-    cross_registration_error,
     register_clip,
     register_to_best_rep,
     rep_homographies_from_parquet,
+    view_consistency,
     write_homographies,
 )
 
@@ -138,18 +138,70 @@ def test_write_homographies_schema(tmp_path: Path) -> None:
     assert set(df["source"]) == {"rep", "registered"}
 
 
-def test_cross_registration_error_schema(tmp_path: Path) -> None:
-    A, B, C = _pattern(1), _pattern(2), _pattern(3)
-    frames = [A, A, A, A, A, B, B, B, B, B, C, C, C, C, C]
-    video = tmp_path / "clip.mp4"
-    if not _write_video(video, frames):
-        pytest.skip("no mp4 writer")
-    reps = {0: 0, 1: 5, 2: 10}
-    digest = _identity_digest(reps)
-    rep_h = {0: np.eye(3), 1: np.eye(3), 2: np.eye(3)}
-    df = cross_registration_error(video, digest, rep_h)
-    assert set(["rep_R", "rep_Rprime", "temporal_dist", "corner_err_pitch"]).issubset(df.columns)
-    assert len(df) >= 1
+def test_pipeline_coverage_counts_rep_and_registered() -> None:
+    """view_registration sources 'rep'/'registered' must count toward homography_coverage;
+    a fully-calibrated run previously reported 0.0 -> false 'calibration FAILED' signal."""
+    from soccer_vision.pipeline import assemble_phases
+    from soccer_vision.pitch.propagation import HomographyEntry
+
+    def det(frame: int, tid: int, x: float, y: float, cls: str, team: str) -> dict:
+        return {"frame": frame, "t_seconds": float(frame), "track_id": tid,
+                "x_px": x, "y_px": y, "bbox_x1": x - 0.01, "bbox_y1": y - 0.01,
+                "bbox_x2": x + 0.01, "bbox_y2": y + 0.01,
+                "class": cls, "team": team, "conf": 0.9}
+    rows = []
+    for f in range(3):
+        rows.append(det(f, 1, 0.5, 0.25, "player", "own"))
+        rows.append(det(f, 2, 0.5, 0.85, "player", "opp"))
+        rows.append(det(f, -1, 0.5, 0.5, "ball", "unknown"))
+    traj = pd.DataFrame(rows).astype({"frame": "int64", "track_id": "int64"})
+    kp = pd.DataFrame(columns=["frame", "kp_idx", "x_px", "y_px", "conf"])
+    homs = {0: HomographyEntry(np.eye(3), "rep", 1.0),           # anchor-equivalent
+            1: HomographyEntry(np.eye(3), "registered", 0.8),    # derived-equivalent
+            2: HomographyEntry(np.eye(3), "registered", 0.8)}
+    result = assemble_phases(traj, kp, fps=1.0, total_frames=3, homographies=homs)
+    assert abs(result.anchor_coverage - 1 / 3) < 1e-9        # "rep" -> anchor coverage
+    assert abs(result.propagated_coverage - 2 / 3) < 1e-9    # "registered" -> prop coverage
+    assert abs(result.homography_coverage - 1.0) < 1e-9      # not 0.0 (the false-FAIL bug)
+
+
+def test_view_consistency_flags_drift() -> None:
+    from soccer_vision.pitch.propagation import HomographyEntry
+    # view 0 has 3 frames far apart in time; registration maps them ~identically (tight),
+    # a synthetic "chain" maps them with growing offset (drift) -> larger spread.
+    def H(dx):  # translation in pitch
+        return np.array([[1.0, 0, dx], [0, 1.0, 0], [0, 0, 1]])
+    reg = {10: HomographyEntry(H(0.0), "rep", 1.0),
+           500: HomographyEntry(H(0.01), "registered", 0.9),
+           2000: HomographyEntry(H(-0.01), "registered", 0.9)}
+    chain = {10: H(0.0), 500: H(0.30), 2000: H(0.90)}   # drifts with time
+    calib = RegisteredCalib(homographies=reg, rep_of={10: 0, 500: 0, 2000: 0}, stats={})
+    df = view_consistency(calib, chain=chain)
+    row = df[df["view"] == 0].iloc[0]
+    assert row["n_frames"] == 3 and row["temporal_span"] == 1990
+    assert row["reg_spread"] < 0.05          # registration is tight
+    assert row["chain_spread"] > row["reg_spread"] * 3   # chain drifts much more
+
+
+def test_view_consistency_skips_singleton_views() -> None:
+    from soccer_vision.pitch.propagation import HomographyEntry
+    calib = RegisteredCalib(
+        homographies={1: HomographyEntry(np.eye(3), "rep", 1.0)},
+        rep_of={1: 0}, stats={})
+    assert view_consistency(calib).empty
+
+
+def test_register_to_best_rep_rejects_collinear() -> None:
+    # a rep and a "frame" whose shared features lie on a single horizontal band -> collinear
+    rep = np.full((H, W, 3), 30, np.uint8)
+    cv2.line(rep, (10, 120), (310, 120), (255, 255, 255), 3)   # one line only
+    for x in range(15, 315, 6):
+        cv2.circle(rep, (x, 120), 2, (0, 200, 255), -1)         # features along the line
+    frame = rep.copy()
+    fkp, fdesc = _orb(frame)
+    rkp, rdesc = _orb(rep)
+    out = register_to_best_rep(fkp, fdesc, [rkp], [rdesc], min_inliers=12)
+    assert out is None                 # collinear inliers -> rejected despite matches
 
 
 def test_cli_writes_homographies(tmp_path: Path) -> None:

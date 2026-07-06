@@ -168,9 +168,12 @@ def assemble_phases(
     })
 
     counts = Counter(e.source for e in valid.values())
-    # Manual-anchor frames are direct high-confidence observations; count as anchor coverage.
-    n_anchor = counts["anchor"] + counts["manual"]
-    n_prop = counts["propagated"]
+    # Provenance-aware coverage: "anchor"/"manual" are direct high-confidence observations
+    # and "rep" (view-registration labeled representatives) are anchor-equivalent; "propagated"
+    # and "registered" (view-registration derived frames) are derived coverage. Without the
+    # rep/registered terms a fully-calibrated view_registration run reports 0.0 (false FAIL).
+    n_anchor = counts["anchor"] + counts["manual"] + counts["rep"]
+    n_prop = counts["propagated"] + counts["registered"]
     anchor_cov = n_anchor / total_frames if total_frames else 0.0
     prop_cov = n_prop / total_frames if total_frames else 0.0
     ball_cov = float(ball_y_full.notna().sum()) / total_frames if total_frames else 0.0

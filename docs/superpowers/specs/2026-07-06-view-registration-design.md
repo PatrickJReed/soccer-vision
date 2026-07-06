@@ -67,24 +67,44 @@ def register_clip(video_path, digest: ViewDigest, rep_homographies: dict[int, ND
     # defaults to all video frames; rep descriptors + per-frame results are the work.
 def write_homographies(calib: RegisteredCalib, out_path: Path) -> None   # reuse homographies_to_parquet
 
-# --- validation (the drift-free proof) ---
-def cross_registration_error(video_path, digest, rep_homographies, *,
-                             n_features=3000, min_inliers=12) -> pd.DataFrame
-    # for each labeled rep R: register R's frame to EVERY other labeled rep R', compose
-    # H = H_R'_pitch @ G(R->R'), reproject the 4 image corners to pitch, compare to R's own
-    # manual H_R. Returns rows (rep_R, rep_Rprime, temporal_dist=|frame_R-frame_R'|,
-    # corner_err_pitch). Drift-free => corner_err ~flat in temporal_dist.
+# --- validation (the HONEST drift-free proof) ---
+# NOTE (2026-07-06 hardening): the original cross_registration_error (register rep R to a
+# FOREIGN rep R') was survivorship-biased false-green — non-overlapping long-span pairs return
+# None -> NaN -> silently dropped, so near/far read "flat" regardless of truth. REPLACED by an
+# honest WITHIN-view metric that measures what the system actually does (each frame -> its OWN
+# overlapping rep) and checks the same view maps consistently across time (a drifting method
+# smears same-view frames apart as the clip progresses).
+def view_consistency(calib: RegisteredCalib, *, ref_px=(960.0, 540.0),
+                     chain: Mapping[int, NDArray] | None = None) -> pd.DataFrame
+    # per view (>=2 frames): project ref_px to pitch via every frame's H; reg_spread = mean L2
+    # to the per-view (component-wise) median projected point; temporal_span = max-min frame.
+    # Returns rows (view, n_frames, temporal_span, reg_spread, chain_spread). Drift-free =>
+    # reg_spread small AND independent of temporal_span. `chain` (frame->H) gives an optional
+    # contrast baseline.
+def homographies_dict_from_parquet(path) -> dict[int, NDArray]   # frame -> 3x3 H
 
 def main(argv=None) -> None
     # CLI: --video --digest-json (from render_digest) --rep-homographies <labeled parquet>
-    #      --out --boxes --min-inliers [--validate]  ; python -m soccer_vision.pitch.view_registration
+    #      --out --boxes --min-inliers [--chain-homographies <parquet>] [--validate]
+    #      ; python -m soccer_vision.pitch.view_registration
 ```
+
+## Degeneracy guard (2026-07-06 hardening)
+`register_to_best_rep` rejects a candidate whose RANSAC inliers are near-COLLINEAR (eigenvalue
+spread ratio of the inlier point cloud < 0.02) or whose homography is degenerate/extreme-scale
+(`|det(G[:2,:2])|` outside [0.02, 50]). With players masked, background features are dominated by
+parallel field lines; a collinear inlier set under-determines the homography perpendicular to the
+line, so findHomography can return many inliers (high confidence) but garbage off-line geometry —
+this is the one path that could emit a wrong per-frame homography, so it is gated.
 
 ## Output — drop-in `homographies.parquet`
 Same schema the pipeline/metrics already consume (`frame, h00..h22, source, confidence`), written via
-the existing `homographies_to_parquet`. `source ∈ {"rep","registered","none"}`. So Slice 2 output
-slots straight into `pipeline.assemble_from_homographies` → the Phase-4 metrics run on a full game
-with a drift-free calibration.
+the existing `homographies_to_parquet`. `source ∈ {"rep","registered"}`; **gap frames are OMITTED
+entirely** (no row — byte-for-byte identical downstream to the chain method, which the mapper NaNs).
+So Slice 2 output slots straight into `pipeline.assemble_from_homographies` → the Phase-4 metrics run
+on a full game with a drift-free calibration. **Pipeline coverage accounting was extended (hardening)
+to count `rep` as anchor-equivalent and `registered` as propagated-equivalent**, so a fully-calibrated
+run reports `homography_coverage≈1.0` instead of a false 0.0.
 
 ## Reused machinery (do not reinvent)
 - `propagation.register` / `_orb_downscaled` / `_homography_from_descriptors` — ORB + findHomography.
@@ -92,12 +112,14 @@ with a drift-free calibration.
 - `propagation.HomographyEntry` — the (H, source, confidence) record.
 - `chain.homographies_to_parquet` / the `h00..h22` schema (from `state.py`/`pipeline.py`).
 
-## Validation / acceptance (chosen: flat error vs temporal distance)
+## Validation / acceptance (chosen: flat error vs temporal distance — measured within-view)
 On oceanside (12/13 reps already labeled in `~/sv-labeler/out/homographies.parquet`):
-- **`cross_registration_error`** → mean corner reprojection error (pitch units) is ~**flat** across
-  temporal distance |R−R′| (e.g. within a small band), i.e. registering through a far rep is no worse
-  than a near one — the definition of drift-free. Contrast the chain, whose error grows 8→266 over the
-  pan. Report the numbers as facts (Patrick interprets any rendered plot).
+- **`view_consistency`** → per-view `reg_spread` (within-view pitch scatter of the same reference
+  point across all occurrences of a view) is small AND does **not** grow with the view's
+  `temporal_span` — a drifting method would smear the same view apart over the clip. This measures
+  what the system actually does (each frame → its own overlapping rep), avoiding the survivorship
+  bias of the discarded cross-view metric. Report numbers as facts; only claim flatness with ≥3
+  views spanning a range of temporal_span.
 - **Coverage**: report % frames registered vs gap, median inliers, per-view counts.
 - Full suite + mypy + ruff clean.
 
@@ -111,7 +133,10 @@ On oceanside (12/13 reps already labeled in `~/sv-labeler/out/homographies.parqu
 - `register_clip` (synthetic mp4, skip if no writer): 3 planted views + rep homographies → every
   frame gets a `registered`/`rep` homography for decodable frames; a blank/blurred frame → gap;
   output parquet has the right schema; rep frames keep `source="rep"`.
-- `cross_registration_error`: on the synthetic clip, error is small and does not grow with distance.
+- `view_consistency`: pure — tight registered Hs across a large temporal_span → small `reg_spread`;
+  a synthetic drifting `chain` → `chain_spread` ≫ `reg_spread`; singleton views skipped.
+- `_well_conditioned` / `register_to_best_rep`: near-collinear inliers (features on one line) → None
+  despite ample matches (the conditioning gate fires, not the min_inliers gate).
 
 ## Out of scope (deferred)
 Temporal-neighbor gap fill; re-labeling reps (existing labeler covers it; 12/13 already labeled);

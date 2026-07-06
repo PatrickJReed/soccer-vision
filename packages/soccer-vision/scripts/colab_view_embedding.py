@@ -236,3 +236,49 @@ sc = plt.scatter(XY[:, 0], XY[:, 1], c=V, cmap="tab20", s=14)
 plt.title(f"{proj} of 128-d embeddings, colored by view_id"); plt.colorbar(sc, label="view")
 plt.tight_layout(); plt.savefig("/content/embedding_map.png", dpi=120); plt.show()
 print("saved /content/embedding_map.png")
+
+# %% [markdown]
+# ## Held-out-views probe — does the embedding GENERALIZE, or just memorize labels?
+# Train a FRESH model that never sees 3 held-out views, then check whether those unseen
+# views still form clean clusters in its embedding. High ARI/silhouette on the held-out
+# views => the backbone learned general "field-view appearance" (real generalization, the
+# result that justifies the learned path over classical per-clip ORB). Low => it only
+# memorized the trained view labels.
+
+# %%
+import torch.nn as nn
+from torchvision import models
+
+HELDOUT = [4, 9, 11]                      # excluded from training entirely
+seen = manifest[~manifest["view_id"].isin(HELDOUT)]
+seen_train = ViewFrameDataset(seen, VIDEO, split="train", img_size=IMG_SIZE, downscale=DOWNSCALE)
+tr_dl = DataLoader(seen_train, batch_size=32, shuffle=True, num_workers=2,
+                   worker_init_fn=_worker_init, drop_last=True)
+
+bb = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1); bb.fc = nn.Identity()
+m2 = nn.Sequential(bb, nn.Linear(512, EMB_DIM), nn.ReLU()).to(device)
+h2 = nn.Linear(EMB_DIM, len(seen_train.view_ids)).to(device)
+opt2 = torch.optim.Adam(list(m2.parameters()) + list(h2.parameters()), lr=1e-4)
+ce2 = nn.CrossEntropyLoss()
+for ep in range(5):
+    m2.train(); h2.train()
+    for xb, yb, _w in tr_dl:
+        xb, yb = xb.to(device), yb.to(device)
+        loss = ce2(h2(m2(xb)), yb); opt2.zero_grad(); loss.backward(); opt2.step()
+    print("epoch", ep, "done")
+
+# embed ALL frames (incl held-out) with the held-out-BLIND model
+full2 = ViewFrameDataset(manifest, VIDEO, split=None, img_size=IMG_SIZE, downscale=DOWNSCALE)
+f2dl = DataLoader(full2, batch_size=64, shuffle=False, num_workers=2, worker_init_fn=_worker_init)
+m2.eval(); E2 = []
+with torch.no_grad():
+    for xb, _y, _w in f2dl:
+        E2.append(m2(xb.to(device)).cpu().numpy())
+E2 = np.concatenate(E2); Vall = full2.rows["view_id"].to_numpy()
+
+mask = np.isin(Vall, HELDOUT); Eh, Vh = E2[mask], Vall[mask]
+kmh = KMeans(n_clusters=len(HELDOUT), n_init=10, random_state=0).fit(Eh)
+print(f"HELD-OUT {HELDOUT} (never trained): "
+      f"ARI={adjusted_rand_score(Vh, kmh.labels_):.3f}  "
+      f"silhouette={silhouette_score(Eh, Vh):.3f}  n={int(mask.sum())}")
+print("  high => backbone generalizes to unseen views; low => memorized trained labels only")

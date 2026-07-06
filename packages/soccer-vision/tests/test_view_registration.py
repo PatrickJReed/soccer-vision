@@ -12,6 +12,7 @@ from soccer_vision.labeler.view_digest import ViewDigest
 from soccer_vision.pitch.view_registration import (
     RegisteredCalib,
     compose_pitch_homography,
+    cross_registration_error,
     register_clip,
     register_to_best_rep,
     rep_homographies_from_parquet,
@@ -135,3 +136,43 @@ def test_write_homographies_schema(tmp_path: Path) -> None:
     df = pd.read_parquet(out)
     assert set(["frame", "h00", "h22", "source", "confidence"]).issubset(df.columns)
     assert set(df["source"]) == {"rep", "registered"}
+
+
+def test_cross_registration_error_schema(tmp_path: Path) -> None:
+    A, B, C = _pattern(1), _pattern(2), _pattern(3)
+    frames = [A, A, A, A, A, B, B, B, B, B, C, C, C, C, C]
+    video = tmp_path / "clip.mp4"
+    if not _write_video(video, frames):
+        pytest.skip("no mp4 writer")
+    reps = {0: 0, 1: 5, 2: 10}
+    digest = _identity_digest(reps)
+    rep_h = {0: np.eye(3), 1: np.eye(3), 2: np.eye(3)}
+    df = cross_registration_error(video, digest, rep_h)
+    assert set(["rep_R", "rep_Rprime", "temporal_dist", "corner_err_pitch"]).issubset(df.columns)
+    assert len(df) >= 1
+
+
+def test_cli_writes_homographies(tmp_path: Path) -> None:
+    import json
+
+    from soccer_vision.pitch.view_registration import main
+    A, B = _pattern(1), _pattern(2)
+    frames = [A] * 6 + [B] * 6
+    video = tmp_path / "clip.mp4"
+    if not _write_video(video, frames):
+        pytest.skip("no mp4 writer")
+    digest_json = tmp_path / "view_digest.json"
+    digest_json.write_text(json.dumps({
+        "n_views": 2, "stride": 6, "sample_frames": [0, 6],
+        "representatives": {"0": 0, "1": 6}, "view_of": {"0": 0, "6": 1}}))
+    hp = tmp_path / "rep_h.parquet"
+    pd.DataFrame([
+        {"frame": 0, "h00": 1.0, "h01": 0, "h02": 0, "h10": 0, "h11": 1.0, "h12": 0,
+         "h20": 0, "h21": 0, "h22": 1.0, "source": "manual", "confidence": 1.0},
+        {"frame": 6, "h00": 1.0, "h01": 0, "h02": 9, "h10": 0, "h11": 1.0, "h12": 0,
+         "h20": 0, "h21": 0, "h22": 1.0, "source": "manual", "confidence": 1.0},
+    ]).to_parquet(hp, index=False)
+    out = tmp_path / "out"
+    main(["--video", str(video), "--digest-json", str(digest_json),
+          "--rep-homographies", str(hp), "--out", str(out)])
+    assert (out / "homographies.parquet").exists()

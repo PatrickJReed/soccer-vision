@@ -112,6 +112,23 @@ run reports `homography_coverage≈1.0` instead of a false 0.0.
 - `propagation.HomographyEntry` — the (H, source, confidence) record.
 - `chain.homographies_to_parquet` / the `h00..h22` schema (from `state.py`/`pipeline.py`).
 
+## ⚠️ Corrected accuracy assessment (2026-07-06, ground-truth check)
+`view_consistency` measures **consistency, not accuracy** — do not read "tighter within-view scatter"
+as "better calibration." Measured at 366 ground-truth clicks (their known pitch landmarks): the
+existing per-frame calibration has median **1.37 m** reprojection error; Slice 2's registered
+homographies have **1.73 m** (paired, ~0.21 m WORSE). Registration forces all frames of a view through
+one rep (→ self-consistent) but inherits `rep_error + ORB_registration_error` (→ slightly less
+accurate). The base calibration is only ~1.37 m ("green-gate" quality, gate ≈ 1.83 m), and each anchor
+constrains only one half of the field, so the far field is extrapolated/unverified. The GT test above is at anchor frames (the existing calib's best case, densely labeled ~1 anchor/1.8s).
+
+**Fair same-budget test (vindicates the drift-free claim):** from ONLY the 13 reps, scored at the 50
+held-out anchor clicks, using the cached inter-frame chain — DENSE existing (50 anchors) 1.37 m |
+**Slice 2 register (13 reps) 1.73 m** | CHAIN from same 13 reps 2.06 m (p90 5.65 vs Slice 2's 3.72).
+So Slice 2 loses to dense labeling but **beats multi-hop propagation at the same sparse budget**,
+especially on the drift-prone tail — the drift-free value is real in ACCURACY, not just consistency.
+Net: label 13 reps not 50, give up ~0.36 m vs dense, gain ~0.33 m + a safer tail vs the chain.
+See `~/sv-labeler/slice2_viz/F_gt_projections.png`.
+
 ## Validation / acceptance (chosen: flat error vs temporal distance — measured within-view)
 On oceanside (12/13 reps already labeled in `~/sv-labeler/out/homographies.parquet`):
 - **`view_consistency`** → per-view `reg_spread` (within-view pitch scatter of the same reference

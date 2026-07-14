@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.optimize import least_squares  # type: ignore[import-untyped]
 from scipy.spatial import ConvexHull, QhullError  # type: ignore[import-untyped]
 
 from soccer_vision.calib.field_model import FIELD_LINES, LENGTH_M, METRES_TO_FEET, WIDTH_M
@@ -124,3 +125,33 @@ def _line_residuals_m(
         ax, c = _LINE_PITCH[lid]
         out.append((float(qi[ax]) - c) * float(_SCALE_M[ax]))
     return np.array(out, np.float64)
+
+
+def _offset_axes(lo: Sequence[LineObs]) -> set[int]:
+    """Which pitch axes (0=x, 1=y) the frame's line clicks constrain."""
+    return {_LINE_PITCH[lid][0] for lid, _, _ in lo}
+
+
+def _solve_offset(
+    h_g: NDArray[np.floating[Any]],
+    po: Sequence[PointObs],
+    lo: Sequence[LineObs],
+    d0: NDArray[np.floating[Any]],
+    *,
+    prior: bool = False,
+) -> NDArray[np.float64]:
+    """2-DOF canvas offset for one frame by robust least squares (metre residuals,
+    soft_l1). `prior=True` adds a weak pull toward d0 — used when the frame's clicks
+    constrain fewer than 2 DOF (e.g. a single one-axis line), so the unconstrained
+    direction stays at the chain init instead of wandering."""
+    d_init = np.asarray(d0, np.float64)
+
+    def fun(d: NDArray[np.float64]) -> NDArray[np.float64]:
+        parts = [_point_residuals_m(h_g, d, po), _line_residuals_m(h_g, d, lo)]
+        if prior:
+            parts.append((d - d_init) * _SCALE_M * PRIOR_WEIGHT)
+        return np.concatenate(parts)
+
+    res = least_squares(fun, d_init, method="trf", loss="soft_l1", f_scale=0.5,
+                        x_scale=1e-2)
+    return np.asarray(res.x, np.float64)

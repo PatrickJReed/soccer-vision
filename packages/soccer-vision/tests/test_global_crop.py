@@ -172,7 +172,7 @@ def test_fit_h_g_rejects_outlier(world: CropWorld) -> None:
     assert np.abs((q - np.array(pitch_pts[1:])) * gc._SCALE_M).max() < 0.05
 
 
-def test_fit_h_g_degenerate_inputs(world: CropWorld) -> None:
+def test_fit_h_g_degenerate_inputs() -> None:
     three = np.array([[0.1, 0.1], [0.2, 0.2], [0.3, 0.1]])
     assert gc._fit_h_g(three, three) is None                       # < 4 points
     col_c = np.array([[0.1, 0.1], [0.2, 0.2], [0.3, 0.3], [0.4, 0.4]])
@@ -180,3 +180,49 @@ def test_fit_h_g_degenerate_inputs(world: CropWorld) -> None:
     assert gc._fit_h_g(col_c, col_p) is None                       # collinear landmarks
     tiny = np.array([[0.5, 0.5], [0.51, 0.5], [0.5, 0.51], [0.51, 0.51]])
     assert gc._fit_h_g(tiny, tiny * 0.01 + 0.5) is None            # hull too small
+    # 5 rows but only 3 unique landmark targets: the distinct-count gate fires.
+    rep_c = np.array([[0.1, 0.1], [0.8, 0.15], [0.45, 0.85], [0.2, 0.5], [0.7, 0.6]])
+    rep_p = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, 1.0], [0.0, 0.0], [1.0, 0.0]])
+    assert gc._fit_h_g(rep_c, rep_p) is None                       # < 4 distinct landmarks
+
+
+def test_offset_from_single_click(world: CropWorld) -> None:
+    f = 120
+    c = world.clicks_at(f)[0]
+    d = gc._solve_offset(world.h_g, [(c.kp_idx, c.x, c.y)], [], np.zeros(2))
+    assert np.linalg.norm(d - world.offsets[f]) < 1e-4  # ONE click determines the frame
+
+
+def test_offset_robust_to_one_bad_click(world: CropWorld) -> None:
+    f = 120
+    po = [(c.kp_idx, c.x, c.y) for c in world.clicks_at(f)]
+    assert len(po) >= 4
+    bad = (po[0][0], po[0][1] + 0.08, po[0][2] + 0.08)  # ~1.5 m wrong
+    d = gc._solve_offset(world.h_g, [bad, *po[1:]], [], world.offsets[f] + 0.05)
+    assert np.linalg.norm(d - world.offsets[f]) < 0.005  # soft_l1 downweights it
+
+
+def test_offset_two_axis_lines_full_solve(world: CropWorld) -> None:
+    f = 120
+    d_true = world.offsets[f]
+    lo = [
+        ("midline", float(world.canvas[4][0] - d_true[0]), float(world.canvas[4][1] - d_true[1])),
+        ("far_touchline", float(world.canvas[1][0] - d_true[0]), float(world.canvas[1][1] - d_true[1])),
+    ]
+    assert gc._offset_axes(lo) == {0, 1}
+    d = gc._solve_offset(world.h_g, [], lo, d_true + np.array([0.03, -0.03]))
+    assert np.linalg.norm(d - d_true) < 1e-3
+
+
+def test_offset_one_axis_line_keeps_prior_direction(world: CropWorld) -> None:
+    f = 120
+    d_true = world.offsets[f]
+    lo = [("midline", float(world.canvas[4][0] - d_true[0]), float(world.canvas[4][1] - d_true[1]))]
+    assert gc._offset_axes(lo) == {1}
+    d0 = d_true + np.array([0.05, 0.05])  # drifted chain init
+    d = gc._solve_offset(world.h_g, [], lo, d0, prior=True)
+    r = gc._line_residuals_m(world.h_g, d, lo)
+    assert abs(r[0]) < 0.2                       # the line got satisfied (metres)
+    # This fixture pans along canvas x (goal-to-goal), so the midline — pitch
+    # axis 1 — pins canvas d[0]; canvas d[1] is the unconstrained direction.
+    assert abs(d[1] - d0[1]) < 0.02              # unconstrained direction stayed near init

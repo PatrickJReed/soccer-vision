@@ -35,7 +35,11 @@ class PitchMapper:
                 np.ones(len(group)),
             ])
             mapped = (H @ pts.T).T
-            mapped /= mapped[:, 2:3]
+            wcol = mapped[:, 2]
+            bad = wcol <= 1e-9  # behind-camera / at-horizon: NaN, never a mirrored coord
+            safe = np.where(bad, 1.0, wcol)
+            mapped = mapped / safe[:, None]
+            mapped[bad, :2] = np.nan
             x_pitch[group.index] = mapped[:, 0]
             y_pitch[group.index] = mapped[:, 1]
         out["x_pitch"] = x_pitch

@@ -270,7 +270,9 @@ def fit_frame_homographies(
         image_pts = np.array([kpmap[i] for i in idxs], dtype=np.float64)
         pitch_pts = lm[idxs]
         try:
-            H = fit_homography(image_pts, pitch_pts)
+            # 0.012 pitch units ~ 0.55-0.8 m in destination space (axis-dependent);
+            # the old None default (cv2's 3.0) did zero outlier rejection here.
+            H = fit_homography(image_pts, pitch_pts, ransac_thresh=0.012)
         except HomographyError:
             continue
         errs = np.linalg.norm(_apply(H, image_pts) - pitch_pts, axis=1)

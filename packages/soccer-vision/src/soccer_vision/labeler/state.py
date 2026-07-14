@@ -51,7 +51,13 @@ from soccer_vision.pitch.propagation import HomographyEntry
 
 # frame_confidence ramps over global_crop's GREEN_RADIUS for BOTH engines; the two
 # engines' green radii must agree or the ramp misgrades physical-engine frames.
-assert _GC_GREEN_RADIUS == _PC_GREEN_RADIUS
+# `if/raise` (not `assert`) so the guard survives `python -O`.
+if _GC_GREEN_RADIUS != _PC_GREEN_RADIUS:
+    raise RuntimeError(
+        f"GREEN_RADIUS mismatch: global_crop={_GC_GREEN_RADIUS} vs "
+        f"physical_calib={_PC_GREEN_RADIUS}; the confidence ramp would misgrade "
+        "physical-engine frames"
+    )
 
 
 @dataclass(frozen=True, eq=False)

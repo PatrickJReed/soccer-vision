@@ -133,7 +133,11 @@ def build_frame_homographies(
         image_points = sel[["x_px", "y_px"]].to_numpy(dtype=np.float64)
         pitch_points = PITCH_LANDMARKS[sel["kp_idx"].to_numpy()]
         try:
-            homographies[cast(int, frame_idx)] = fit_homography(image_points, pitch_points)
+            # 0.012 pitch units ~ 0.55-0.8 m in destination space (axis-dependent);
+            # the old None default (cv2's 3.0) did zero outlier rejection here.
+            homographies[cast(int, frame_idx)] = fit_homography(
+                image_points, pitch_points, ransac_thresh=0.012
+            )
         except HomographyError:
             continue
     return homographies

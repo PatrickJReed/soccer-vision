@@ -50,3 +50,14 @@ def test_missing_homography_emits_nan() -> None:
     out = mapper.transform(detections, homographies)
     assert not pd.isna(out["x_pitch"].iloc[0])
     assert pd.isna(out["x_pitch"].iloc[1])
+
+
+def test_behind_camera_points_map_to_nan() -> None:
+    # H whose third row makes w <= 0 for the second probe pixel ("behind camera")
+    H = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -0.01, 1.0]])
+    det = pd.DataFrame({"frame": [0, 0], "x_px": [10.0, 10.0], "y_px": [50.0, 200.0]})
+    out = PitchMapper().transform(det, {0: H})
+    xp = out["x_pitch"].to_numpy()
+    yp = out["y_pitch"].to_numpy()
+    assert np.isfinite(xp[0])                            # w = 0.5 > 0: normal mapping
+    assert np.isnan(xp[1]) and np.isnan(yp[1])           # w = -1

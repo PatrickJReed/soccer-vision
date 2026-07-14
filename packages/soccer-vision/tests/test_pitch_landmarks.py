@@ -151,3 +151,25 @@ def test_multiple_frames_dispatched_independently() -> None:
     kp = pd.concat([good, sparse], ignore_index=True)
     homographies = build_frame_homographies(kp)
     assert set(homographies) == {0}
+
+
+def test_build_frame_homographies_rejects_gross_outlier() -> None:
+    ids = [0, 1, 2, 3, 9, 10, 13, 14]
+    H_true = np.array([[6e-4, 1e-5, 0.05], [2e-5, 9e-4, 0.02], [1e-6, 2e-6, 1.0]])
+    inv = np.linalg.inv(H_true)
+    px = []
+    for i in ids:
+        v = inv @ np.array([*PITCH_LANDMARKS[i], 1.0])
+        px.append(v[:2] / v[2])
+    rows: list[dict[str, float]] = [
+        {"frame": 0, "kp_idx": i, "x_px": float(p[0]), "y_px": float(p[1]), "conf": 1.0}
+        for i, p in zip(ids, px, strict=True)
+    ]
+    rows[0]["x_px"] += 400.0                              # one gross mislabel
+    hs = build_frame_homographies(pd.DataFrame(rows))
+    assert 0 in hs
+    good = np.array([[r["x_px"], r["y_px"]] for r in rows[1:]])
+    q = (hs[0] @ np.column_stack([good, np.ones(len(good))]).T).T
+    q = q[:, :2] / q[:, 2:3]
+    tgt = PITCH_LANDMARKS[ids[1:]]
+    assert np.abs(q - tgt).max() < 0.02                   # outlier did not bias the fit

@@ -165,6 +165,9 @@ def render_spotcheck(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        cap.release()
+        return []
     written: list[Path] = []
     for f in _spot_frames(sorted({c.frame for c in points}), n_frames):
         h_norm = calib.frame_homography(f)
@@ -233,10 +236,14 @@ def main() -> None:
     if args.video is not None:
         out = args.spot_out or Path("gate_spotcheck")
         engines = ("physical", "crop") if args.engine == "both" else (args.engine,)
+        any_rendered = False
         for eng in engines:
             dest = out / eng if args.engine == "both" else out
             paths = render_spotcheck(args.chain, args.clicks, args.video, dest, engine=eng)
             print(f"\n[{eng}] wrote {len(paths)} spot-check overlays -> {dest}")
+            any_rendered = any_rendered or bool(paths)
+        if not any_rendered:
+            print("ERROR: no frames rendered -- check --video path")
         print("REQUIRED: review the spot-checks (incl. a sparse/no-line frame) and confirm "
               "the foreground/overlay before trusting green.")
 

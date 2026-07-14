@@ -15,7 +15,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Any
+from typing import Any, TypedDict
 
 import numpy as np
 from numpy.typing import NDArray
@@ -451,9 +451,19 @@ def frame_confidence(calib: Any, frame: int) -> float:
     return CONF_PROP_MAX - (CONF_PROP_MAX - CONF_PROP_MIN) * min(1.0, gap / GREEN_RADIUS)
 
 
+class CropAssumptionReport(TypedDict):
+    """Schema of crop_assumption_report (consumed as-is by the diagnostics CLI)."""
+
+    n: int
+    max_abs_rot_deg: float
+    max_scale_dev: float
+    max_perspective: float
+    ok: bool
+
+
 def crop_assumption_report(
     interframe: Mapping[int, NDArray[np.floating[Any]]], size: tuple[int, int]
-) -> dict[str, Any]:
+) -> CropAssumptionReport:
     """Decompose NORMALIZED inter-frame pair transforms in PIXEL space and report how
     translation-pure they are. ok=False means the crop model is questionable for this
     clip (rotation/zoom/perspective present) — a loud warning, not a hard failure."""
@@ -469,18 +479,12 @@ def crop_assumption_report(
         rots.append(math.degrees(math.atan2(g[1, 0], g[0, 0])))
         scales.append(math.sqrt(abs(float(np.linalg.det(g[:2, :2])))) - 1.0)
         persp.append(max(abs(float(g[2, 0])), abs(float(g[2, 1]))))
-    if not rots:
-        return {"ok": True, "n": 0, "max_abs_rot_deg": 0.0, "max_scale_dev": 0.0,
-                "max_perspective": 0.0}
-    rep: dict[str, Any] = {
-        "n": len(rots),
-        "max_abs_rot_deg": float(np.max(np.abs(rots))),
-        "max_scale_dev": float(np.max(np.abs(scales))),
-        "max_perspective": float(np.max(persp)),
-    }
-    rep["ok"] = bool(rep["max_abs_rot_deg"] <= 0.2 and rep["max_scale_dev"] <= 0.005
-                     and rep["max_perspective"] <= 1e-5)
-    return rep
+    rot = float(np.max(np.abs(rots))) if rots else 0.0
+    scl = float(np.max(np.abs(scales))) if scales else 0.0
+    per = float(np.max(persp)) if persp else 0.0
+    return CropAssumptionReport(
+        n=len(rots), max_abs_rot_deg=rot, max_scale_dev=scl, max_perspective=per,
+        ok=bool(rot <= 0.2 and scl <= 0.005 and per <= 1e-5))
 
 
 def implied_camera(
@@ -490,13 +494,20 @@ def implied_camera(
     """REPORT-ONLY physical decomposition of H_g: assuming square pixels and principal
     point pp_canvas (normalized canvas units — use the mean frame centre), recover the
     focal (px) from the plane-homography orthonormality constraints and the camera
-    centre (metres). None if the constraints are inconsistent (non-physical H_g)."""
+    centre (metres). None if the constraints are inconsistent (non-physical H_g):
+    no positive f^2 candidate, or the two constraints disagreeing by more than 2x
+    in focal (a big split usually means the pp assumption is off)."""
     w, h = size
     # pitch[0,1] -> canvas px, then pitch metres -> canvas px
     a = np.diag([float(w), float(h), 1.0]) @ np.linalg.inv(np.asarray(h_g, np.float64))
     a = a @ np.diag([1.0 / WIDTH_M, 1.0 / LENGTH_M, 1.0])
     cx, cy = float(pp_canvas[0]) * w, float(pp_canvas[1]) * h
     b = np.array([[1.0, 0, -cx], [0, 1.0, -cy], [0, 0, 1.0]]) @ a
+    # Fix the homogeneous scale so the 1e-12 degeneracy guard below is scale-
+    # meaningful; the f^2 ratios themselves are invariant to this normalization.
+    b = b / float(np.linalg.norm(b))
+    # Derivation: for the z=0 pitch plane, a ~ K [r1 r2 t]; removing the principal
+    # point leaves b ~ diag(f, f, 1) [r1 r2 t] with r1.r2 = 0 and |r1| = |r2|.
     b1, b2 = b[:, 0], b[:, 1]
     # with D = diag(1/f^2, 1/f^2, 1): b1' D b2 = 0  and  |D^.5 b1| = |D^.5 b2|
     n1 = b1[0] * b2[0] + b1[1] * b2[1]
@@ -506,9 +517,13 @@ def implied_camera(
     cands = [n / dd for n, dd in ((n1, d1), (n2, d2)) if abs(dd) > 1e-12 and n / dd > 0]
     if not cands:
         return None
+    if len(cands) == 2 and max(cands) / min(cands) > 4.0:
+        return None  # candidates disagree by > 2x in f: constraints inconsistent
     f2 = float(np.mean(cands))
     f_px = math.sqrt(f2)
     m = np.diag([1.0 / f_px, 1.0 / f_px, 1.0]) @ b
+    # lam > 0 always: the decomposition is recovered up to overall-scale SIGN, so a
+    # negative-scale h_g would flip the recovered camera-height sign (report-only).
     lam = 1.0 / float(np.linalg.norm(m[:, 0]))
     r1, r2, t = lam * m[:, 0], lam * m[:, 1], lam * m[:, 2]
     r3 = np.cross(r1, r2)

@@ -412,18 +412,32 @@ def _sky_calib(calib: gc.CropCalib) -> gc.CropCalib:
     return dataclasses.replace(calib, segments={0: dataclasses.replace(ss, h_g=sky)})
 
 
-def test_green_implies_wsign_pass(world: CropWorld) -> None:
-    """No frame with a failing w-sign may be green. The healthy calib alone can't
-    falsify this (nothing in it fails w-signs), so ALSO run the corrupted-h_g calib
-    from the sky test, where every frame's w-sign check fails — a status() that
-    skipped the w-sign gate would go green there and trip the assert."""
+def test_green_implies_wsign_pass(world: CropWorld, monkeypatch: pytest.MonkeyPatch) -> None:
+    """status() must red-gate failing w-signs INDEPENDENTLY of the fold gate.
+
+    On this synthetic sky corruption _fold_norm happens to be 0 everywhere, so the
+    fold band alone reds every frame and would mask a deleted w-sign gate. That is
+    a fixture artifact, NOT a production guarantee: on REAL single-end sky poses
+    the near field stays sane, so the fold count can sit inside [FOLD_MIN, FOLD_MAX]
+    while the far end projects with w < 0 — the exact "lines in the sky" mechanism
+    the w-sign gate exists for. The fold gate does NOT subsume it. To make this
+    test falsify the gate, the sky leg opens the fold band wide so the w-sign gate
+    is the ONLY possible red producer: deleting it turns these frames green."""
     frames = list(range(0, world.n_frames, 20))
     calib = _session(world, frames)
-    for c in (calib, _sky_calib(calib)):
-        for f in range(0, world.n_frames, 7):
-            if c.status(f) == "green":
-                h = c.frame_homography(f)
-                assert h is not None and gc._wsigns_ok(h, SIZE)
+    for f in range(0, world.n_frames, 7):       # healthy leg: green implies w-signs pass
+        if calib.status(f) == "green":
+            h = calib.frame_homography(f)
+            assert h is not None and gc._wsigns_ok(h, SIZE)
+    monkeypatch.setattr(gc, "FOLD_MIN", 0)      # sky leg: take the fold gate out of play
+    monkeypatch.setattr(gc, "FOLD_MAX", 100)
+    sky = _sky_calib(calib)
+    probed = 0
+    for f in range(0, world.n_frames, 7):
+        if sky.frame_homography(f) is not None:
+            probed += 1
+            assert sky.status(f) == "red"       # only the w-sign gate can red here
+    assert probed > 0
 
 
 def test_wsign_cache_matches_per_frame(world: CropWorld) -> None:
@@ -473,8 +487,13 @@ def test_crop_assumption_report_pass_and_fail(world: CropWorld) -> None:
 
 
 def test_implied_camera_recovers_focal(world: CropWorld) -> None:
+    # The symmetric midfield fixture pose makes the ORTHOGONALITY constraint
+    # 0/0-degenerate (|d1| far below the 1e-12 guard after b-normalization), so this
+    # test exercises the single-surviving-candidate branch — the guard is load-bearing
+    # here: only the equal-norm constraint pins f.
     out = gc.implied_camera(world.h_g, SIZE, pp_canvas=np.array([0.5, 0.5]))
     assert out is not None
     f_px, c = out
     assert abs(f_px - 1460.0) / 1460.0 < 0.05      # within 5% of the true focal
-    assert np.all(np.isfinite(c))
+    # camera centre in pitch metres: the fixture's true sideline camera (z up-negative)
+    assert np.allclose(c, [-25.0, LENGTH_M / 2, -18.0], atol=0.5)

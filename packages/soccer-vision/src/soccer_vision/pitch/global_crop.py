@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any
 
 import numpy as np
@@ -134,6 +135,12 @@ def _line_pitch_axes(lo: Sequence[LineObs]) -> set[int]:
     return {_LINE_PITCH[lid][0] for lid, _, _ in lo}
 
 
+def _full_dof(po: Sequence[PointObs], lo: Sequence[LineObs]) -> bool:
+    """True when a frame's clicks constrain both offset DOF: any point gives two
+    constraints; lines must span both pitch axes (independent-constraint count)."""
+    return bool(po) or _line_pitch_axes(lo) == {0, 1}
+
+
 def _solve_offset(
     h_g: NDArray[np.floating[Any]],
     po: Sequence[PointObs],
@@ -184,9 +191,11 @@ class CropCalib:
     def _segment(self, frame: int) -> int:
         return self.segment_of.get(frame, 0)
 
-    @property
+    @cached_property
     def anchor_h(self) -> dict[int, NDArray[np.float64]]:
-        """Anchor frame -> normalized H (bootstrap/duck-type parity with PhysicalCalib)."""
+        """Anchor frame -> normalized H (bootstrap/duck-type parity with PhysicalCalib).
+
+        Build once; do not call per frame."""
         out: dict[int, NDArray[np.float64]] = {}
         for ss in self.segments.values():
             for f, d in ss.offsets.items():
@@ -197,11 +206,15 @@ class CropCalib:
         ss = self.segments.get(self._segment(frame))
         return ss is not None and frame in ss.offsets
 
+    @cached_property
+    def _anchors_by_segment(self) -> dict[int, list[int]]:
+        """Per-segment sorted anchor frames that have chain transforms (built once;
+        the per-frame status path calls _segment_anchors 2-3x per frame)."""
+        return {sid: sorted(f for f in ss.offsets if f in self.transforms)
+                for sid, ss in self.segments.items()}
+
     def _segment_anchors(self, frame: int) -> list[int]:
-        ss = self.segments.get(self._segment(frame))
-        if ss is None:
-            return []
-        return sorted(f for f in ss.offsets if f in self.transforms)
+        return self._anchors_by_segment.get(self._segment(frame), [])
 
     def nearest_anchor_gap(self, frame: int) -> int | None:
         anchors = self._segment_anchors(frame)
@@ -270,8 +283,7 @@ def _grade_anchor(
 ) -> str:
     """green iff the frame's own clicks fit in-sample within tolerance AND the clicks
     constrain both offset DOF (>=1 point, or lines spanning both pitch axes)."""
-    full_dof = bool(po) or _line_pitch_axes(lo) == {0, 1}
-    if not full_dof:
+    if not _full_dof(po, lo):
         return "yellow"
     pr = _point_residuals_m(h_g, d, po).reshape(-1, 2)
     pt_ft = [float(np.hypot(r[0], r[1]) * _FT) for r in pr]
@@ -294,8 +306,11 @@ def solve_crop_session(
     rounds: int = 3,  # alternation converges ~0.6x/round; 3 bounds drifted-chain anchors < 1 ft
 ) -> CropCalib:
     """Solve every segment: RANSAC H_g from chain-initialized canvas correspondences,
-    then alternate (offset re-solve per clicked frame) <-> (H_g refine with points+lines).
-    Segments without >=4 spread landmarks stay unsolved (bootstrap waits)."""
+    then alternate (offset re-solve per clicked frame) <-> (H_g refine with points+lines),
+    closing with a final offset sweep so stored (h_g, d) pairs are self-consistent.
+    Segments without >=4 spread landmarks stay unsolved (bootstrap waits). Clicked
+    frames absent from `transforms` are silently dropped (no canvas placement
+    without a chain transform)."""
     tf = {f: np.asarray(m, np.float64) for f, m in transforms.items()}
     seg_of: dict[int, int] = dict(segment_of) if segment_of is not None else {}
     by_pt: dict[int, list[Click]] = {}
@@ -327,12 +342,17 @@ def solve_crop_session(
             continue
         for _ in range(rounds):
             for f in frames:
-                full_dof = bool(po_of[f]) or _line_pitch_axes(lo_of[f]) == {0, 1}
-                d[f] = _solve_offset(h_g, po_of[f], lo_of[f], d[f], prior=not full_dof)
+                d[f] = _solve_offset(h_g, po_of[f], lo_of[f], d[f],
+                                     prior=not _full_dof(po_of[f], lo_of[f]))
             usable = [(d[f], po_of[f], lo_of[f]) for f in frames
-                      if po_of[f] or _line_pitch_axes(lo_of[f]) == {0, 1}]
+                      if _full_dof(po_of[f], lo_of[f])]
             if usable:
                 h_g = _refine_h_g(h_g, usable)
+        # Closing sweep AFTER the last refine: offsets stay consistent with the
+        # SHIPPED h_g (one click exactly determines its frame against it).
+        for f in frames:
+            d[f] = _solve_offset(h_g, po_of[f], lo_of[f], d[f],
+                                 prior=not _full_dof(po_of[f], lo_of[f]))
         grade = {f: _grade_anchor(h_g, d[f], po_of[f], lo_of[f]) for f in frames}
         ys = [PITCH_LANDMARKS[i][1] for f in frames for i, _, _ in po_of[f]]
         capped = bool(ys) and (max(ys) - min(ys)) < Y_SPAN_ONE_END

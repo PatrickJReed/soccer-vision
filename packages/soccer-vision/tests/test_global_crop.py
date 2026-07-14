@@ -262,35 +262,39 @@ def test_solve_recovers_world(world: CropWorld) -> None:
 
 def test_single_end_frame_places_far_end(world: CropWorld) -> None:
     """F-C1 regression — the point of this project. A frame clicked ONLY at one end
-    must place the OTHER end's landmarks accurately, because H_g carries them."""
-    frames = [f for f in range(0, world.n_frames, 20) if world.visible(f)]
-    f_own = min(frames, key=lambda f: float(np.mean([PITCH_LANDMARKS[i][1] for i in world.visible(f)])))
-    own_ids = [i for i in world.visible(f_own) if PITCH_LANDMARKS[i][1] < 0.5]
+    must place the OTHER end's landmarks accurately, because H_g carries them.
+    Runs on a DRIFTED chain so the test discriminates: on a drift-free chain the
+    init offset already equals truth and an implementation that IGNORED the single
+    click would still pass; with drift, ignoring it fails the 2 ft bound."""
+    w = CropWorld(world.n_frames, drift=2e-4)
+    frames = [f for f in range(0, w.n_frames, 20) if w.visible(f)]
+    f_own = min(frames, key=lambda f: float(np.mean([PITCH_LANDMARKS[i][1] for i in w.visible(f)])))
+    own_ids = [i for i in w.visible(f_own) if PITCH_LANDMARKS[i][1] < 0.5]
     assert len(own_ids) >= 1
-    clicks = [c for f in frames if f != f_own for c in world.clicks_at(f)]
-    clicks += world.clicks_at(f_own, own_ids[:1])   # ONE own-end click only
-    calib = gc.solve_crop_session(clicks, [], SIZE, world.transforms)
+    clicks = [c for f in frames if f != f_own for c in w.clicks_at(f)]
+    clicks += w.clicks_at(f_own, own_ids[:1])   # ONE own-end click only
+    calib = gc.solve_crop_session(clicks, [], SIZE, w.transforms)
     assert calib.is_anchor(f_own)
     # every landmark of the whole field projects to < 2 ft error under this frame's H
     for i in range(21):
         if i == NEAR_HALFWAY_IDX:
             continue
-        assert _err_ft(calib, world, f_own, i) < 2.0
+        assert _err_ft(calib, w, f_own, i) < 2.0
 
 
 def test_chain_drift_corrected_at_anchors(world: CropWorld) -> None:
     """Corrupt the chain with linear drift; anchor frames must still solve to truth
-    (clicks win), and unclicked frames' error stays bounded by SHORT-hop drift."""
-    drifted = CropWorld(world.n_frames, drift=2e-4)   # 0.048 norm ≈ 92 px over 240 frames
-    frames = list(range(0, drifted.n_frames, 20))
-    clicks = [c for f in frames for c in drifted.clicks_at(f)]
-    calib = gc.solve_crop_session(clicks, [], SIZE, drifted.transforms)
+    (clicks win), and unclicked frames' error stays bounded by SHORT-hop drift.
+    Truth queries (visible/click) are drift-invariant — drift corrupts only the
+    chain transforms — so `world` grounds the checks for the drifted session."""
+    frames = [f for f in range(0, world.n_frames, 20) if world.visible(f)]
+    calib = _session(world, frames, drift=2e-4)  # 0.048 norm ≈ 92 px over 240 frames
     for f in frames:
-        for i in drifted.visible(f)[:3]:
-            assert _err_ft(calib, drifted, f, i) < 1.0        # anchors: click-solved
+        for i in world.visible(f)[:3]:
+            assert _err_ft(calib, world, f, i) < 1.0          # anchors: click-solved
     mid = frames[3] + 10                                       # 10-frame hop
-    i = drifted.visible(mid)[0]
-    assert _err_ft(calib, drifted, mid, i) < 3.0               # short-hop bound, not 92 px
+    i = world.visible(mid)[0]
+    assert _err_ft(calib, world, mid, i) < 3.0                 # short-hop bound, not 92 px
 
 
 def test_segment_isolation(world: CropWorld) -> None:
@@ -313,10 +317,41 @@ def test_one_end_session_is_capped(world: CropWorld) -> None:
                                                    for i in world.visible(f)])) < 0.35]
     clicks = [c for f in own_frames[:4] for c in world.clicks_at(f)]
     calib = gc.solve_crop_session(clicks, [], SIZE, world.transforms)
-    seg = calib.segments.get(0)
-    if seg is None:
-        pytest.skip("one-end clicks degenerate for H_g on this geometry")
+    seg = calib.segments[0]  # own-end landmarks have enough spread to solve H_g
     assert seg.one_end_capped
+    # Negative: a session that clicked both ends is NOT capped.
+    full = _session(world, [f for f in range(0, world.n_frames, 20) if world.visible(f)])
+    assert not full.segments[0].one_end_capped
+
+
+def test_anchor_grading(world: CropWorld) -> None:
+    """anchor_status pins Task 5's status()/export gate: green for well-clicked
+    anchors; yellow for under-constrained (single one-axis line) and for clicks
+    scattered beyond POINT_OK_FT (median in-sample residual)."""
+    frames = [f for f in range(0, world.n_frames, 20) if world.visible(f)]
+    # (b) a frame with ONLY a midline click: one pitch axis -> not full DOF -> yellow
+    f_line = 30
+    d30 = world.offsets[f_line]
+    line = LineClick(frame=f_line, line_id="midline",
+                     x=float(world.canvas[4][0] - d30[0]),
+                     y=float(world.canvas[4][1] - d30[1]))
+    calib = _session(world, frames, lines=[line])
+    status = calib.segments[0].anchor_status
+    assert all(status[f] == "green" for f in frames)      # (a) well-clicked: green
+    assert status[f_line] == "yellow"
+    # (c) clicks scattered beyond POINT_OK_FT: alternating +-0.06 canvas so no
+    # translation absorbs it -> median residual well over 6 ft -> yellow
+    f_bad = 120
+
+    def _corrupt(c: Click, k: int) -> Click:
+        s = 0.06 if k % 2 == 0 else -0.06
+        return Click(frame=c.frame, kp_idx=c.kp_idx, x=c.x + s, y=c.y + s)
+
+    clicks = [c for f in frames if f != f_bad for c in world.clicks_at(f)]
+    clicks += [_corrupt(c, k) for k, c in enumerate(world.clicks_at(f_bad))]
+    calib2 = gc.solve_crop_session(clicks, [], SIZE, world.transforms)
+    assert calib2.segments[0].anchor_status[f_bad] == "yellow"
+    assert calib2.segments[0].anchor_status[frames[0]] == "green"
 
 
 def test_too_few_landmarks_no_anchor(world: CropWorld) -> None:

@@ -7,7 +7,7 @@ from soccer_vision.calib.field_model import LENGTH_M, WIDTH_M
 from soccer_vision.pitch import global_crop as gc
 from soccer_vision.pitch.calib_anchor import frame_homography
 from soccer_vision.pitch.landmarks import NEAR_HALFWAY_IDX, PITCH_LANDMARKS
-from soccer_vision.pitch.manual_anchor import Click
+from soccer_vision.pitch.manual_anchor import Click, LineClick
 
 SIZE = (1920, 1080)
 W, H = SIZE
@@ -198,7 +198,11 @@ def test_offset_robust_to_one_bad_click(world: CropWorld) -> None:
     po = [(c.kp_idx, c.x, c.y) for c in world.clicks_at(f)]
     assert len(po) >= 4
     bad = (po[0][0], po[0][1] + 0.08, po[0][2] + 0.08)  # ~1.5 m wrong
-    d = gc._solve_offset(world.h_g, [bad, *po[1:]], [], world.offsets[f] + 0.05)
+    # One midline line-obs alongside the points: exercises the mixed points+lines
+    # residual concatenation in the solver (landmark 4 lies ON the midline).
+    d_true = world.offsets[f]
+    lo = [("midline", float(world.canvas[4][0] - d_true[0]), float(world.canvas[4][1] - d_true[1]))]
+    d = gc._solve_offset(world.h_g, [bad, *po[1:]], lo, world.offsets[f] + 0.05)
     assert np.linalg.norm(d - world.offsets[f]) < 0.005  # soft_l1 downweights it
 
 
@@ -209,7 +213,7 @@ def test_offset_two_axis_lines_full_solve(world: CropWorld) -> None:
         ("midline", float(world.canvas[4][0] - d_true[0]), float(world.canvas[4][1] - d_true[1])),
         ("far_touchline", float(world.canvas[1][0] - d_true[0]), float(world.canvas[1][1] - d_true[1])),
     ]
-    assert gc._offset_axes(lo) == {0, 1}
+    assert gc._line_pitch_axes(lo) == {0, 1}
     d = gc._solve_offset(world.h_g, [], lo, d_true + np.array([0.03, -0.03]))
     assert np.linalg.norm(d - d_true) < 1e-3
 
@@ -218,7 +222,7 @@ def test_offset_one_axis_line_keeps_prior_direction(world: CropWorld) -> None:
     f = 120
     d_true = world.offsets[f]
     lo = [("midline", float(world.canvas[4][0] - d_true[0]), float(world.canvas[4][1] - d_true[1]))]
-    assert gc._offset_axes(lo) == {1}
+    assert gc._line_pitch_axes(lo) == {1}
     d0 = d_true + np.array([0.05, 0.05])  # drifted chain init
     d = gc._solve_offset(world.h_g, [], lo, d0, prior=True)
     r = gc._line_residuals_m(world.h_g, d, lo)
@@ -226,3 +230,96 @@ def test_offset_one_axis_line_keeps_prior_direction(world: CropWorld) -> None:
     # This fixture pans along canvas x (goal-to-goal), so the midline — pitch
     # axis 1 — pins canvas d[0]; canvas d[1] is the unconstrained direction.
     assert abs(d[1] - d0[1]) < 0.02              # unconstrained direction stayed near init
+
+
+def _session(world: CropWorld, frames: list[int], *, drift: float = 0.0,
+             lines: list[LineClick] | None = None,
+             gap_guard: int = 200) -> gc.CropCalib:
+    w = CropWorld(world.n_frames, drift=drift) if drift else world
+    clicks = [c for f in frames for c in w.clicks_at(f)]
+    return gc.solve_crop_session(clicks, lines or [], SIZE, w.transforms,
+                                 gap_guard=gap_guard)
+
+
+def _err_ft(calib: gc.CropCalib, world: CropWorld, frame: int, kp_idx: int) -> float:
+    h = calib.frame_homography(frame)
+    assert h is not None
+    c = world.click(frame, kp_idx)
+    q = gc._apply(h, np.array([[c.x, c.y]]))[0]
+    return float(np.linalg.norm((q - PITCH_LANDMARKS[kp_idx]) * gc._SCALE_M) * gc._FT)
+
+
+def test_solve_recovers_world(world: CropWorld) -> None:
+    # Skip pan-overshoot frames with NO visible landmarks (fixture: last ~quarter):
+    # they yield no clicks, so no implementation could make them anchors.
+    frames = [f for f in range(0, world.n_frames, 20) if world.visible(f)]
+    calib = _session(world, frames)
+    for f in frames:
+        assert calib.is_anchor(f)
+        for i in world.visible(f):
+            assert _err_ft(calib, world, f, i) < 1.0
+
+
+def test_single_end_frame_places_far_end(world: CropWorld) -> None:
+    """F-C1 regression — the point of this project. A frame clicked ONLY at one end
+    must place the OTHER end's landmarks accurately, because H_g carries them."""
+    frames = [f for f in range(0, world.n_frames, 20) if world.visible(f)]
+    f_own = min(frames, key=lambda f: float(np.mean([PITCH_LANDMARKS[i][1] for i in world.visible(f)])))
+    own_ids = [i for i in world.visible(f_own) if PITCH_LANDMARKS[i][1] < 0.5]
+    assert len(own_ids) >= 1
+    clicks = [c for f in frames if f != f_own for c in world.clicks_at(f)]
+    clicks += world.clicks_at(f_own, own_ids[:1])   # ONE own-end click only
+    calib = gc.solve_crop_session(clicks, [], SIZE, world.transforms)
+    assert calib.is_anchor(f_own)
+    # every landmark of the whole field projects to < 2 ft error under this frame's H
+    for i in range(21):
+        if i == NEAR_HALFWAY_IDX:
+            continue
+        assert _err_ft(calib, world, f_own, i) < 2.0
+
+
+def test_chain_drift_corrected_at_anchors(world: CropWorld) -> None:
+    """Corrupt the chain with linear drift; anchor frames must still solve to truth
+    (clicks win), and unclicked frames' error stays bounded by SHORT-hop drift."""
+    drifted = CropWorld(world.n_frames, drift=2e-4)   # 0.048 norm ≈ 92 px over 240 frames
+    frames = list(range(0, drifted.n_frames, 20))
+    clicks = [c for f in frames for c in drifted.clicks_at(f)]
+    calib = gc.solve_crop_session(clicks, [], SIZE, drifted.transforms)
+    for f in frames:
+        for i in drifted.visible(f)[:3]:
+            assert _err_ft(calib, drifted, f, i) < 1.0        # anchors: click-solved
+    mid = frames[3] + 10                                       # 10-frame hop
+    i = drifted.visible(mid)[0]
+    assert _err_ft(calib, drifted, mid, i) < 3.0               # short-hop bound, not 92 px
+
+
+def test_segment_isolation(world: CropWorld) -> None:
+    seg_of = {f: (0 if f < 120 else 1) for f in range(world.n_frames)}
+    clicks = [c for f in (0, 40, 80) for c in world.clicks_at(f)]  # only segment 0 clicked
+    calib = gc.solve_crop_session(clicks, [], SIZE, world.transforms, segment_of=seg_of)
+    assert calib.frame_homography(60) is not None
+    assert calib.frame_homography(150) is None                  # other segment: no H_g
+
+
+def test_gap_guard(world: CropWorld) -> None:
+    calib = _session(world, [0, 20], gap_guard=50)
+    assert calib.frame_homography(30) is not None
+    assert calib.frame_homography(200) is None                  # 180 > guard
+
+
+def test_one_end_session_is_capped(world: CropWorld) -> None:
+    own_frames = [f for f in range(world.n_frames)
+                  if world.visible(f) and float(np.mean([PITCH_LANDMARKS[i][1]
+                                                   for i in world.visible(f)])) < 0.35]
+    clicks = [c for f in own_frames[:4] for c in world.clicks_at(f)]
+    calib = gc.solve_crop_session(clicks, [], SIZE, world.transforms)
+    seg = calib.segments.get(0)
+    if seg is None:
+        pytest.skip("one-end clicks degenerate for H_g on this geometry")
+    assert seg.one_end_capped
+
+
+def test_too_few_landmarks_no_anchor(world: CropWorld) -> None:
+    calib = gc.solve_crop_session(world.clicks_at(120)[:3], [], SIZE, world.transforms)
+    assert calib.anchor_h == {}
+    assert calib.frame_homography(120) is None

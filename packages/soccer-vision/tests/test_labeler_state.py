@@ -149,7 +149,12 @@ def test_export_writes_only_green_frames(tmp_path: Path) -> None:
         st.export(tmp_path)
         hdf = pd.read_parquet(tmp_path / "homographies.parquet")
         assert sorted(hdf["frame"].tolist()) == sorted(greens)   # only green frames
-        assert (hdf["confidence"] == 1.0).all()
+        # Honest confidence (F-C2): 0.9 anchors / 0.8 -> 0.6 propagated ramp — never
+        # the retired constant 1.0.
+        assert (hdf["confidence"] >= 0.6).all() and (hdf["confidence"] <= 0.9).all()
+        anchors_exported = [f for f in _spread_anchors(9) if f in hdf["frame"].tolist()]
+        by_frame = hdf.set_index("frame")["confidence"]
+        assert all(by_frame[f] == 0.9 for f in anchors_exported)
     finally:
         st.stop_worker()
 
@@ -164,9 +169,12 @@ def test_export_gate_is_status_green(tmp_path: Path) -> None:
         h = np.eye(3)
         with st._lock:
             st._fits = {
-                0: CalibFrame(H=h, status="green", is_anchor=True, residual=None, n_points=6),
-                1: CalibFrame(H=h, status="yellow", is_anchor=False, residual=None, n_points=0),
-                2: CalibFrame(H=h, status="red", is_anchor=False, residual=None, n_points=0),
+                0: CalibFrame(H=h, status="green", is_anchor=True, residual=None,
+                              n_points=6, confidence=0.9),
+                1: CalibFrame(H=h, status="yellow", is_anchor=False, residual=None,
+                              n_points=0, confidence=0.0),
+                2: CalibFrame(H=h, status="red", is_anchor=False, residual=None,
+                              n_points=0, confidence=0.0),
             }
         st.export(tmp_path)
         hdf = pd.read_parquet(tmp_path / "homographies.parquet")
@@ -181,8 +189,8 @@ def test_status_of_reflects_calibframe_status() -> None:
     try:
         with st._lock:
             st._fits = {
-                0: CalibFrame(np.eye(3), "green", True, None, 6),
-                1: CalibFrame(np.eye(3), "yellow", False, None, 0),
+                0: CalibFrame(np.eye(3), "green", True, None, 6, 0.9),
+                1: CalibFrame(np.eye(3), "yellow", False, None, 0, 0.0),
             }
         assert st._status_of(0) == "green"
         assert st._status_of(1) == "yellow"

@@ -18,9 +18,11 @@ def main() -> None:
                     help="previously exported keypoints.parquet to load as clicks")
     ap.add_argument("--workers", type=int, default=None,
                     help="parallel chain precompute workers (default: cores-1)")
+    ap.add_argument("--engine", choices=["physical", "crop"], default="physical",
+                    help="calibration engine (crop = global-crop model)")
     args = ap.parse_args()
     run(args.video, port=args.port, export_dir=args.export_dir,
-        resume=args.resume, workers=args.workers)
+        resume=args.resume, workers=args.workers, engine=args.engine)
 
 
 if __name__ == "__main__":

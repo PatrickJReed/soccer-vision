@@ -451,7 +451,9 @@ def frame_confidence(calib: Any, frame: int) -> float:
     return CONF_PROP_MAX - (CONF_PROP_MAX - CONF_PROP_MIN) * min(1.0, gap / GREEN_RADIUS)
 
 
-_NEAR_TL_POINT_IDS = {0, 2}  # near-touchline endpoint landmarks (held out with its lines)
+# Near-touchline endpoint landmarks: held out with its LINE clicks, else the foreground
+# holdout is circular (mirrors physical_calib._NEAR_TL_POINT_IDS).
+_NEAR_TL_POINT_IDS = set(FIELD_LINES["near_touchline"])  # {0, 2}
 
 
 @dataclass(frozen=True)

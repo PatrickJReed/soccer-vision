@@ -20,6 +20,12 @@ from numpy.typing import NDArray
 from soccer_vision.labeler.chain import denormalize_homography
 from soccer_vision.labeler.refit_worker import RefitWorker
 from soccer_vision.pipeline import homographies_to_parquet
+from soccer_vision.pitch.global_crop import (
+    CropCalib,
+    evaluate_crop_gate,
+    frame_confidence,
+    solve_crop_session,
+)
 from soccer_vision.pitch.manual_anchor import (
     Click,
     LineClick,
@@ -45,6 +51,7 @@ class CalibFrame:
     is_anchor: bool         # True if this frame was directly clicked and solved as a pose
     residual: float | None  # diagnostic only (unused by the physical gate); None = n/a
     n_points: int           # point clicks on this anchor frame (0 for propagated frames)
+    confidence: float       # honest export confidence (0.9 anchor / 0.8->0.6 ramp / 0.0)
 
 
 class LabelerState:
@@ -63,8 +70,12 @@ class LabelerState:
         residual_px_threshold: float = 60.0,
         outlier_px: float = 40.0,
         autosave_path: Path | None = None,
+        # "physical" = shared-focal per-frame poses; "crop" = one H_g per segment +
+        # 2-DOF per-frame crop offsets (the Trace virtual-PTZ model).
+        engine: str = "physical",
     ) -> None:
         self.n_frames = n_frames
+        self._engine = engine
         self.size = size
         self.line_band = line_band
         self._lock = threading.RLock()
@@ -78,7 +89,8 @@ class LabelerState:
         self.line_clicks: list[LineClick] = []
         self._seq: list[str] = []  # insertion order across clicks ("pt") + line_clicks ("ln")
         self._fits: dict[int, CalibFrame] = {}
-        self._last_calib: PhysicalCalib | None = None  # warm-start seed for the next solve
+        # warm-start seed for the next physical solve (unused by the crop engine)
+        self._last_calib: PhysicalCalib | CropCalib | None = None
         self._gap_guard = DEFAULT_GAP_GUARD
         self._K: NDArray[np.float64] | None = None
         self._calibrated = False
@@ -96,9 +108,10 @@ class LabelerState:
         return [c for c in self.clicks if c.kp_idx not in self._outliers.get(c.frame, [])]
 
     def _try_bootstrap(self) -> bool:
-        """Calibrated once solve_session produces >= 1 physical anchor. The physical model
+        """Calibrated once the engine's solve produces >= 1 anchor. The physical model
         needs >= 3 diverse clicked frames (>= 6 points each) to estimate the shared focal;
-        below that there is no anchor yet and this stays False (the bootstrap waits)."""
+        the crop model bootstraps from ONE >= 4-landmark frame (no focal to estimate).
+        Below the engine's floor there is no anchor yet and this stays False (waits)."""
         if self._calibrated:
             return True
         calib = self._solve()
@@ -115,22 +128,32 @@ class LabelerState:
             window=self.line_band, frames=frames)
         return {f: [(lid, x * w, y * h) for (lid, x, y) in lst] for f, lst in prop.items()}
 
-    def _solve(self) -> PhysicalCalib:
-        """Run the physical per-frame solve ONCE over a stable snapshot of the active clicks
-        (points + lines). Snapshots under the lock, then runs solve_session OFF the lock
-        (shared-focal calibrate + per-anchor SQPNP+refine_pose; bracket-propagation is lazy
-        in frame_homography). Callers solve once per recompute and reuse the result — the
-        solve is expensive. solve_session handles the empty / too-few-views case by returning
-        a PhysicalCalib with no anchors, so frame_homography is None for every frame.
+    def _solve(self) -> PhysicalCalib | CropCalib:
+        """Run the engine's session solve ONCE over a stable snapshot of the active clicks
+        (points + lines). Snapshots under the lock, then solves OFF the lock. Callers solve
+        once per recompute and reuse the result. Both engines handle the empty /
+        too-few-views case by returning a calib with no anchors, so frame_homography is
+        None for every frame.
 
-        The previous PhysicalCalib (self._last_calib) is passed as a warm-start seed so each
-        anchor's refine_pose starts from its prior pose; it only affects iteration count, not
-        the optimum, and a stale seed is safe (each anchor re-refines to the current clicks).
+        physical: shared-focal calibrate + per-anchor SQPNP+refine_pose (expensive);
+        the previous PhysicalCalib (self._last_calib) is passed as a warm-start seed so
+        each anchor's refine_pose starts from its prior pose; it only affects iteration
+        count, not the optimum, and a stale seed is safe (each anchor re-refines to the
+        current clicks). crop: RANSAC H_g per segment + 2-DOF offsets — fast and
+        deterministic, so it takes no seed.
         """
         with self._lock:
             clicks = list(self._active_clicks())  # stable COPY for the lock-free solve
             lines = list(self.line_clicks)
             seed = self._last_calib               # warm-start from the prior solution
+        if self._engine == "crop":
+            calib_c = solve_crop_session(
+                clicks, lines, self.size, self._transforms,
+                segment_of=self._segment_of, gap_guard=self._gap_guard)
+            with self._lock:
+                self._last_calib = calib_c
+            return calib_c
+        assert not isinstance(seed, CropCalib)  # the engine is fixed for a session's life
         calib = solve_session(
             clicks, lines, self.size, self._transforms,
             segment_of=self._segment_of, gap_guard=self._gap_guard, seed=seed)
@@ -139,9 +162,9 @@ class LabelerState:
         return calib
 
     def _build_frame(
-        self, calib: PhysicalCalib, counts: Mapping[int, int], f: int
+        self, calib: PhysicalCalib | CropCalib, counts: Mapping[int, int], f: int
     ) -> CalibFrame | None:
-        """Build one frame's CalibFrame from an already-solved PhysicalCalib (cheap: an
+        """Build one frame's CalibFrame from an already-solved calib (cheap: an
         anchor lookup or a bracket propagation). None if the frame has no homography
         (uncalibrated / beyond the gap guard). `counts` is frame -> point-click count."""
         h = calib.frame_homography(f)
@@ -154,12 +177,13 @@ class LabelerState:
             is_anchor=anchor,
             residual=None,
             n_points=counts.get(f, 0) if anchor else 0,
+            confidence=frame_confidence(calib, f),
         )
 
     def _compute_dirty(
         self, frames: Sequence[int], is_cancelled: Callable[[], bool]
     ) -> dict[int, CalibFrame | None] | None:
-        """Solve the physical session ONCE, then build each requested frame's CalibFrame
+        """Solve the engine's session ONCE, then build each requested frame's CalibFrame
         (cheap). Chunks ONLY to check cancellation between chunks — the solve itself runs
         once, never re-run per chunk. Returns a map over EVERY requested frame ->
         CalibFrame-or-None (None = no longer solvable, so the applier pops any stale fit).
@@ -221,23 +245,27 @@ class LabelerState:
         os.replace(tmp, self.autosave_path)
 
     def _affected(self, frame: int) -> list[int]:
-        """Frames whose homography a LINE edit at `frame` can change: its own registration
-        segment (the line refines that segment's anchor poses / propagation). A POINT edit is
-        NOT scoped here — it re-estimates the shared focal K over ALL frames, so point paths
-        mark every frame dirty instead."""
+        """Frames whose homography an edit at `frame` can change: its own registration
+        segment. Scopes LINE edits in both engines (the line refines that segment's
+        anchors / propagation) and crop-mode POINT edits (each segment has its own H_g;
+        no shared parameter). A physical-mode POINT edit is NOT scoped here — it
+        re-estimates the shared focal K over ALL frames, so that path marks every
+        frame dirty instead."""
         seg = self._segment_of.get(frame)
         return [f for f in range(self.n_frames) if self._segment_of.get(f) == seg]
 
     def add_click(self, frame: int, kp_idx: int, x: float, y: float) -> None:
         # Non-blocking: append the click and mark frames dirty, then return immediately. The
         # background RefitWorker re-solves off the request thread; the clicked frame keeps its
-        # cached (pre-click) overlay until the worker drains (~100-300 ms). A point click feeds
-        # the SHARED focal K (estimated over all frames), so every frame is marked dirty.
+        # cached (pre-click) overlay until the worker drains (~100-300 ms).
         with self._lock:
             self.clicks.append(Click(frame=frame, kp_idx=kp_idx, x=x, y=y))
             self._seq.append("pt")
         if self._calibrated or self._try_bootstrap():
-            self._worker.mark_dirty(range(self.n_frames))
+            # crop mode: a point click only constrains its own segment's H_g; physical
+            # mode: it feeds the shared focal K, so every frame is dirty.
+            dirty = self._affected(frame) if self._engine == "crop" else range(self.n_frames)
+            self._worker.mark_dirty(dirty)
         self._autosave()
 
     def add_clicks(self, clicks: Sequence[Click]) -> None:
@@ -285,8 +313,12 @@ class LabelerState:
                 assert self.clicks, "_seq/clicks out of sync"
                 removed_frame = self.clicks.pop().frame
         if self._calibrated:
-            # a removed POINT changes the shared K (all frames); a removed LINE is segment-scoped
-            affected = self._affected(removed_frame) if kind == "ln" else range(self.n_frames)
+            # a removed LINE is segment-scoped; so is a removed POINT in crop mode (it only
+            # constrained its segment's H_g) — but in physical mode a removed point changes
+            # the shared K, so that path marks all frames.
+            affected = (self._affected(removed_frame)
+                        if kind == "ln" or self._engine == "crop"
+                        else range(self.n_frames))
             self._worker.mark_dirty(affected)  # non-blocking
         self._autosave()
 
@@ -302,7 +334,10 @@ class LabelerState:
         if not found:
             return False
         if self._calibrated:
-            self._worker.mark_dirty(range(self.n_frames))  # point moved -> shared K changes
+            # crop mode: a moved point re-solves only its segment's H_g; physical mode:
+            # it moves the shared K, so every frame is dirty.
+            dirty = self._affected(frame) if self._engine == "crop" else range(self.n_frames)
+            self._worker.mark_dirty(dirty)
         self._autosave()
         return True
 
@@ -387,11 +422,34 @@ class LabelerState:
             # foreground self-check + plausible fold), never yellow/red "sky" frames.
             if cf is None or cf.status != "green":
                 continue
-            # A green frame is whole-field trustworthy -> confidence 1.0. The physical gate
-            # (foreground self-check + fold), not an in-sample residual, decides trust.
+            # Confidence comes from the engine's grading (frame_confidence: 0.9 anchor,
+            # 0.8 -> 0.6 propagated ramp), never a constant — GREEN gates admission,
+            # the ramp grades how much to trust each admitted frame (retires F-C2).
             entries[f] = HomographyEntry(
-                denormalize_homography(cf.H, self.size), "manual", 1.0)
+                denormalize_homography(cf.H, self.size), "manual", cf.confidence)
         homographies_to_parquet(entries, out / "homographies.parquet")
+        if self._engine == "crop":
+            # LOO gate cost: ~1.3-1.6 s at 26 anchors (quadratic in anchors) — acceptable
+            # because export is terminal and already blocks on wait_idle above; escape
+            # hatch if sessions grow = segment-scoped LOO re-solves.
+            with self._lock:
+                pts = list(self._active_clicks())
+                lns = list(self.line_clicks)
+            rep = evaluate_crop_gate(pts, lns, self.size, self._transforms,
+                                     segment_of=self._segment_of,
+                                     gap_guard=self._gap_guard)
+            # n_anchors = clicked frames at export; prop_n counts click errors on the
+            # LOO-evaluated frames only, so silently-skipped frames show as the gap.
+            n_anchors = len({c.frame for c in pts})
+            (out / "calib_gate.json").write_text(json.dumps({
+                "engine": "crop",
+                "fg_median_ft": rep.fg_median_ft, "fg_p90_ft": rep.fg_p90_ft,
+                "fg_n": rep.fg_n,
+                "prop_median_ft": rep.prop_median_ft, "prop_p90_ft": rep.prop_p90_ft,
+                "prop_n": rep.prop_n, "n_anchors": n_anchors,
+                "prop_by_end": {k: list(v) for k, v in rep.prop_by_end.items()},
+                "passed_numeric": rep.passed_numeric,
+            }, indent=2))
         if self.line_clicks:
             pd.DataFrame(
                 [{"frame": lc.frame, "line_id": lc.line_id, "x_px": lc.x * w, "y_px": lc.y * h}

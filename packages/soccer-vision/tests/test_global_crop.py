@@ -512,7 +512,19 @@ def test_propagation_holdout_split_by_end(world: CropWorld) -> None:
     errs, by_end = gc.propagation_holdout_crop(clicks, [], SIZE, world.transforms)
     assert errs and float(np.median(errs)) < 2.0
     assert set(by_end) <= {"own", "opp", "both"}
+    # Both ends must actually be measured (fixture: own=43/opp=53) — a split that
+    # bucketed everything under one key would silently defeat the F-C1 evidence.
+    assert {"own", "opp"} <= set(by_end)
     assert sum(len(v) for v in by_end.values()) == len(errs)
+
+
+def test_evaluate_crop_gate_fails_without_foreground_evidence(world: CropWorld) -> None:
+    """No near-touchline line clicks -> no foreground holdout -> the gate must FAIL
+    (inf medians), never silently pass a session with zero foreground evidence."""
+    frames = list(range(0, world.n_frames, 20))
+    clicks = [c for f in frames for c in world.clicks_at(f)]
+    rep = gc.evaluate_crop_gate(clicks, [], SIZE, world.transforms)
+    assert rep.fg_n == 0 and not rep.passed_numeric
 
 
 def test_evaluate_crop_gate_passes_on_clean_world(world: CropWorld) -> None:

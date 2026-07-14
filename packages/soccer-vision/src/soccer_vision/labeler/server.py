@@ -220,12 +220,14 @@ def run(
     export_dir: Path | None = None,
     resume: Path | None = None,
     workers: int | None = None,
+    engine: str = "physical",
 ) -> None:  # pragma: no cover - launches a blocking server
     """Precompute the chain, open the video, and serve the labeler UI.
 
     resume: a previously exported keypoints.parquet — its clicks are loaded
     into the session (converted back from full-pixel to normalized coords).
     workers: parallel workers for chain precompute (default: cores-1).
+    engine: LabelerState calibration engine ("physical" | "crop").
     """
     import cv2
 
@@ -238,7 +240,7 @@ def run(
     sidecar = cache_dir / f"{Path(video_path).stem}.clicks.json"
     state = LabelerState(
         interframe=interframe, n_frames=n_frames, size=size,
-        autosave_path=sidecar,
+        autosave_path=sidecar, engine=engine,
     )
     restore_session(state, sidecar=sidecar, resume=resume, size=size)
     cap = cv2.VideoCapture(str(video_path))

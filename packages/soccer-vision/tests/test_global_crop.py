@@ -358,3 +358,80 @@ def test_too_few_landmarks_no_anchor(world: CropWorld) -> None:
     calib = gc.solve_crop_session(world.clicks_at(120)[:3], [], SIZE, world.transforms)
     assert calib.anchor_h == {}
     assert calib.frame_homography(120) is None
+
+
+def test_status_green_anchor_and_propagated(world: CropWorld) -> None:
+    frames = list(range(0, world.n_frames, 20))
+    calib = _session(world, frames)
+    assert calib.status(frames[2]) == "green"
+    assert calib.status(frames[2] + 5) == "green"     # within GREEN_RADIUS of used anchors
+    assert calib.status(999_999) == "red"
+
+
+def test_status_uses_bracket_anchors_not_nearest_green(world: CropWorld) -> None:
+    """F-C3: a frame bracketed by a YELLOW anchor must not be green just because a
+    green anchor sits nearby on the other side of it."""
+    frames = list(range(0, world.n_frames, 20))
+    clicks = [c for f in frames for c in world.clicks_at(f)]
+    calib = gc.solve_crop_session(clicks, [], SIZE, world.transforms)
+    f_mid = frames[3]
+    ss = calib.segments[0]
+    forced = dict(ss.anchor_status)
+    forced[f_mid] = "yellow"
+    calib2 = gc.CropCalib(
+        {0: gc.SegmentSolve(ss.h_g, ss.offsets, forced, ss.one_end_capped)},
+        calib.transforms, calib.segment_of, calib.size, calib.gap_guard)
+    probe = f_mid + 5   # bracketed by f_mid (yellow) and frames[4] (green)
+    assert set(calib2.used_anchors(probe)) == {f_mid, frames[4]}
+    assert calib2.status(probe) == "yellow"
+
+
+def test_sky_pose_is_red(world: CropWorld) -> None:
+    frames = list(range(0, world.n_frames, 20))
+    calib = _session(world, frames)
+    ss = calib.segments[0]
+    sky = ss.h_g.copy()
+    # Corrupt row 2 at the h_g's NATURAL perspective scale (solved row2 ~ [0, 117, 1]):
+    # -300 overwhelms the +117 y-term, so the w=0 horizon cuts the landmark set and
+    # the far half flips behind the camera (7 of 21 landmarks w<0 on this geometry).
+    sky[2, :] = np.array([0.9, -300.0, 1.0])
+    calib2 = gc.CropCalib(
+        {0: gc.SegmentSolve(sky, ss.offsets, ss.anchor_status, ss.one_end_capped)},
+        calib.transforms, calib.segment_of, calib.size, calib.gap_guard)
+    f = frames[2]
+    h = calib2.frame_homography(f)
+    assert h is not None
+    if gc._wsigns_ok(h, SIZE):
+        pytest.skip("corruption did not flip w-signs on this geometry; strengthen row")
+    assert calib2.status(f) == "red"
+
+
+def test_green_implies_wsign_pass(world: CropWorld) -> None:
+    frames = list(range(0, world.n_frames, 20))
+    calib = _session(world, frames)
+    for f in range(0, world.n_frames, 7):
+        if calib.status(f) == "green":
+            h = calib.frame_homography(f)
+            assert h is not None and gc._wsigns_ok(h, SIZE)
+
+
+def test_one_end_capped_status_is_yellow(world: CropWorld) -> None:
+    """A one-end-capped segment caps even perfect anchors at yellow (honesty rule)."""
+    frames = list(range(0, world.n_frames, 20))
+    calib = _session(world, frames)
+    ss = calib.segments[0]
+    capped = gc.CropCalib(
+        {0: gc.SegmentSolve(ss.h_g, ss.offsets, ss.anchor_status, True)},
+        calib.transforms, calib.segment_of, calib.size, calib.gap_guard)
+    assert capped.status(frames[2]) == "yellow"
+
+
+def test_confidence_mapping(world: CropWorld) -> None:
+    frames = list(range(0, world.n_frames, 20))
+    calib = _session(world, frames)
+    f_anchor = frames[2]
+    assert gc.frame_confidence(calib, f_anchor) == pytest.approx(0.9)
+    c_near = gc.frame_confidence(calib, f_anchor + 2)
+    c_far = gc.frame_confidence(calib, f_anchor + 9)
+    assert 0.6 <= c_far < c_near <= 0.8
+    assert gc.frame_confidence(calib, 999_999) == 0.0

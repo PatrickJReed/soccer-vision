@@ -22,6 +22,7 @@ from scipy.optimize import least_squares  # type: ignore[import-untyped]
 from scipy.spatial import ConvexHull, QhullError  # type: ignore[import-untyped]
 
 from soccer_vision.calib.field_model import FIELD_LINES, LENGTH_M, METRES_TO_FEET, WIDTH_M
+from soccer_vision.calib.validate import fold_count
 from soccer_vision.pitch.homography import HomographyError, fit_homography
 from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 from soccer_vision.pitch.manual_anchor import Click, LineClick
@@ -168,6 +169,40 @@ def _solve_offset(
     return np.asarray(res.x, np.float64)
 
 
+def _pitch_to_px(
+    h_norm: NDArray[np.floating[Any]], size: tuple[int, int]
+) -> NDArray[np.float64] | None:
+    """Sign-normalized pitch->pixel map from a NORMALIZED image->pitch homography
+    (signed so the field centre projects with w > 0); None when singular."""
+    w, h = size
+    h_px = np.asarray(h_norm, np.float64) @ np.diag([1.0 / w, 1.0 / h, 1.0])
+    try:
+        p = np.linalg.inv(h_px)
+    except np.linalg.LinAlgError:
+        return None
+    if float((p @ np.array([0.5, 0.5, 1.0]))[2]) < 0:
+        p = -p
+    return np.asarray(p, np.float64)
+
+
+def _wsigns_ok(h_norm: NDArray[np.floating[Any]], size: tuple[int, int]) -> bool:
+    """True iff ALL 21 canonical landmarks project with w > 0 (in front of the camera)
+    under the sign-normalized pitch->pixel map. A pose whose far end flips behind the
+    camera plane ("lines in the sky") fails this even when its near field looks fine."""
+    p = _pitch_to_px(h_norm, size)
+    if p is None:
+        return False
+    pts = np.column_stack([PITCH_LANDMARKS, np.ones(len(PITCH_LANDMARKS))])
+    wz = (p @ pts.T).T[:, 2]
+    return bool(np.all(wz > 1e-9))
+
+
+def _fold_norm(h_norm: NDArray[np.floating[Any]], size: tuple[int, int]) -> int:
+    """fold_count for a NORMALIZED image->pitch homography (sign-normalized)."""
+    p = _pitch_to_px(h_norm, size)
+    return fold_count(p, size) if p is not None else 0
+
+
 @dataclass(frozen=True, eq=False)
 class SegmentSolve:
     """One segment's solved global model."""
@@ -257,6 +292,32 @@ class CropCalib:
         if ss is None or d is None:
             return None
         return np.asarray(ss.h_g @ _t(d), np.float64)
+
+    def status(self, frame: int) -> str:
+        """green = click-solved anchor within in-sample tolerance, or a frame within
+        GREEN_RADIUS whose USED bracket anchors are all green — in both cases the
+        whole-field projection is physical (all-21 w>0, fold in band). yellow =
+        propagated beyond radius / partially-constrained anchor / one-end-capped
+        segment. red = no homography or an unphysical projection."""
+        h = self.frame_homography(frame)
+        if h is None:
+            return "red"
+        if not _wsigns_ok(h, self.size):
+            return "red"
+        if not FOLD_MIN <= _fold_norm(h, self.size) <= FOLD_MAX:
+            return "red"
+        ss = self.segments[self._segment(frame)]
+        if ss.one_end_capped:
+            return "yellow"
+        if frame in ss.offsets:
+            return ss.anchor_status.get(frame, "yellow")
+        used = self.used_anchors(frame)
+        if not used:  # unreachable: h is not None implies bracket anchors exist
+            return "yellow"
+        near = min(abs(frame - a) for a in used)
+        if near <= GREEN_RADIUS and all(ss.anchor_status.get(a) == "green" for a in used):
+            return "green"
+        return "yellow"
 
 
 def _refine_h_g(
@@ -360,3 +421,15 @@ def solve_crop_session(
             h_g=np.asarray(h_g, np.float64), offsets=d, anchor_status=grade,
             one_end_capped=capped)
     return CropCalib(segments, tf, seg_of, size, gap_guard)
+
+
+def frame_confidence(calib: Any, frame: int) -> float:
+    """Honest export confidence for ANY engine exposing status/is_anchor/
+    nearest_anchor_gap: 0.9 for a green anchor, 0.8 -> 0.6 ramp across GREEN_RADIUS
+    for propagated green, 0.0 otherwise. Retires the constant-1.0 overclaim (F-C2)."""
+    if calib.status(frame) != "green":
+        return 0.0
+    if calib.is_anchor(frame):
+        return CONF_ANCHOR
+    gap = calib.nearest_anchor_gap(frame) or 0
+    return CONF_PROP_MAX - (CONF_PROP_MAX - CONF_PROP_MIN) * min(1.0, gap / GREEN_RADIUS)

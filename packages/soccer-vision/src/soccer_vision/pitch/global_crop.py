@@ -17,17 +17,20 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from soccer_vision.calib.field_model import LENGTH_M, METRES_TO_FEET, WIDTH_M
+from soccer_vision.calib.field_model import FIELD_LINES, LENGTH_M, METRES_TO_FEET, WIDTH_M
 from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 
-RANSAC_THRESH_PITCH = 0.012   # global-fit inlier gate, pitch units (~0.8 m)
+RANSAC_THRESH_PITCH = 0.012   # global-fit inlier gate, pitch units (~0.55-0.8 m per axis)
 HULL_AREA_MIN = 0.02          # min spread (pitch-units^2) of fit landmarks
 Y_SPAN_ONE_END = 0.5          # below this y-span the session saw ~one end -> cap yellow
-POINT_OK_FT = 6.0             # in-sample anchor tolerances (same convention as physical)
+# Grading: same conventions as physical_calib (tolerances, fold plausibility range,
+# green radius, gap guard) — rationale documented there.
+POINT_OK_FT = 6.0
 LINE_OK_FT = 4.0
 FOLD_MIN, FOLD_MAX = 4, 15
 GREEN_RADIUS = 100
 DEFAULT_GAP_GUARD = 200
+# Export confidence tiers: green anchor, then a propagated ramp (max -> min with distance).
 CONF_ANCHOR = 0.9
 CONF_PROP_MAX, CONF_PROP_MIN = 0.8, 0.6
 PRIOR_WEIGHT = 0.05           # weak chain prior for offset DOF the clicks don't constrain
@@ -42,6 +45,8 @@ _LINE_PITCH: dict[str, tuple[int, float]] = {
     "opp_goal_line": (1, 1.0),
     "midline": (1, 0.5),
 }
+# The named lines must stay in sync with the 3D field model's line set.
+assert _LINE_PITCH.keys() == FIELD_LINES.keys()
 
 PointObs = tuple[int, float, float]   # (kp_idx, x_norm, y_norm)
 LineObs = tuple[str, float, float]    # (line_id, x_norm, y_norm)
@@ -54,6 +59,7 @@ def _translation(m: NDArray[np.floating[Any]]) -> NDArray[np.float64]:
 
 
 def _t(d: NDArray[np.floating[Any]]) -> NDArray[np.float64]:
+    """The crop-offset translation factor T(d) in H_f = H_g @ T(d_f)."""
     return np.array([[1.0, 0.0, float(d[0])], [0.0, 1.0, float(d[1])], [0.0, 0.0, 1.0]])
 
 
@@ -84,9 +90,8 @@ def _line_residuals_m(
         return np.zeros(0)
     pts = np.array([[x + d[0], y + d[1]] for _, x, y in lo], np.float64)
     q = _apply(h_g, pts)
-    out = [
-        (float(qi[ax]) - c) * float(_SCALE_M[ax])
-        for (lid, _, _), qi in zip(lo, q, strict=True)
-        for ax, c in (_LINE_PITCH[lid],)
-    ]
+    out: list[float] = []
+    for (lid, _, _), qi in zip(lo, q, strict=True):
+        ax, c = _LINE_PITCH[lid]
+        out.append((float(qi[ax]) - c) * float(_SCALE_M[ax]))
     return np.array(out, np.float64)

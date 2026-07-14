@@ -1,21 +1,40 @@
 """Tests for pitch/global_crop.py — the exact virtual-PTZ crop model."""
+import cv2
 import numpy as np
 import pytest
 from numpy.typing import NDArray
+from soccer_vision.calib.field_model import LENGTH_M, WIDTH_M
 from soccer_vision.pitch import global_crop as gc
 from soccer_vision.pitch.calib_anchor import frame_homography
-from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
+from soccer_vision.pitch.landmarks import NEAR_HALFWAY_IDX, PITCH_LANDMARKS
 from soccer_vision.pitch.manual_anchor import Click
 
 SIZE = (1920, 1080)
 W, H = SIZE
 K_TRUE = np.array([[1460.0, 0, W / 2], [0, 1460.0, H / 2], [0, 0, 1.0]])
-# One fixed sideline camera at midfield (25 m out, 18 m up, image x along the
-# field length) so a canvas-x pan sweeps goal-to-goal. Same synthetic-camera
-# recipe as test_physical_calib; that file's behind-the-goal pose puts the field
-# ends along canvas *y*, which would defeat this fixture's x-pan.
-RVEC = np.array([[-0.9402], [-0.9402], [-1.3582]])
-TVEC = np.array([[-34.25], [8.0452], [29.7368]])
+PAN_MARGIN = 0.1  # canvas units of pan pre-roll left of the field (applied twice)
+
+
+def _sideline_pose() -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """One fixed sideline camera at midfield: 25 m out from the near touchline
+    (x<0), 18 m up (world z points down, so above-ground is negative z), looking
+    at the field centre with the image x-axis along the field length — so a
+    canvas-x pan sweeps goal-to-goal. (test_physical_calib's behind-the-goal pose
+    puts the field ends along canvas *y*, which would defeat this fixture's x-pan.)
+    """
+    cam = np.array([-25.0, LENGTH_M / 2.0, -18.0])
+    fwd = np.array([WIDTH_M / 2.0, LENGTH_M / 2.0, 0.0]) - cam
+    fwd /= np.linalg.norm(fwd)
+    right = np.array([0.0, 1.0, 0.0])
+    right -= right.dot(fwd) * fwd
+    right /= np.linalg.norm(right)
+    rot = np.stack([right, np.cross(fwd, right), fwd])  # rows = camera x/y/z axes
+    rvec = np.asarray(cv2.Rodrigues(rot)[0], np.float64)
+    tvec = np.asarray(-rot @ cam, np.float64).reshape(3, 1)
+    return rvec, tvec
+
+
+RVEC, TVEC = _sideline_pose()
 
 
 def _h_g_true() -> NDArray[np.float64]:
@@ -41,9 +60,12 @@ class CropWorld:
         canvas = _canvas_of_landmarks(self.h_g)
         span = canvas[:, 0].max() - canvas[:, 0].min()
         # Pan sweeps the canvas x-range so both field ends are seen by some frame.
-        x0 = canvas[:, 0].min() - 0.1
+        # It starts 2*PAN_MARGIN left of the field and overshoots the right edge
+        # (span * 1.2), so the last ~quarter of frames (>= ~175 of 240) see fewer
+        # than 4 landmarks — later tasks should place anchors well inside the clip.
+        x0 = canvas[:, 0].min() - 2.0 * PAN_MARGIN
         self.offsets = {
-            f: np.array([x0 + span * 1.2 * f / (n_frames - 1) - 0.1, 0.0])
+            f: np.array([x0 + span * 1.2 * f / (n_frames - 1), 0.0])
             for f in range(n_frames)
         }
         self.canvas = canvas
@@ -52,13 +74,23 @@ class CropWorld:
             f: np.array([[1.0, 0.0, d[0] + drift * f], [0.0, 1.0, d[1]], [0.0, 0.0, 1.0]])
             for f, d in self.offsets.items()
         }
+        # Self-check on EVERY construction: the pan really shows both field ends
+        # (else the pose/pan constants are wrong). Valid for drift worlds too:
+        # drift corrupts self.transforms only, never self.offsets (the truth).
+        ends = [
+            float(np.mean([PITCH_LANDMARKS[i][1] for i in self.visible(f)]))
+            for f in range(n_frames)
+            if len(self.visible(f)) >= 4
+        ]
+        assert min(ends) < 0.4 and max(ends) > 0.6
 
     def visible(self, frame: int) -> list[int]:
         d = self.offsets[frame]
         out = []
         for i, c in enumerate(self.canvas):
             x, y = c[0] - d[0], c[1] - d[1]
-            if 0.02 <= x <= 0.98 and 0.02 <= y <= 0.98 and i != 5:
+            # NEAR_HALFWAY_IDX sits under the real camera: never visible, never labeled.
+            if 0.02 <= x <= 0.98 and 0.02 <= y <= 0.98 and i != NEAR_HALFWAY_IDX:
                 out.append(i)
         return out
 
@@ -74,17 +106,14 @@ class CropWorld:
 
 @pytest.fixture(scope="module")
 def world() -> CropWorld:
-    w = CropWorld()
-    ends = {f: np.mean([PITCH_LANDMARKS[i][1] for i in w.visible(f)])
-            for f in range(w.n_frames) if len(w.visible(f)) >= 4}
-    # self-check: the pan really shows both ends (else the fixture constants are wrong)
-    assert min(ends.values()) < 0.4 and max(ends.values()) > 0.6
-    return w
+    return CropWorld()  # the both-ends self-check runs inside __init__
 
 
 def test_translation_and_compose_roundtrip(world: CropWorld) -> None:
     f = 30
     assert np.allclose(gc._translation(world.transforms[f]), world.offsets[f])
+    # homogeneous transforms are defined up to scale: the /m[2,2] must normalize
+    assert np.allclose(gc._translation(2.0 * world.transforms[f]), world.offsets[f])
     h_f = world.h_g @ gc._t(world.offsets[f])
     c = world.clicks_at(f)[0]
     q = gc._apply(h_f, np.array([[c.x, c.y]]))[0]
@@ -101,3 +130,14 @@ def test_residuals_are_metres(world: CropWorld) -> None:
     lo = [("midline", float(mx), float(my))]
     rl = gc._line_residuals_m(world.h_g, world.offsets[f], lo)
     assert rl.shape == (1,) and abs(rl[0]) < 1e-6  # landmark 4 lies ON the midline
+    # Perturbed samples pin the metre CONVERSION and its SIGN (exact zeros can't).
+    inv = np.linalg.inv(world.h_g)
+    delta = 0.01  # pitch-x units past landmark 6, toward the far touchline
+    p_pt = PITCH_LANDMARKS[6] + np.array([delta, 0.0])
+    cx, cy = gc._apply(inv, p_pt[None, :])[0] - world.offsets[f]
+    rp = gc._point_residuals_m(world.h_g, world.offsets[f], [(6, float(cx), float(cy))])
+    assert abs(rp[0] - delta * WIDTH_M) < 1e-9 and abs(rp[1]) < 1e-9
+    off = 0.02  # pitch-y units past the midline, toward the opp goal
+    lx, ly = gc._apply(inv, np.array([[0.6, 0.5 + off]]))[0] - world.offsets[f]
+    rl2 = gc._line_residuals_m(world.h_g, world.offsets[f], [("midline", float(lx), float(ly))])
+    assert abs(rl2[0] - off * LENGTH_M) < 1e-9

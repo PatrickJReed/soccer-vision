@@ -75,3 +75,33 @@ view-dependent violation regardless of solver quality.
    rotation, C FIXED at the measured value — which scored 2.5–3.0 ft in the 2026-07-01
    experiment; only free-C failed) is now the best-supported next step. The trust seam,
    gate machinery, and by-end LOO built here carry over unchanged.
+
+## Option-C measurement (2026-07-14, same day): fixed-C rotation on real sessions
+
+Harness: scratchpad `fixed_c_experiment.py` — stage-1 physical solve → robust median
+camera centre Ĉ → per-anchor ROTATION-ONLY re-solve (3 DOF, t = −R·Ĉ) → same gates.
+
+| session · metric | physical | fixed-C (hard) | gate bar |
+|---|---|---|---|
+| oceanside foreground med / p90 | 4.18 / 9.72 | **3.17 / 6.53** | ≤5 / ≤12 |
+| oceanside LOO propagation med / p90 | **5.85** / 21.13 | 6.61 / **15.47** | ≤5 / — |
+| training LOO propagation med / p90 | **4.40** / 25.33 | 4.79 / **17.67** | ≤5 / — |
+
+Ĉ estimates: training (−1.0, 34.7, −4.0) m — matches July-1's (−1.2, 34.3, −4.0)
+almost exactly; focal 1460.9 matches. Oceanside Ĉ = (−5.1, 34.1, −4.9) m, centre
+spread median 1.8 m / max 5.4 m; focal 1361 (different install).
+
+**Reading:** fixed-C buys clearly better foreground (−24/−33%) and strong tail
+compression (p90 −27…−30%) at a small median cost (+0.4…+0.8 ft); it does NOT reach
+July-1's 2.5–3.0 ft (different protocol/eval set) and does not bring the oceanside
+propagation median under the 5.0 bar. The hard constraint mis-fits a few anchors
+(in-sample outliers +21…+64 ft) — a production version would need a soft prior /
+outlier handling (≈ audit Model B), i.e., another optimization loop for a tail-only win
+while both engines' medians already sit at the finest product tolerance (~4.9 ft).
+
+**Aside (design learning):** all-21-landmark w-sign is NOT a valid sky test for the real
+Trace geometry — the camera sits ~4–5 m high near the touchline, so near-side landmarks
+legitimately fall behind the camera plane (free physical anchors: 0/23 and 21/50 pass).
+Any future far-end gate for the physical engine must check FAR-END landmarks only (the
+spec's original F-C2 wording; the all-21 strengthening was valid only for the synthetic
+high camera).

@@ -1,4 +1,6 @@
 """Tests for pitch/global_crop.py — the exact virtual-PTZ crop model."""
+import dataclasses
+
 import cv2
 import numpy as np
 import pytest
@@ -378,9 +380,8 @@ def test_status_uses_bracket_anchors_not_nearest_green(world: CropWorld) -> None
     ss = calib.segments[0]
     forced = dict(ss.anchor_status)
     forced[f_mid] = "yellow"
-    calib2 = gc.CropCalib(
-        {0: gc.SegmentSolve(ss.h_g, ss.offsets, forced, ss.one_end_capped)},
-        calib.transforms, calib.segment_of, calib.size, calib.gap_guard)
+    calib2 = dataclasses.replace(
+        calib, segments={0: dataclasses.replace(ss, anchor_status=forced)})
     probe = f_mid + 5   # bracketed by f_mid (yellow) and frames[4] (green)
     assert set(calib2.used_anchors(probe)) == {f_mid, frames[4]}
     assert calib2.status(probe) == "yellow"
@@ -395,24 +396,48 @@ def test_sky_pose_is_red(world: CropWorld) -> None:
     # -300 overwhelms the +117 y-term, so the w=0 horizon cuts the landmark set and
     # the far half flips behind the camera (7 of 21 landmarks w<0 on this geometry).
     sky[2, :] = np.array([0.9, -300.0, 1.0])
-    calib2 = gc.CropCalib(
-        {0: gc.SegmentSolve(sky, ss.offsets, ss.anchor_status, ss.one_end_capped)},
-        calib.transforms, calib.segment_of, calib.size, calib.gap_guard)
+    calib2 = dataclasses.replace(calib, segments={0: dataclasses.replace(ss, h_g=sky)})
     f = frames[2]
     h = calib2.frame_homography(f)
     assert h is not None
-    if gc._wsigns_ok(h, SIZE):
-        pytest.skip("corruption did not flip w-signs on this geometry; strengthen row")
+    assert not gc._wsigns_ok(h, SIZE), "corruption no longer flips w-signs; strengthen row"
     assert calib2.status(f) == "red"
 
 
+def _sky_calib(calib: gc.CropCalib) -> gc.CropCalib:
+    """calib with segment 0's h_g corrupted to the sky pose (see test_sky_pose_is_red)."""
+    ss = calib.segments[0]
+    sky = ss.h_g.copy()
+    sky[2, :] = np.array([0.9, -300.0, 1.0])
+    return dataclasses.replace(calib, segments={0: dataclasses.replace(ss, h_g=sky)})
+
+
 def test_green_implies_wsign_pass(world: CropWorld) -> None:
+    """No frame with a failing w-sign may be green. The healthy calib alone can't
+    falsify this (nothing in it fails w-signs), so ALSO run the corrupted-h_g calib
+    from the sky test, where every frame's w-sign check fails — a status() that
+    skipped the w-sign gate would go green there and trip the assert."""
     frames = list(range(0, world.n_frames, 20))
     calib = _session(world, frames)
-    for f in range(0, world.n_frames, 7):
-        if calib.status(f) == "green":
-            h = calib.frame_homography(f)
-            assert h is not None and gc._wsigns_ok(h, SIZE)
+    for c in (calib, _sky_calib(calib)):
+        for f in range(0, world.n_frames, 7):
+            if c.status(f) == "green":
+                h = c.frame_homography(f)
+                assert h is not None and gc._wsigns_ok(h, SIZE)
+
+
+def test_wsign_cache_matches_per_frame(world: CropWorld) -> None:
+    """The per-segment cached w-sign verdict must equal the per-frame _wsigns_ok
+    check for every frame (offset-invariance of the projective row) — probed on
+    both the healthy calib (all pass) and the corrupted one (all fail)."""
+    frames = list(range(0, world.n_frames, 20))
+    calib = _session(world, frames)
+    for c in (calib, _sky_calib(calib)):
+        cached = c._wsigns_by_segment[0]
+        for f in range(0, world.n_frames, 7):
+            h = c.frame_homography(f)
+            if h is not None:
+                assert gc._wsigns_ok(h, SIZE) == cached
 
 
 def test_one_end_capped_status_is_yellow(world: CropWorld) -> None:
@@ -420,9 +445,8 @@ def test_one_end_capped_status_is_yellow(world: CropWorld) -> None:
     frames = list(range(0, world.n_frames, 20))
     calib = _session(world, frames)
     ss = calib.segments[0]
-    capped = gc.CropCalib(
-        {0: gc.SegmentSolve(ss.h_g, ss.offsets, ss.anchor_status, True)},
-        calib.transforms, calib.segment_of, calib.size, calib.gap_guard)
+    capped = dataclasses.replace(
+        calib, segments={0: dataclasses.replace(ss, one_end_capped=True)})
     assert capped.status(frames[2]) == "yellow"
 
 
@@ -435,3 +459,22 @@ def test_confidence_mapping(world: CropWorld) -> None:
     c_far = gc.frame_confidence(calib, f_anchor + 9)
     assert 0.6 <= c_far < c_near <= 0.8
     assert gc.frame_confidence(calib, 999_999) == 0.0
+
+
+def test_crop_assumption_report_pass_and_fail(world: CropWorld) -> None:
+    pairs = {f: np.linalg.inv(world.transforms[f]) @ world.transforms[f + 1]
+             for f in range(world.n_frames - 1)}
+    rep = gc.crop_assumption_report(pairs, SIZE)
+    assert rep["ok"] and rep["max_abs_rot_deg"] < 0.01 and abs(rep["max_scale_dev"]) < 1e-6
+    # 0.05 rad in normalized coords ≈ 1.6° after the pixel-space aspect correction
+    rot = np.array([[np.cos(0.05), -np.sin(0.05), 0], [np.sin(0.05), np.cos(0.05), 0], [0, 0, 1.0]])
+    rep2 = gc.crop_assumption_report({0: rot}, SIZE)
+    assert not rep2["ok"] and rep2["max_abs_rot_deg"] > 1.0
+
+
+def test_implied_camera_recovers_focal(world: CropWorld) -> None:
+    out = gc.implied_camera(world.h_g, SIZE, pp_canvas=np.array([0.5, 0.5]))
+    assert out is not None
+    f_px, c = out
+    assert abs(f_px - 1460.0) / 1460.0 < 0.05      # within 5% of the true focal
+    assert np.all(np.isfinite(c))

@@ -11,6 +11,7 @@ Pure: no I/O. Spec: docs/superpowers/specs/2026-07-14-global-crop-calibration-de
 """
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
@@ -293,6 +294,19 @@ class CropCalib:
             return None
         return np.asarray(ss.h_g @ _t(d), np.float64)
 
+    @cached_property
+    def _wsigns_by_segment(self) -> dict[int, bool]:
+        """Per-segment w-sign verdict, evaluated once at d = 0 (i.e. on h_g itself).
+
+        Offset-invariant: for H_f = h_g @ T(d) the pitch->px map is
+        diag(w, h, 1) @ T(-d) @ inv(h_g); T(-d) is affine (last row [0, 0, 1]) and
+        the diag scales rows 1-2 only, so ROW 3 equals row 3 of inv(h_g) for every
+        d. That row alone fixes each landmark's projected w sign AND the
+        field-centre sign normalization, so the per-frame _wsigns_ok verdict is
+        identical across a segment's frames (equivalence probed in
+        test_wsign_cache_matches_per_frame)."""
+        return {sid: _wsigns_ok(ss.h_g, self.size) for sid, ss in self.segments.items()}
+
     def status(self, frame: int) -> str:
         """green = click-solved anchor within in-sample tolerance, or a frame within
         GREEN_RADIUS whose USED bracket anchors are all green — in both cases the
@@ -302,7 +316,9 @@ class CropCalib:
         h = self.frame_homography(frame)
         if h is None:
             return "red"
-        if not _wsigns_ok(h, self.size):
+        # w-sign gate via the offset-invariant per-segment cache: the pixel map is
+        # now inverted once per status call (inside _fold_norm), not twice.
+        if not self._wsigns_by_segment[self._segment(frame)]:
             return "red"
         if not FOLD_MIN <= _fold_norm(h, self.size) <= FOLD_MAX:
             return "red"
@@ -433,3 +449,69 @@ def frame_confidence(calib: Any, frame: int) -> float:
         return CONF_ANCHOR
     gap = calib.nearest_anchor_gap(frame) or 0
     return CONF_PROP_MAX - (CONF_PROP_MAX - CONF_PROP_MIN) * min(1.0, gap / GREEN_RADIUS)
+
+
+def crop_assumption_report(
+    interframe: Mapping[int, NDArray[np.floating[Any]]], size: tuple[int, int]
+) -> dict[str, Any]:
+    """Decompose NORMALIZED inter-frame pair transforms in PIXEL space and report how
+    translation-pure they are. ok=False means the crop model is questionable for this
+    clip (rotation/zoom/perspective present) — a loud warning, not a hard failure."""
+    w, h = size
+    s = np.diag([1.0 / w, 1.0 / h, 1.0])
+    s_inv = np.diag([float(w), float(h), 1.0])
+    rots: list[float] = []
+    scales: list[float] = []
+    persp: list[float] = []
+    for m in interframe.values():
+        g = s_inv @ np.asarray(m, np.float64) @ s     # back to pixel space
+        g = g / g[2, 2]
+        rots.append(math.degrees(math.atan2(g[1, 0], g[0, 0])))
+        scales.append(math.sqrt(abs(float(np.linalg.det(g[:2, :2])))) - 1.0)
+        persp.append(max(abs(float(g[2, 0])), abs(float(g[2, 1]))))
+    if not rots:
+        return {"ok": True, "n": 0, "max_abs_rot_deg": 0.0, "max_scale_dev": 0.0,
+                "max_perspective": 0.0}
+    rep: dict[str, Any] = {
+        "n": len(rots),
+        "max_abs_rot_deg": float(np.max(np.abs(rots))),
+        "max_scale_dev": float(np.max(np.abs(scales))),
+        "max_perspective": float(np.max(persp)),
+    }
+    rep["ok"] = bool(rep["max_abs_rot_deg"] <= 0.2 and rep["max_scale_dev"] <= 0.005
+                     and rep["max_perspective"] <= 1e-5)
+    return rep
+
+
+def implied_camera(
+    h_g: NDArray[np.floating[Any]], size: tuple[int, int],
+    *, pp_canvas: NDArray[np.floating[Any]],
+) -> tuple[float, NDArray[np.float64]] | None:
+    """REPORT-ONLY physical decomposition of H_g: assuming square pixels and principal
+    point pp_canvas (normalized canvas units — use the mean frame centre), recover the
+    focal (px) from the plane-homography orthonormality constraints and the camera
+    centre (metres). None if the constraints are inconsistent (non-physical H_g)."""
+    w, h = size
+    # pitch[0,1] -> canvas px, then pitch metres -> canvas px
+    a = np.diag([float(w), float(h), 1.0]) @ np.linalg.inv(np.asarray(h_g, np.float64))
+    a = a @ np.diag([1.0 / WIDTH_M, 1.0 / LENGTH_M, 1.0])
+    cx, cy = float(pp_canvas[0]) * w, float(pp_canvas[1]) * h
+    b = np.array([[1.0, 0, -cx], [0, 1.0, -cy], [0, 0, 1.0]]) @ a
+    b1, b2 = b[:, 0], b[:, 1]
+    # with D = diag(1/f^2, 1/f^2, 1): b1' D b2 = 0  and  |D^.5 b1| = |D^.5 b2|
+    n1 = b1[0] * b2[0] + b1[1] * b2[1]
+    d1 = -b1[2] * b2[2]
+    n2 = (b1[0] ** 2 + b1[1] ** 2) - (b2[0] ** 2 + b2[1] ** 2)
+    d2 = b2[2] ** 2 - b1[2] ** 2
+    cands = [n / dd for n, dd in ((n1, d1), (n2, d2)) if abs(dd) > 1e-12 and n / dd > 0]
+    if not cands:
+        return None
+    f2 = float(np.mean(cands))
+    f_px = math.sqrt(f2)
+    m = np.diag([1.0 / f_px, 1.0 / f_px, 1.0]) @ b
+    lam = 1.0 / float(np.linalg.norm(m[:, 0]))
+    r1, r2, t = lam * m[:, 0], lam * m[:, 1], lam * m[:, 2]
+    r3 = np.cross(r1, r2)
+    rmat = np.column_stack([r1, r2, r3])
+    c = -rmat.T @ t
+    return f_px, np.asarray(c, np.float64)

@@ -451,6 +451,113 @@ def frame_confidence(calib: Any, frame: int) -> float:
     return CONF_PROP_MAX - (CONF_PROP_MAX - CONF_PROP_MIN) * min(1.0, gap / GREEN_RADIUS)
 
 
+_NEAR_TL_POINT_IDS = {0, 2}  # near-touchline endpoint landmarks (held out with its lines)
+
+
+@dataclass(frozen=True)
+class CropGateReport:
+    """Held-out acceptance metrics (feet) for a session's crop calibration."""
+
+    fg_median_ft: float
+    fg_p90_ft: float
+    fg_n: int
+    prop_median_ft: float
+    prop_p90_ft: float
+    prop_n: int
+    prop_by_end: dict[str, tuple[float, float, int]]  # end -> (median, p90, n)
+    passed_numeric: bool
+
+
+def foreground_holdout_crop(
+    points: Sequence[Click], lines: Sequence[LineClick], size: tuple[int, int],
+    transforms: Mapping[int, NDArray[np.floating[Any]]],
+    *, segment_of: Mapping[int, int] | None = None,
+    gap_guard: int = DEFAULT_GAP_GUARD,
+) -> list[float]:
+    """Remove ALL near-touchline evidence (its line clicks AND the point landmarks on
+    it), re-solve, then measure the held line clicks' perpendicular error in feet."""
+    held = [lc for lc in lines if lc.line_id == "near_touchline"]
+    if not held:
+        return []
+    rest_l = [lc for lc in lines if lc.line_id != "near_touchline"]
+    rest_p = [c for c in points if c.kp_idx not in _NEAR_TL_POINT_IDS]
+    calib = solve_crop_session(rest_p, rest_l, size, transforms,
+                               segment_of=segment_of, gap_guard=gap_guard)
+    errs: list[float] = []
+    for lc in held:
+        h = calib.frame_homography(lc.frame)
+        if h is None:
+            continue
+        q = _apply(h, np.array([[lc.x, lc.y]]))[0]
+        errs.append(abs(float(q[0])) * float(_SCALE_M[0]) * _FT)
+    return errs
+
+
+def _end_of_frame(clicked: Sequence[Click]) -> str:
+    ys = [float(PITCH_LANDMARKS[c.kp_idx][1]) for c in clicked]
+    m = float(np.mean(ys))
+    return "own" if m < 0.45 else "opp" if m > 0.55 else "both"
+
+
+def propagation_holdout_crop(
+    points: Sequence[Click], lines: Sequence[LineClick], size: tuple[int, int],
+    transforms: Mapping[int, NDArray[np.floating[Any]]],
+    *, segment_of: Mapping[int, int] | None = None,
+    gap_guard: int = DEFAULT_GAP_GUARD,
+) -> tuple[list[float], dict[str, list[float]]]:
+    """Leave-one-anchor-out: drop each clicked frame entirely, re-solve, predict its
+    point clicks. Returns (all errors ft, errors bucketed by which end the held frame
+    saw) — the by-end buckets are the direct F-C1 measurement."""
+    seg = dict(segment_of) if segment_of is not None else {}
+    by_frame: dict[int, list[Click]] = {}
+    for c in points:
+        by_frame.setdefault(c.frame, []).append(c)
+    errs: list[float] = []
+    by_end: dict[str, list[float]] = {}
+    for held, hcs in sorted(by_frame.items()):
+        others = [f for f in by_frame if f != held and seg.get(f, 0) == seg.get(held, 0)]
+        if not others or min(abs(held - f) for f in others) > gap_guard:
+            continue
+        calib = solve_crop_session(
+            [c for c in points if c.frame != held],
+            [lc for lc in lines if lc.frame != held],
+            size, transforms, segment_of=segment_of, gap_guard=gap_guard)
+        h = calib.frame_homography(held)
+        if h is None:
+            continue
+        end = _end_of_frame(hcs)
+        for c in hcs:
+            q = _apply(h, np.array([[c.x, c.y]]))[0]
+            e = float(np.linalg.norm((q - PITCH_LANDMARKS[c.kp_idx]) * _SCALE_M) * _FT)
+            errs.append(e)
+            by_end.setdefault(end, []).append(e)
+    return errs, by_end
+
+
+def evaluate_crop_gate(
+    points: Sequence[Click], lines: Sequence[LineClick], size: tuple[int, int],
+    transforms: Mapping[int, NDArray[np.floating[Any]]],
+    *, segment_of: Mapping[int, int] | None = None,
+    gap_guard: int = DEFAULT_GAP_GUARD,
+) -> CropGateReport:
+    """Numeric acceptance gate (same thresholds as the physical engine's):
+    foreground med <= 5 ft & p90 <= 12 ft AND propagation med <= 5 ft."""
+    fg = foreground_holdout_crop(points, lines, size, transforms,
+                                 segment_of=segment_of, gap_guard=gap_guard)
+    pr, by_end = propagation_holdout_crop(points, lines, size, transforms,
+                                          segment_of=segment_of, gap_guard=gap_guard)
+
+    def _stats(v: list[float]) -> tuple[float, float]:
+        return ((float(np.median(v)), float(np.percentile(v, 90)))
+                if v else (float("inf"), float("inf")))
+
+    fg_med, fg_p90 = _stats(fg)
+    pr_med, pr_p90 = _stats(pr)
+    ends = {k: (*_stats(v), len(v)) for k, v in sorted(by_end.items())}
+    passed = fg_med <= 5.0 and fg_p90 <= 12.0 and pr_med <= 5.0
+    return CropGateReport(fg_med, fg_p90, len(fg), pr_med, pr_p90, len(pr), ends, passed)
+
+
 class CropAssumptionReport(TypedDict):
     """Schema of crop_assumption_report (consumed as-is by the diagnostics CLI)."""
 

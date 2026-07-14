@@ -486,6 +486,45 @@ def test_crop_assumption_report_pass_and_fail(world: CropWorld) -> None:
     assert not rep2["ok"] and rep2["max_abs_rot_deg"] > 1.0
 
 
+def _ntl_line_clicks(world: CropWorld, frame: int, n: int = 3) -> list[LineClick]:
+    d = world.offsets[frame]
+    out: list[LineClick] = []
+    for yv in np.linspace(0.15, 0.85, n):
+        pitch = np.array([[0.0, float(yv)]])                 # ON the near touchline
+        cpt = gc._apply(np.linalg.inv(world.h_g), pitch)[0]  # canvas position
+        out.append(LineClick(frame=frame, line_id="near_touchline",
+                             x=float(cpt[0] - d[0]), y=float(cpt[1] - d[1])))
+    return out
+
+
+def test_foreground_holdout_crop(world: CropWorld) -> None:
+    frames = list(range(0, world.n_frames, 20))
+    clicks = [c for f in frames for c in world.clicks_at(f)]
+    lines = [lc for f in frames[:3] for lc in _ntl_line_clicks(world, f)]
+    errs = gc.foreground_holdout_crop(clicks, lines, SIZE, world.transforms)
+    assert len(errs) == 9
+    assert float(np.median(errs)) < 2.0                       # feet, exact synthetic data
+
+
+def test_propagation_holdout_split_by_end(world: CropWorld) -> None:
+    frames = list(range(0, world.n_frames, 20))
+    clicks = [c for f in frames for c in world.clicks_at(f)]
+    errs, by_end = gc.propagation_holdout_crop(clicks, [], SIZE, world.transforms)
+    assert errs and float(np.median(errs)) < 2.0
+    assert set(by_end) <= {"own", "opp", "both"}
+    assert sum(len(v) for v in by_end.values()) == len(errs)
+
+
+def test_evaluate_crop_gate_passes_on_clean_world(world: CropWorld) -> None:
+    frames = list(range(0, world.n_frames, 20))
+    clicks = [c for f in frames for c in world.clicks_at(f)]
+    lines = [lc for f in frames[:3] for lc in _ntl_line_clicks(world, f)]
+    rep = gc.evaluate_crop_gate(clicks, lines, SIZE, world.transforms)
+    assert rep.passed_numeric
+    assert rep.fg_n == 9 and rep.prop_n > 0
+    assert rep.prop_by_end  # the F-C1 evidence table exists
+
+
 def test_implied_camera_recovers_focal(world: CropWorld) -> None:
     # The symmetric midfield fixture pose makes the ORTHOGONALITY constraint
     # 0/0-degenerate (|d1| far below the 1e-12 guard after b-normalization), so this

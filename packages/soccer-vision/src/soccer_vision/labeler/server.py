@@ -12,7 +12,7 @@ import json
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -220,7 +220,7 @@ def run(
     export_dir: Path | None = None,
     resume: Path | None = None,
     workers: int | None = None,
-    engine: str = "physical",
+    engine: Literal["physical", "crop"] = "physical",
 ) -> None:  # pragma: no cover - launches a blocking server
     """Precompute the chain, open the video, and serve the labeler UI.
 

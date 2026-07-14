@@ -72,3 +72,15 @@ def test_run_gate_passes_on_clean_session(tmp_path: Path) -> None:
 
 def test_run_gate_none_when_chain_missing(tmp_path: Path) -> None:
     assert run_gate(tmp_path / "nope.npz", tmp_path / "x.json") is None
+
+
+def test_crop_gate_from_session() -> None:
+    from soccer_vision.pitch.validate_session import crop_gate_from_session
+
+    from tests.test_global_crop import SIZE, CropWorld
+
+    world = CropWorld()
+    clicks = [c for f in range(0, world.n_frames, 20) for c in world.clicks_at(f)]
+    rep = crop_gate_from_session(clicks, [], SIZE, world.transforms)
+    assert rep.prop_n > 0
+    assert not rep.passed_numeric  # no foreground line clicks -> honest fail

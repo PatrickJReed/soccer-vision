@@ -1,15 +1,19 @@
-"""CLI: acceptance gate for a labeler session's PHYSICAL calibration.
+"""CLI: acceptance gates for a labeler session — PHYSICAL and CROP engines side by side.
 
-Loads a cached inter-frame chain + a clicks sidecar (points AND lines) and runs the
-held-out gate: (1) near-touchline FOREGROUND (remove it, predict it) and (2) leave-one-
-anchor-out bracket PROPAGATION, both in feet. With --video it also renders a few clipped
-overlay spot-checks (including a sparse/no-line frame) for a human to confirm before the
-session is trusted -- numeric metrics under-measure the "lines in the sky" failure.
+Loads a cached inter-frame chain + a clicks sidecar (points AND lines) and runs each
+requested engine's held-out gate: (1) near-touchline FOREGROUND (remove it, predict it)
+and (2) leave-one-anchor-out bracket PROPAGATION, both in feet. The crop engine's report
+adds the by-end propagation table + a per-segment implied camera — the Task-11 evidence
+for whether the global-crop model fixes the cross-pan (F-C1) failure. With --video it
+also renders a few clipped overlay spot-checks (including a sparse/no-line frame) for a
+human to confirm before the session is trusted -- numeric metrics under-measure the
+"lines in the sky" failure.
 
 Usage:
   uv run python -m soccer_vision.pitch.validate_session \\
       --chain  ~/sv-labeler/.sv_labeler_cache/<videohash>.npz \\
       --clicks ~/sv-labeler/.sv_labeler_cache/<clip>.clicks.json \\
+      [--engine both] [--crop-check] \\
       [--video ~/sv-labeler/<clip>.mp4 --spot-out ~/sv-labeler/gate_spotcheck]
 
 Acceptance (numeric): foreground median <= 5 ft & p90 <= 12 ft AND propagation median <= 5 ft.
@@ -19,15 +23,32 @@ from __future__ import annotations
 
 import argparse
 import itertools
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+from numpy.typing import NDArray
 
 from soccer_vision.labeler.chain import load_chain
 from soccer_vision.labeler.state import clicks_from_sidecar, line_clicks_from_sidecar
-from soccer_vision.pitch.manual_anchor import build_segments, cumulative_transforms
+from soccer_vision.pitch.global_crop import (
+    CropCalib,
+    CropGateReport,
+    crop_assumption_report,
+    evaluate_crop_gate,
+    implied_camera,
+    solve_crop_session,
+)
+from soccer_vision.pitch.manual_anchor import (
+    Click,
+    LineClick,
+    build_segments,
+    cumulative_transforms,
+)
 from soccer_vision.pitch.physical_calib import (
     GateReport,
+    PhysicalCalib,
     evaluate_gate,
     solve_session,
 )
@@ -56,6 +77,57 @@ def run_gate(chain_path: Path, clicks_path: Path) -> GateReport | None:
     return evaluate_gate(points, lines, size, transforms, segment_of=segment_of)
 
 
+def crop_gate_from_session(
+    points: list[Click], lines: list[LineClick], size: tuple[int, int],
+    transforms: Mapping[int, NDArray[np.floating[Any]]],
+    *, segment_of: Mapping[int, int] | None = None,
+) -> CropGateReport:
+    """Crop-engine acceptance gate from a loaded session (mirror of run_gate's seam)."""
+    return evaluate_crop_gate(points, lines, size, transforms, segment_of=segment_of)
+
+
+def print_crop_report(
+    points: list[Click], lines: list[LineClick], size: tuple[int, int],
+    transforms: Mapping[int, NDArray[np.floating[Any]]],
+    segment_of: Mapping[int, int] | None,
+) -> None:
+    """Print the crop gate (incl. the by-end F-C1 table) + per-segment implied camera."""
+    rep_c = crop_gate_from_session(points, lines, size, transforms, segment_of=segment_of)
+    print("\n[crop] held-out acceptance gate (feet):")
+    print(f"  foreground   median={rep_c.fg_median_ft:6.2f}  p90={rep_c.fg_p90_ft:6.2f}"
+          f"  n={rep_c.fg_n}")
+    print(f"  propagation  median={rep_c.prop_median_ft:6.2f}  p90={rep_c.prop_p90_ft:6.2f}"
+          f"  n={rep_c.prop_n}")
+    for end, (med, p90, n) in rep_c.prop_by_end.items():
+        print(f"    held frame saw {end:>4}: median={med:6.2f}  p90={p90:6.2f}  n={n}")
+    print(f"  NUMERIC (fg med<=5 & p90<=12, prop med<=5): "
+          f"{'PASS' if rep_c.passed_numeric else 'FAIL'}")
+    calib = solve_crop_session(points, lines, size, transforms, segment_of=segment_of)
+    for seg_id, ss in sorted(calib.segments.items()):
+        centers = np.array([[0.5 + d[0], 0.5 + d[1]] for d in ss.offsets.values()])
+        cam = implied_camera(ss.h_g, size, pp_canvas=centers.mean(axis=0))
+        if cam is not None:
+            f_px, c = cam
+            print(f"  segment {seg_id}: implied focal {f_px:.0f}px  centre "
+                  f"({c[0]:.1f}, {c[1]:.1f}, {c[2]:.1f})m  one_end_capped={ss.one_end_capped}")
+        else:
+            print(f"  segment {seg_id}: implied camera unrecoverable"
+                  f"  one_end_capped={ss.one_end_capped}")
+
+
+def print_crop_check(
+    interframe: Mapping[int, NDArray[np.floating[Any]]], size: tuple[int, int]
+) -> None:
+    """Print the crop-assumption diagnostic: how translation-pure the chain's inter-frame
+    transforms are (ok=False = rotation/zoom/perspective present -> crop model suspect)."""
+    rep = crop_assumption_report(interframe, size)
+    print("crop-assumption diagnostic (inter-frame transforms, pixel space):")
+    print(f"  pairs n={rep['n']}  max |rot|={rep['max_abs_rot_deg']:.4f} deg"
+          f"  max scale dev={rep['max_scale_dev']:.6f}"
+          f"  max perspective={rep['max_perspective']:.2e}")
+    print(f"  crop model: {'OK' if rep['ok'] else 'QUESTIONABLE (rotation/zoom/perspective)'}")
+
+
 def _spot_frames(clicked: list[int], n_frames: int, k: int = 8) -> list[int]:
     """A spread of frames to render: the clicked anchors + evenly-spaced samples across the
     clip (so a viewer sees both anchored and propagated frames)."""
@@ -64,10 +136,13 @@ def _spot_frames(clicked: list[int], n_frames: int, k: int = 8) -> list[int]:
 
 
 def render_spotcheck(
-    chain_path: Path, clicks_path: Path, video_path: Path, out_dir: Path
+    chain_path: Path, clicks_path: Path, video_path: Path, out_dir: Path,
+    *, engine: str = "physical",
 ) -> list[Path]:
     """Render clipped field-overlay PNGs for a spread of frames. Returns the written paths.
-    Off-screen / behind-camera field parts are clipped out (clipped_polyline)."""
+    Off-screen / behind-camera field parts are clipped out (clipped_polyline). `engine`
+    picks the calibration solve ("physical" | "crop"); both expose the same
+    frame_homography/status/is_anchor surface the render loop uses."""
     import cv2
 
     from soccer_vision.viz.pitch_overlay import clipped_polyline
@@ -81,7 +156,11 @@ def render_spotcheck(
     lines = line_clicks_from_sidecar(clicks_path)
     segment_of = build_segments(interframe, n_frames)
     transforms = cumulative_transforms(interframe, segment_of)
-    calib = solve_session(points, lines, size, transforms, segment_of=segment_of)
+    calib: PhysicalCalib | CropCalib
+    if engine == "crop":
+        calib = solve_crop_session(points, lines, size, transforms, segment_of=segment_of)
+    else:
+        calib = solve_session(points, lines, size, transforms, segment_of=segment_of)
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -118,26 +197,46 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--chain", type=Path, required=True, help="cached inter-frame chain .npz")
     ap.add_argument("--clicks", type=Path, required=True, help="clicks sidecar .json")
+    ap.add_argument("--engine", choices=("physical", "crop", "both"), default="both",
+                    help="which calibration engine(s) to gate and render (default: both)")
+    ap.add_argument("--crop-check", action="store_true",
+                    help="also print the crop-assumption diagnostic (chain translation-purity)")
     ap.add_argument("--video", type=Path, default=None, help="video for spot-check renders")
     ap.add_argument("--spot-out", type=Path, default=None, help="dir for spot-check PNGs")
     args = ap.parse_args()
 
-    report = run_gate(args.chain, args.clicks)
-    if report is None:
+    loaded = load_chain(args.chain)
+    if loaded is None:
         raise SystemExit(f"chain cache not found: {args.chain}")
+    interframe, n_frames, size = loaded
+    points = clicks_from_sidecar(args.clicks)
+    lines = line_clicks_from_sidecar(args.clicks)
+    segment_of = build_segments(interframe, n_frames)
+    transforms = cumulative_transforms(interframe, segment_of)
 
-    print("held-out acceptance gate (feet):")
-    print(f"  foreground   median={report.fg_median_ft:6.2f}  p90={report.fg_p90_ft:6.2f}"
-          f"  n={report.fg_n}")
-    print(f"  propagation  median={report.prop_median_ft:6.2f}  p90={report.prop_p90_ft:6.2f}"
-          f"  n={report.prop_n}")
-    print(f"  NUMERIC (fg med<=5 & p90<=12, prop med<=5): "
-          f"{'PASS' if report.passed_numeric else 'FAIL'}")
+    if args.crop_check:
+        print_crop_check(interframe, size)
+
+    if args.engine in ("physical", "both"):
+        report = evaluate_gate(points, lines, size, transforms, segment_of=segment_of)
+        print("\n[physical] held-out acceptance gate (feet):")
+        print(f"  foreground   median={report.fg_median_ft:6.2f}  p90={report.fg_p90_ft:6.2f}"
+              f"  n={report.fg_n}")
+        print(f"  propagation  median={report.prop_median_ft:6.2f}"
+              f"  p90={report.prop_p90_ft:6.2f}  n={report.prop_n}")
+        print(f"  NUMERIC (fg med<=5 & p90<=12, prop med<=5): "
+              f"{'PASS' if report.passed_numeric else 'FAIL'}")
+
+    if args.engine in ("crop", "both"):
+        print_crop_report(points, lines, size, transforms, segment_of)
 
     if args.video is not None:
         out = args.spot_out or Path("gate_spotcheck")
-        paths = render_spotcheck(args.chain, args.clicks, args.video, out)
-        print(f"\nwrote {len(paths)} spot-check overlays -> {out}")
+        engines = ("physical", "crop") if args.engine == "both" else (args.engine,)
+        for eng in engines:
+            dest = out / eng if args.engine == "both" else out
+            paths = render_spotcheck(args.chain, args.clicks, args.video, dest, engine=eng)
+            print(f"\n[{eng}] wrote {len(paths)} spot-check overlays -> {dest}")
         print("REQUIRED: review the spot-checks (incl. a sparse/no-line frame) and confirm "
               "the foreground/overlay before trusting green.")
 

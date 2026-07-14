@@ -439,11 +439,13 @@ def solve_crop_session(
     return CropCalib(segments, tf, seg_of, size, gap_guard)
 
 
-def frame_confidence(calib: Any, frame: int) -> float:
+def frame_confidence(calib: Any, frame: int, *, status: str | None = None) -> float:
     """Honest export confidence for ANY engine exposing status/is_anchor/
     nearest_anchor_gap: 0.9 for a green anchor, 0.8 -> 0.6 ramp across GREEN_RADIUS
-    for propagated green, 0.0 otherwise. Retires the constant-1.0 overclaim (F-C2)."""
-    if calib.status(frame) != "green":
+    for propagated green, 0.0 otherwise. Retires the constant-1.0 overclaim (F-C2).
+    Pass a precomputed `status` to skip re-running calib.status(frame)."""
+    status = calib.status(frame) if status is None else status
+    if status != "green":
         return 0.0
     if calib.is_anchor(frame):
         return CONF_ANCHOR

@@ -7,11 +7,13 @@ Separated from the HTTP server so it is testable without a socket or a video.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -20,6 +22,9 @@ from numpy.typing import NDArray
 from soccer_vision.labeler.chain import denormalize_homography
 from soccer_vision.labeler.refit_worker import RefitWorker
 from soccer_vision.pipeline import homographies_to_parquet
+from soccer_vision.pitch.global_crop import (
+    GREEN_RADIUS as _GC_GREEN_RADIUS,
+)
 from soccer_vision.pitch.global_crop import (
     CropCalib,
     evaluate_crop_gate,
@@ -39,7 +44,14 @@ from soccer_vision.pitch.physical_calib import (
     PhysicalCalib,
     solve_session,
 )
+from soccer_vision.pitch.physical_calib import (
+    GREEN_RADIUS as _PC_GREEN_RADIUS,
+)
 from soccer_vision.pitch.propagation import HomographyEntry
+
+# frame_confidence ramps over global_crop's GREEN_RADIUS for BOTH engines; the two
+# engines' green radii must agree or the ramp misgrades physical-engine frames.
+assert _GC_GREEN_RADIUS == _PC_GREEN_RADIUS
 
 
 @dataclass(frozen=True, eq=False)
@@ -47,11 +59,17 @@ class CalibFrame:
     """A calibrated per-frame result in the labeler's normalized space."""
 
     H: NDArray[np.float64]  # NORMALIZED image -> pitch[0,1] (frontend overlay)
-    status: str             # "green" | "yellow" | "red" (physical per-frame status)
+    status: str             # "green" | "yellow" | "red" (engine's per-frame grading)
     is_anchor: bool         # True if this frame was directly clicked and solved as a pose
     residual: float | None  # diagnostic only (unused by the physical gate); None = n/a
     n_points: int           # point clicks on this anchor frame (0 for propagated frames)
     confidence: float       # honest export confidence (0.9 anchor / 0.8->0.6 ramp / 0.0)
+
+
+def _finite_or_none(x: float) -> float | None:
+    """Strict-JSON safety: json.dumps writes bare Infinity/NaN, which jq/JS reject —
+    serialize non-finite gate stats as null instead."""
+    return x if math.isfinite(x) else None
 
 
 class LabelerState:
@@ -72,8 +90,10 @@ class LabelerState:
         autosave_path: Path | None = None,
         # "physical" = shared-focal per-frame poses; "crop" = one H_g per segment +
         # 2-DOF per-frame crop offsets (the Trace virtual-PTZ model).
-        engine: str = "physical",
+        engine: Literal["physical", "crop"] = "physical",
     ) -> None:
+        if engine not in ("physical", "crop"):  # argparse choices only guard the CLI path
+            raise ValueError(f"unknown engine {engine!r}: expected 'physical' or 'crop'")
         self.n_frames = n_frames
         self._engine = engine
         self.size = size
@@ -89,8 +109,9 @@ class LabelerState:
         self.line_clicks: list[LineClick] = []
         self._seq: list[str] = []  # insertion order across clicks ("pt") + line_clicks ("ln")
         self._fits: dict[int, CalibFrame] = {}
-        # warm-start seed for the next physical solve (unused by the crop engine)
-        self._last_calib: PhysicalCalib | CropCalib | None = None
+        # warm-start seed for the next physical solve (the crop engine takes no seed
+        # and never writes this)
+        self._last_calib: PhysicalCalib | None = None
         self._gap_guard = DEFAULT_GAP_GUARD
         self._K: NDArray[np.float64] | None = None
         self._calibrated = False
@@ -145,15 +166,12 @@ class LabelerState:
         with self._lock:
             clicks = list(self._active_clicks())  # stable COPY for the lock-free solve
             lines = list(self.line_clicks)
-            seed = self._last_calib               # warm-start from the prior solution
         if self._engine == "crop":
-            calib_c = solve_crop_session(
+            return solve_crop_session(
                 clicks, lines, self.size, self._transforms,
                 segment_of=self._segment_of, gap_guard=self._gap_guard)
-            with self._lock:
-                self._last_calib = calib_c
-            return calib_c
-        assert not isinstance(seed, CropCalib)  # the engine is fixed for a session's life
+        with self._lock:
+            seed = self._last_calib               # warm-start from the prior solution
         calib = solve_session(
             clicks, lines, self.size, self._transforms,
             segment_of=self._segment_of, gap_guard=self._gap_guard, seed=seed)
@@ -171,13 +189,14 @@ class LabelerState:
         if h is None:
             return None
         anchor = calib.is_anchor(f)
+        status = calib.status(f)  # computed once: shared by the CalibFrame + the ramp
         return CalibFrame(
             H=h,
-            status=calib.status(f),
+            status=status,
             is_anchor=anchor,
             residual=None,
             n_points=counts.get(f, 0) if anchor else 0,
-            confidence=frame_confidence(calib, f),
+            confidence=frame_confidence(calib, f, status=status),
         )
 
     def _compute_dirty(
@@ -443,11 +462,15 @@ class LabelerState:
             n_anchors = len({c.frame for c in pts})
             (out / "calib_gate.json").write_text(json.dumps({
                 "engine": "crop",
-                "fg_median_ft": rep.fg_median_ft, "fg_p90_ft": rep.fg_p90_ft,
+                "fg_median_ft": _finite_or_none(rep.fg_median_ft),
+                "fg_p90_ft": _finite_or_none(rep.fg_p90_ft),
                 "fg_n": rep.fg_n,
-                "prop_median_ft": rep.prop_median_ft, "prop_p90_ft": rep.prop_p90_ft,
+                "prop_median_ft": _finite_or_none(rep.prop_median_ft),
+                "prop_p90_ft": _finite_or_none(rep.prop_p90_ft),
                 "prop_n": rep.prop_n, "n_anchors": n_anchors,
-                "prop_by_end": {k: list(v) for k, v in rep.prop_by_end.items()},
+                "prop_by_end": {
+                    k: [_finite_or_none(med), _finite_or_none(p90), n]
+                    for k, (med, p90, n) in rep.prop_by_end.items()},
                 "passed_numeric": rep.passed_numeric,
             }, indent=2))
         if self.line_clicks:

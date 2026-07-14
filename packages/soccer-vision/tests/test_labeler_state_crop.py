@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 from numpy.typing import NDArray
 from soccer_vision.labeler.state import LabelerState
 
@@ -23,6 +24,15 @@ def _interframe(world: CropWorld) -> dict[int, NDArray[np.float64]]:
 def _state(world: CropWorld, tmp_path: Path) -> LabelerState:
     return LabelerState(interframe=_interframe(world), n_frames=world.n_frames, size=SIZE,
                         autosave_path=tmp_path / "clicks.json", engine="crop")
+
+
+def test_invalid_engine_rejected() -> None:
+    """The runtime guard fires for non-CLI constructions (argparse choices only guard
+    the CLI; the Literal type only guards type-checked callers)."""
+    world = CropWorld()
+    with pytest.raises(ValueError, match="unknown engine"):
+        LabelerState(interframe=_interframe(world), n_frames=world.n_frames, size=SIZE,
+                     engine="banana")  # type: ignore[arg-type]
 
 
 def test_crop_bootstrap_single_frame(tmp_path: Path) -> None:
@@ -58,7 +68,11 @@ def test_export_honest_confidence_and_gate_json(tmp_path: Path) -> None:
     assert not (df["confidence"] == 1.0).any()          # the F-C2 overclaim is retired
     gate = json.loads((out / "calib_gate.json").read_text())
     assert gate["engine"] == "crop"
-    assert "prop_by_end" in gate and isinstance(gate["passed_numeric"], bool)
+    assert "prop_by_end" in gate
+    assert gate["passed_numeric"] is False        # no foreground lines in this session
+    # non-finite stats serialize as null (strict-JSON safety): the fg holdout is empty
+    assert gate["fg_median_ft"] is None and gate["fg_p90_ft"] is None
+    assert gate["prop_n"] > 0 and gate["prop_median_ft"] is not None
     assert gate["n_anchors"] >= 1
 
 
@@ -82,6 +96,9 @@ def test_point_click_dirty_scoped_to_segment(tmp_path: Path) -> None:
         st._worker.mark_dirty = lambda frames: marked.extend(frames)  # type: ignore[method-assign]
         c = world.clicks_at(150)[0]
         st.add_click(150, c.kp_idx, c.x, c.y)
-        assert marked and min(marked) >= 120        # only the second segment re-solves
+        # exactly frame 150's segment re-solves — no more (physical would dirty all
+        # frames for the shared focal), no fewer (the whole segment shares its H_g)
+        assert set(marked) == {f for f in range(world.n_frames)
+                               if st._segment_of.get(f) == st._segment_of.get(150)}
     finally:
         st.stop_worker()

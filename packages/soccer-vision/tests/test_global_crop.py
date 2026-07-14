@@ -141,3 +141,42 @@ def test_residuals_are_metres(world: CropWorld) -> None:
     lx, ly = gc._apply(inv, np.array([[0.6, 0.5 + off]]))[0] - world.offsets[f]
     rl2 = gc._line_residuals_m(world.h_g, world.offsets[f], [("midline", float(lx), float(ly))])
     assert abs(rl2[0] - off * LENGTH_M) < 1e-9
+
+
+def test_fit_h_g_recovers_truth(world: CropWorld) -> None:
+    canvas_pts: list[list[float]] = []
+    pitch_pts: list[NDArray[np.float64]] = []
+    for f in range(0, world.n_frames, 20):
+        for c in world.clicks_at(f):
+            d = world.offsets[f]
+            canvas_pts.append([c.x + d[0], c.y + d[1]])
+            pitch_pts.append(PITCH_LANDMARKS[c.kp_idx])
+    h = gc._fit_h_g(np.array(canvas_pts), np.array(pitch_pts))
+    assert h is not None
+    q = gc._apply(h, np.array(canvas_pts))
+    assert np.abs((q - np.array(pitch_pts)) * gc._SCALE_M).max() < 0.05  # < 5 cm
+
+
+def test_fit_h_g_rejects_outlier(world: CropWorld) -> None:
+    canvas_pts: list[list[float]] = []
+    pitch_pts: list[NDArray[np.float64]] = []
+    for f in range(0, world.n_frames, 20):
+        for c in world.clicks_at(f):
+            d = world.offsets[f]
+            canvas_pts.append([c.x + d[0], c.y + d[1]])
+            pitch_pts.append(PITCH_LANDMARKS[c.kp_idx])
+    canvas_pts[0] = [canvas_pts[0][0] + 0.2, canvas_pts[0][1] + 0.2]  # gross outlier
+    h = gc._fit_h_g(np.array(canvas_pts), np.array(pitch_pts))
+    assert h is not None
+    q = gc._apply(h, np.array(canvas_pts[1:]))
+    assert np.abs((q - np.array(pitch_pts[1:])) * gc._SCALE_M).max() < 0.05
+
+
+def test_fit_h_g_degenerate_inputs(world: CropWorld) -> None:
+    three = np.array([[0.1, 0.1], [0.2, 0.2], [0.3, 0.1]])
+    assert gc._fit_h_g(three, three) is None                       # < 4 points
+    col_c = np.array([[0.1, 0.1], [0.2, 0.2], [0.3, 0.3], [0.4, 0.4]])
+    col_p = np.array([[0.0, 0.0], [0.0, 0.3], [0.0, 0.6], [0.0, 0.9]])
+    assert gc._fit_h_g(col_c, col_p) is None                       # collinear landmarks
+    tiny = np.array([[0.5, 0.5], [0.51, 0.5], [0.5, 0.51], [0.51, 0.51]])
+    assert gc._fit_h_g(tiny, tiny * 0.01 + 0.5) is None            # hull too small

@@ -16,8 +16,10 @@ from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.spatial import ConvexHull, QhullError  # type: ignore[import-untyped]
 
 from soccer_vision.calib.field_model import FIELD_LINES, LENGTH_M, METRES_TO_FEET, WIDTH_M
+from soccer_vision.pitch.homography import HomographyError, fit_homography
 from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 
 RANSAC_THRESH_PITCH = 0.012   # global-fit inlier gate, pitch units (~0.55-0.8 m per axis)
@@ -68,6 +70,33 @@ def _apply(h: NDArray[np.floating[Any]], pts: NDArray[np.floating[Any]]) -> NDAr
     p = np.column_stack([np.asarray(pts, np.float64), np.ones(len(pts))])
     q = (np.asarray(h, np.float64) @ p.T).T
     return np.asarray(q[:, :2] / q[:, 2:3], np.float64)
+
+
+def _fit_h_g(
+    canvas_pts: NDArray[np.floating[Any]], pitch_pts: NDArray[np.floating[Any]]
+) -> NDArray[np.float64] | None:
+    """RANSAC global fit canvas->pitch. None when the constraints are degenerate:
+    < 4 distinct landmarks, or their pitch spread (hull area) is too small to pin a
+    homography — the bootstrap-wait semantic (red, never a garbage fit)."""
+    if len(canvas_pts) < 4:
+        return None
+    distinct = np.unique(np.round(np.asarray(pitch_pts, np.float64), 6), axis=0)
+    if len(distinct) < 4:
+        return None
+    try:
+        if ConvexHull(distinct).volume < HULL_AREA_MIN:  # 2-D: volume == area
+            return None
+    except QhullError:
+        return None  # collinear
+    try:
+        h = fit_homography(
+            np.asarray(canvas_pts, np.float64),
+            np.asarray(pitch_pts, np.float64),
+            ransac_thresh=RANSAC_THRESH_PITCH,
+        )
+    except HomographyError:
+        return None
+    return np.asarray(h, np.float64)
 
 
 def _point_residuals_m(

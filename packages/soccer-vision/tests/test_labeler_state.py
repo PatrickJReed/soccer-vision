@@ -105,6 +105,32 @@ def test_uncalibrated_below_three_diverse_frames() -> None:
         st.stop_worker()
 
 
+def test_calibframe_h_sign_normalized_for_frontend_clip() -> None:
+    """CalibFrame.H is served to the frontend, whose overlay JS clips on homogeneous
+    w > 0. H and -H are projectively identical, but pose-derived ANCHOR homographies
+    (h22 < 0) and findHomography-propagated brackets (h22 = +1) carry OPPOSITE global
+    signs — unnormalized, propagated frames map the image centre with w < 0 and their
+    overlays render empty. Every served H must map the image centre (normalized
+    (0.5, 0.5)) with w > 0, across BOTH anchor and propagated frames."""
+    interframe, _poses, clicks = _pan_session(9)
+    st = LabelerState(interframe, 9, size=SIZE)
+    try:
+        st.add_clicks(clicks)
+        st.wait_idle(timeout=10)
+        centre = np.array([0.5, 0.5, 1.0])
+        n_anchor = n_prop = 0
+        for f in range(9):
+            cf = st.frame_homography(f)
+            if cf is None:
+                continue
+            n_anchor, n_prop = n_anchor + cf.is_anchor, n_prop + (not cf.is_anchor)
+            w_c = float((cf.H @ centre)[2])
+            assert w_c > 0, f"frame {f} (anchor={cf.is_anchor}): centre w={w_c:.4f}"
+        assert n_anchor > 0 and n_prop > 0  # both sign families exercised
+    finally:
+        st.stop_worker()
+
+
 # ---- coverage-graded status ----
 def test_anchor_is_yellow_without_near_touchline() -> None:
     interframe, _poses, clicks = _pan_session(9)

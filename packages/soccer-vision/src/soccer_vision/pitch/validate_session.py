@@ -135,6 +135,21 @@ def _spot_frames(clicked: list[int], n_frames: int, k: int = 8) -> list[int]:
     return sorted(set(clicked) | set(spread))
 
 
+def _sign_fixed_pitch_to_px(
+    h_norm: NDArray[np.floating[Any]], size: tuple[int, int]
+) -> NDArray[np.float64]:
+    """Pitch->pixel map from a NORMALIZED image->pitch homography, sign-normalized so the
+    FIELD centre projects with w > 0. Global-sign ambiguity (H = -H projectively):
+    findHomography-propagated frames (h22 = +1) carry the opposite sign from pose-derived
+    anchors (h22 < 0), and clipped_polyline clips on w > 0 — unnormalized, sign-flipped
+    frames render empty overlays."""
+    w, h = size
+    p = np.diag([float(w), float(h), 1.0]) @ np.linalg.inv(np.asarray(h_norm, np.float64))
+    if float((p @ np.array([0.5, 0.5, 1.0]))[2]) < 0.0:
+        p = -p
+    return np.asarray(p, np.float64)
+
+
 def render_spotcheck(
     chain_path: Path, clicks_path: Path, video_path: Path, out_dir: Path,
     *, engine: str = "physical",
@@ -151,7 +166,6 @@ def render_spotcheck(
     if loaded is None:
         return []
     interframe, n_frames, size = loaded
-    w, h = size
     points = clicks_from_sidecar(clicks_path)
     lines = line_clicks_from_sidecar(clicks_path)
     segment_of = build_segments(interframe, n_frames)
@@ -177,7 +191,7 @@ def render_spotcheck(
         ok, frame = cap.read()
         if not ok:
             continue
-        h_pitch_to_px = np.diag([float(w), float(h), 1.0]) @ np.linalg.inv(h_norm)
+        h_pitch_to_px = _sign_fixed_pitch_to_px(h_norm, size)
         for a, b in _SKELETON:
             samples = np.linspace(a, b, 50)
             # Clip per-segment so a line that exits the frame / dips behind the camera

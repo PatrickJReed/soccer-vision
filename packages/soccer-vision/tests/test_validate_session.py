@@ -74,6 +74,26 @@ def test_run_gate_none_when_chain_missing(tmp_path: Path) -> None:
     assert run_gate(tmp_path / "nope.npz", tmp_path / "x.json") is None
 
 
+def test_sign_fixed_pitch_to_px_global_sign_invariant() -> None:
+    """render_spotcheck draws via clipped_polyline, which clips on homogeneous w > 0.
+    H and -H are projectively identical, but pose-derived anchors (h22 < 0) and
+    findHomography-propagated frames (h22 = +1) carry opposite global signs — the
+    helper must return a pitch->pixel map whose FIELD centre projects with w > 0
+    regardless of the input's global sign, and identically for H and -H."""
+    from soccer_vision.pitch.calib_anchor import frame_homography
+    from soccer_vision.pitch.validate_session import _sign_fixed_pitch_to_px
+
+    rvec, tvec = _look_at((-8.0, 34.0, 9.0), (22.85, 34.0, 0.0))
+    h_px = np.asarray(frame_homography(_K, rvec, tvec), np.float64)
+    h_norm = h_px @ np.diag([float(SIZE[0]), float(SIZE[1]), 1.0])
+    centre = np.array([0.5, 0.5, 1.0])
+    a = _sign_fixed_pitch_to_px(h_norm, SIZE)
+    b = _sign_fixed_pitch_to_px(-h_norm, SIZE)
+    assert float((a @ centre)[2]) > 0
+    assert float((b @ centre)[2]) > 0
+    np.testing.assert_allclose(a, b)
+
+
 def test_crop_gate_from_session() -> None:
     from soccer_vision.pitch.validate_session import crop_gate_from_session
 

@@ -194,6 +194,11 @@ class LabelerState:
         h = calib.frame_homography(f)
         if h is None:
             return None
+        # Global-sign ambiguity (H = -H projectively): findHomography-propagated frames
+        # (h22 = +1) carry the opposite sign from pose-derived anchors (h22 < 0), and the
+        # frontend overlay JS clips on w > 0 — serve H with the image centre at w > 0.
+        if float((h @ np.array([0.5, 0.5, 1.0]))[2]) < 0.0:
+            h = -h
         anchor = calib.is_anchor(f)
         status = calib.status(f)  # computed once: shared by the CalibFrame + the ramp
         return CalibFrame(

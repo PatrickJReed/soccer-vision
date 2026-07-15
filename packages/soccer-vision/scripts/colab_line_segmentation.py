@@ -27,6 +27,7 @@ import json
 import math
 import random
 import sys
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -43,7 +44,9 @@ OUT_DIR = Path("/content/drive/MyDrive/soccer-vision/line_seg_v0")
 # Honest-eval split config
 HELDOUT_FIELDS: list[str] = []   # tier 3: field-held-out TEST (final-only)
 HELDOUT_GAMES: list[str] = []    # tier 2: game-held-out val2 (final-only)
-HELDOUT_VIEW_FRACTION = 0.25     # tier 1: per-game seeded view holdout -> val1
+HELDOUT_VIEW_FRACTION = 0.25     # tier 1: per-game seeded view holdout -> val1;
+#                                  0.0 DISABLES the view holdout entirely (val1 is
+#                                  then empty and reported "not evaluable")
 SEED = 0
 TIME_BLOCK_TRAIN_FRAC = 0.85     # degraded v0 mode: first 85% of frames -> train
 
@@ -135,6 +138,7 @@ def assign_tiers(
     val1  : per remaining game, a seeded heldout_view_fraction of its distinct
             view_ids (tier 1) — per-epoch model selection. Rows with view_id == -1
             inside a view-labeled game stay in train (they can't be view-held).
+            heldout_view_fraction == 0 disables the view holdout entirely.
     degraded v0: if ALL remaining rows have view_id == -1, per-game TIME-BLOCKED
             split (first TIME_BLOCK_TRAIN_FRAC of frames train, rest val1) + loud
             banner. NEVER a random frame split.
@@ -152,11 +156,11 @@ def assign_tiers(
         print(_DEGRADED_BANNER)
         for _gid, g in df.loc[rem].groupby("game_id"):
             order = g.sort_values("frame").index
-            n_train = int(len(order) * TIME_BLOCK_TRAIN_FRAC)
-            if len(order) > 1:  # keep both sides non-empty when possible
-                n_train = max(1, min(len(order) - 1, n_train))
+            n_train = max(1, int(len(order) * TIME_BLOCK_TRAIN_FRAC))
+            if len(order) > 1:  # keep val1 non-empty when possible;
+                n_train = min(len(order) - 1, n_train)  # a 1-row game just trains
             df.loc[order[n_train:], "tier"] = "val1"
-    else:
+    elif heldout_view_fraction > 0:  # 0.0 disables the tier-1 view holdout
         for gid, g in df.loc[rem].groupby("game_id"):
             views = sorted(int(v) for v in g["view_id"].unique() if v != -1)
             if len(views) < 2:
@@ -170,12 +174,15 @@ def assign_tiers(
     return df, degraded
 
 
-def summarize_tiers(df: pd.DataFrame) -> str:
-    """Per-tier row counts. Empty tiers are reported 'not evaluable', never silent."""
+def summarize_tiers(df: pd.DataFrame, degraded: bool = False) -> str:
+    """Per-tier row counts. Empty tiers are reported 'not evaluable', never silent.
+    With degraded=True, val1 is labeled time-blocked (it is NOT view-held-out)."""
     lines = []
     for tier in ("train", "val1", "val2", "test"):
         sub = df[df["tier"] == tier]
         desc = _TIER_DESC[tier]
+        if tier == "val1" and degraded:
+            desc = "tier 1 (time-blocked val1, degraded mode)"
         if len(sub) == 0:
             lines.append(f"{desc:<46} not evaluable with this config (0 rows)")
         else:
@@ -272,11 +279,11 @@ if RUN_CELLS:
     tiers_df, degraded_split = assign_tiers(
         manifest, heldout_fields=HELDOUT_FIELDS, heldout_games=HELDOUT_GAMES,
         heldout_view_fraction=HELDOUT_VIEW_FRACTION, seed=SEED)
-    print(summarize_tiers(tiers_df))
+    print(summarize_tiers(tiers_df, degraded_split))
 
 
 # %%
-# ---- Data pipeline (defined lazily: --dry-run must never import torch) ---------
+# ---- Data pipeline (torch imports lazy inside methods: --dry-run never sees them)
 def _read_pair(dataset_dir, row):
     """(RGB uint8 HxWx3 image, uint8 HxW class mask) for one manifest row."""
     import cv2
@@ -288,9 +295,13 @@ def _read_pair(dataset_dir, row):
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB), msk
 
 
-def make_datasets(tiers_df, dataset_dir, *, crop=CROP, val_size=VAL_SIZE,
-                  line_bias=LINE_CROP_BIAS):
-    """{tier: torch Dataset} for the non-empty tiers.
+class LineSegDataset:
+    """Map-style dataset over manifest rows (train: augmented crops; val: resize).
+
+    Duck-typed for torch's DataLoader (__len__/__getitem__ only): no torch base
+    class, so importing this module never pulls in torch (--dry-run), and the
+    class is MODULE-LEVEL so it pickles under spawn-start DataLoader workers
+    (Colab forks, but the local-box mode on macOS spawns).
 
     Train: random crop x crop window, ~line_bias of draws recentered on a random
     line pixel (so batches aren't all grass) + hflip (classes are side-merged:
@@ -300,27 +311,33 @@ def make_datasets(tiers_df, dataset_dir, *, crop=CROP, val_size=VAL_SIZE,
     identical for every tier, so IoUs stay comparable.
 
     Augmentation randomness uses the GLOBAL `random` module: torch DataLoader
-    reseeds it per worker per epoch from torch's (manually seeded) generator, so
-    crops vary across epochs yet the run stays reproducible.
+    reseeds it per worker per epoch from torch's manually-seeded generator, so
+    the augmentation STREAM is reproducible run-to-run. Full GPU training is
+    still NOT bitwise-deterministic (cudnn determinism is not pinned — accepted).
     """
-    import cv2
-    import torch
-    from torch.utils.data import Dataset
-    from torchvision import transforms
 
-    jitter = transforms.ColorJitter(brightness=0.2, contrast=0.2,
-                                    saturation=0.2, hue=0.02)
-    mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
-    std = torch.tensor(IMAGENET_STD).view(3, 1, 1)
+    def __init__(self, rows, dataset_dir, *, train, crop=CROP, val_size=VAL_SIZE,
+                 line_bias=LINE_CROP_BIAS):
+        self.rows = rows.reset_index(drop=True)
+        self.dataset_dir = dataset_dir
+        self.train = train
+        self.crop = crop
+        self.val_size = val_size
+        self.line_bias = line_bias
+        self._jitter = None  # built lazily: torchvision import stays out of --dry-run
 
-    def _train_crop(img, msk):
+    def __len__(self):
+        return len(self.rows)
+
+    def _train_crop(self, img, msk):
+        crop = self.crop
         h, w = msk.shape
         if h < crop or w < crop:  # defensive: pad small frames with background
             img = np.pad(img, ((0, max(0, crop - h)), (0, max(0, crop - w)), (0, 0)))
             msk = np.pad(msk, ((0, max(0, crop - h)), (0, max(0, crop - w))))
             h, w = msk.shape
         y0, x0 = random.randint(0, h - crop), random.randint(0, w - crop)
-        if random.random() < line_bias:
+        if random.random() < self.line_bias:
             ys, xs = np.nonzero(msk)
             if len(xs):  # recenter on a random line pixel, jittered, clamped
                 j = random.randrange(len(xs))
@@ -330,33 +347,39 @@ def make_datasets(tiers_df, dataset_dir, *, crop=CROP, val_size=VAL_SIZE,
                 x0 = min(max(cx - crop // 2, 0), w - crop)
         return img[y0:y0 + crop, x0:x0 + crop], msk[y0:y0 + crop, x0:x0 + crop]
 
-    class LineSegDataset(Dataset):
-        def __init__(self, rows, train):
-            self.rows = rows.reset_index(drop=True)
-            self.train = train
+    def __getitem__(self, i):
+        import cv2
+        import torch
 
-        def __len__(self):
-            return len(self.rows)
+        img, msk = _read_pair(self.dataset_dir, self.rows.iloc[i])
+        if self.train:
+            img, msk = self._train_crop(img, msk)
+            if random.random() < 0.5:
+                img, msk = img[:, ::-1], msk[:, ::-1]
+        else:
+            img = cv2.resize(img, (self.val_size, self.val_size),
+                             interpolation=cv2.INTER_LINEAR)
+            msk = cv2.resize(msk, (self.val_size, self.val_size),
+                             interpolation=cv2.INTER_NEAREST)
+        x = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1)
+        x = x.float() / 255.0
+        if self.train:
+            if self._jitter is None:
+                from torchvision import transforms
+                self._jitter = transforms.ColorJitter(brightness=0.2, contrast=0.2,
+                                                      saturation=0.2, hue=0.02)
+            x = self._jitter(x)
+        x = (x - torch.tensor(IMAGENET_MEAN).view(3, 1, 1)) \
+            / torch.tensor(IMAGENET_STD).view(3, 1, 1)
+        return x, torch.from_numpy(np.ascontiguousarray(msk)).long()
 
-        def __getitem__(self, i):
-            img, msk = _read_pair(dataset_dir, self.rows.iloc[i])
-            if self.train:
-                img, msk = _train_crop(img, msk)
-                if random.random() < 0.5:
-                    img, msk = img[:, ::-1], msk[:, ::-1]
-            else:
-                img = cv2.resize(img, (val_size, val_size),
-                                 interpolation=cv2.INTER_LINEAR)
-                msk = cv2.resize(msk, (val_size, val_size),
-                                 interpolation=cv2.INTER_NEAREST)
-            x = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1)
-            x = x.float() / 255.0
-            if self.train:
-                x = jitter(x)
-            x = (x - mean) / std
-            return x, torch.from_numpy(np.ascontiguousarray(msk)).long()
 
-    return {tier: LineSegDataset(tiers_df[tiers_df["tier"] == tier], tier == "train")
+def make_datasets(tiers_df, dataset_dir, *, crop=CROP, val_size=VAL_SIZE,
+                  line_bias=LINE_CROP_BIAS):
+    """{tier: LineSegDataset} for the non-empty tiers."""
+    return {tier: LineSegDataset(tiers_df[tiers_df["tier"] == tier], dataset_dir,
+                                 train=(tier == "train"), crop=crop,
+                                 val_size=val_size, line_bias=line_bias)
             for tier in ("train", "val1", "val2", "test")
             if (tiers_df["tier"] == tier).any()}
 
@@ -432,19 +455,35 @@ def build_model():
         label2id={v: k for k, v in CLASS_NAMES.items()})
 
 
+def _json_safe(obj):
+    """Recursively replace non-finite floats (nan/inf) with None — strict-JSON
+    safety for the sidecar (per-class IoU is nan when a class is absent from a
+    small val1, and json.dumps would otherwise emit invalid JSON)."""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj
+
+
 def train_model(tiers_df, dataset_dir, out_dir, *, epochs=EPOCHS, batch=BATCH,
                 lr=LR, crop=CROP, val_size=VAL_SIZE, lr_schedule=LR_SCHEDULE,
                 max_batches=None, seed=SEED, extra_config=None):
     """Train with class-weighted CE; select on val1 mean line-IoU per epoch.
-    Best checkpoint -> out_dir/best_model + config-echo sidecar train_config.json.
-    max_batches caps batches per epoch (smoke test). Returns (model, dsets, best,
-    history) — model is the LAST-epoch state; reload best_model for final eval.
+    Best checkpoint -> out_dir/best_model + config-echo sidecar train_config.json,
+    both stamped with this run's run_id (the final-eval cell uses it to refuse a
+    stale Drive checkpoint). max_batches caps batches per epoch (smoke test).
+    Returns (model, dsets, best, history) — model is the LAST-epoch state; reload
+    best_model for final eval.
     """
     import torch
     import torch.nn.functional as F
     from torch.utils.data import DataLoader
 
     seed_everything(seed)
+    run_id = uuid.uuid4().hex  # ties OUT_DIR's checkpoint/sidecar to THIS run
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     dsets = make_datasets(tiers_df, dataset_dir, crop=crop, val_size=val_size)
@@ -469,6 +508,7 @@ def train_model(tiers_df, dataset_dir, out_dir, *, epochs=EPOCHS, batch=BATCH,
                     drop_last=len(dsets["train"]) > batch)
 
     config_echo = {
+        "run_id": run_id,
         "model_name": MODEL_NAME, "dataset_dir": str(dataset_dir),
         "epochs": epochs, "batch": batch, "lr": lr, "lr_schedule": lr_schedule,
         "crop": crop, "val_size": val_size, "line_crop_bias": LINE_CROP_BIAS,
@@ -480,7 +520,7 @@ def train_model(tiers_df, dataset_dir, out_dir, *, epochs=EPOCHS, batch=BATCH,
                         for t in ("train", "val1", "val2", "test")},
         **(extra_config or {}),
     }
-    best = {"epoch": -1, "val1_mean_line_iou": float("-inf")}
+    best = {"epoch": -1, "val1_mean_line_iou": float("-inf"), "run_id": run_id}
     history = []
     for epoch in range(epochs):
         model.train()
@@ -509,17 +549,18 @@ def train_model(tiers_df, dataset_dir, out_dir, *, epochs=EPOCHS, batch=BATCH,
             title=f"epoch {epoch}: train loss {train_loss:.4f} — tier 1 (val1)"))
         if not math.isnan(mean_line) and mean_line > best["val1_mean_line_iou"]:
             best = {"epoch": epoch, "val1_mean_line_iou": mean_line,
-                    "val1_iou": {CLASS_NAMES[c]: iou[c] for c in CLASS_NAMES}}
+                    "val1_iou": {CLASS_NAMES[c]: iou[c] for c in CLASS_NAMES},
+                    "run_id": run_id}
             model.save_pretrained(out_dir / "best_model")
-            (out_dir / "train_config.json").write_text(json.dumps(
-                {**config_echo, "best": best, "history": history}, indent=2))
+            (out_dir / "train_config.json").write_text(json.dumps(_json_safe(
+                {**config_echo, "best": best, "history": history}), indent=2))
             print(f"  ** new best -> {out_dir / 'best_model'}")
     if best["epoch"] < 0:
         print("WARNING: no epoch produced a finite val1 mean line-IoU — "
               "no checkpoint saved")
     else:
-        (out_dir / "train_config.json").write_text(json.dumps(
-            {**config_echo, "best": best, "history": history}, indent=2))
+        (out_dir / "train_config.json").write_text(json.dumps(_json_safe(
+            {**config_echo, "best": best, "history": history}), indent=2))
     return model, dsets, best, history
 
 
@@ -534,7 +575,7 @@ if RUN_CELLS and SMOKE_TEST:
     smoke_manifest = load_manifest(SMOKE_DATASET_DIR)
     smoke_tiers, smoke_degraded = assign_tiers(
         smoke_manifest, heldout_fields=[], heldout_games=[], seed=SEED)
-    print(summarize_tiers(smoke_tiers))
+    print(summarize_tiers(smoke_tiers, smoke_degraded))
     train_model(smoke_tiers, SMOKE_DATASET_DIR, "/content/line_seg_smoke",
                 epochs=2, batch=2, crop=256, max_batches=8, lr=LR,
                 extra_config={"smoke": True, "degraded_split": smoke_degraded})
@@ -560,18 +601,31 @@ if RUN_CELLS and RUN_FULL_TRAINING:
 
 # %%
 if RUN_CELLS and RUN_FULL_TRAINING:
-    import torch
-    from transformers import SegformerForSemanticSegmentation
+    # Stale-checkpoint guard: OUT_DIR lives on Drive and survives sessions. Only
+    # evaluate if THIS run saved a best checkpoint AND the sidecar on Drive still
+    # carries this run's run_id — otherwise warn loudly and skip, never silently
+    # score a stale model from an earlier run.
+    _sidecar_path = OUT_DIR / "train_config.json"
+    _sidecar = json.loads(_sidecar_path.read_text()) if _sidecar_path.exists() else {}
+    if best["epoch"] < 0 or _sidecar.get("run_id") != best["run_id"]:
+        print("WARNING: OUT_DIR/best_model is NOT from this run (no best epoch "
+              "saved, or the Drive sidecar's run_id does not match) — SKIPPING "
+              "the final tier-2/3 eval rather than scoring a stale checkpoint")
+    else:
+        import torch
+        from transformers import SegformerForSemanticSegmentation
 
-    _dev = "cuda" if torch.cuda.is_available() else "cpu"
-    best_model = SegformerForSemanticSegmentation.from_pretrained(
-        OUT_DIR / "best_model").to(_dev)
-    for _tier in ("val2", "test"):
-        if _tier in dsets:
-            _iou, _mean = evaluate(best_model, dsets[_tier], _dev)
-            print(format_iou_table(_iou, _mean, title=f"FINAL — {_TIER_DESC[_tier]}"))
-        else:
-            print(f"FINAL — {_TIER_DESC[_tier]}: not evaluable with this config (0 rows)")
+        _dev = "cuda" if torch.cuda.is_available() else "cpu"
+        best_model = SegformerForSemanticSegmentation.from_pretrained(
+            OUT_DIR / "best_model").to(_dev)
+        for _tier in ("val2", "test"):
+            if _tier in dsets:
+                _iou, _mean = evaluate(best_model, dsets[_tier], _dev)
+                print(format_iou_table(_iou, _mean,
+                                       title=f"FINAL — {_TIER_DESC[_tier]}"))
+            else:
+                print(f"FINAL — {_TIER_DESC[_tier]}: not evaluable with this "
+                      "config (0 rows)")
 
 
 # %%
@@ -643,22 +697,30 @@ def show_val_grid(model, tiers_df, dataset_dir, tier="val1", n=6, save_to=None):
 
 # %%
 if RUN_CELLS and RUN_FULL_TRAINING:
-    show_val_grid(best_model, tiers_df, DATASET_DIR, tier="val1", n=6,
-                  save_to="/content/val_grid.png")
+    if "best_model" not in globals():
+        print("skipping visual grid — best_model unavailable "
+              "(the final-eval cell skipped loading a stale checkpoint)")
+    else:
+        show_val_grid(best_model, tiers_df, DATASET_DIR, tier="val1", n=6,
+                      save_to="/content/val_grid.png")
 
 # %%
 if RUN_CELLS and RUN_FULL_TRAINING:
-    # single-image inference demo on the first val1 frame
-    import matplotlib.pyplot as plt
+    if "best_model" not in globals():
+        print("skipping inference demo — best_model unavailable "
+              "(the final-eval cell skipped loading a stale checkpoint)")
+    else:
+        # single-image inference demo on the first val1 frame
+        import matplotlib.pyplot as plt
 
-    _row = tiers_df[tiers_df["tier"] == "val1"].iloc[0]
-    _pred, _tint = predict_mask(best_model, Path(DATASET_DIR) / _row["image"])
-    print("pred mask:", _pred.shape, "classes present:",
-          {int(c): CLASS_NAMES[int(c)] for c in np.unique(_pred)})
-    plt.figure(figsize=(10, 6))
-    plt.imshow(_tint)
-    plt.axis("off")
-    plt.show()
+        _row = tiers_df[tiers_df["tier"] == "val1"].iloc[0]
+        _pred, _tint = predict_mask(best_model, Path(DATASET_DIR) / _row["image"])
+        print("pred mask:", _pred.shape, "classes present:",
+              {int(c): CLASS_NAMES[int(c)] for c in np.unique(_pred)})
+        plt.figure(figsize=(10, 6))
+        plt.imshow(_tint)
+        plt.axis("off")
+        plt.show()
 
 
 # %%
@@ -670,15 +732,17 @@ def dry_run(dataset, heldout_fields, heldout_games, heldout_view_fraction, seed)
         df, heldout_fields=heldout_fields, heldout_games=heldout_games,
         heldout_view_fraction=heldout_view_fraction, seed=seed)
     print()
-    print(summarize_tiers(tiers))
+    print(summarize_tiers(tiers, degraded))
     print()
     freq = stats_class_frequencies(dataset)
     src = "dataset_stats.json"
     if freq is None:
         freq = class_pixel_frequencies(tiers, dataset)
         src = "sampled masks"
-    print(format_class_table(freq, class_weights_from_freq(freq),
-                             title=f"class pixel frequencies ({src}) -> CE weights"))
+    print(format_class_table(
+        freq, class_weights_from_freq(freq),
+        title=f"class pixel frequencies ({src}, dataset-wide, informational — "
+              "training recomputes weights from the TRAIN tier after splits)"))
     print()
     print(f"degraded v0 mode: {degraded}")
 
@@ -707,5 +771,8 @@ def main(argv=None):
             args.heldout_view_fraction, args.seed)
 
 
-if __name__ == "__main__" and not IN_COLAB:
+# not RUN_CELLS too: a local-GPU-box run (RUN_CELLS=True) must not fall into
+# argparse after training, and a local Jupyter kernel's `-f <json>` argv would
+# error here otherwise.
+if __name__ == "__main__" and not IN_COLAB and not RUN_CELLS:
     main()

@@ -3,6 +3,8 @@
 Geometry constants below are PitchSpec.standard_9v9()'s ACTUAL values (the dataclass
 defaults: box length 0.187, box width 0.720, circle radius 0.106 — a fraction of
 pitch LENGTH). 0.157/0.592/0.087 belong to fifa_11v11(), not this project's fields.
+The oracles are deliberately hardcoded literals, NOT read from PitchSpec: importing
+them would make the test circular (a wrong spec would silently validate itself).
 """
 import numpy as np
 from numpy.typing import NDArray
@@ -41,6 +43,12 @@ def _dist_m(cls: int, p: NDArray[np.float64]) -> NDArray[np.float64]:
         r_m = 0.106 * LENGTH_M
         d = np.hypot(x_m - WIDTH_M / 2, y_m - LENGTH_M / 2)
         return np.abs(d - r_m)
+    if cls == lm.CLS_BOX_LINE:
+        bl = 0.187 * LENGTH_M
+        cx_l, cx_r = (0.5 - 0.720 / 2) * WIDTH_M, (0.5 + 0.720 / 2) * WIDTH_M
+        d_front = np.minimum(np.abs(y_m - bl), np.abs(y_m - (LENGTH_M - bl)))
+        d_sides = np.minimum(np.abs(x_m - cx_l), np.abs(x_m - cx_r))
+        return np.minimum(d_front, d_sides)
     raise AssertionError(cls)
 
 
@@ -55,28 +63,60 @@ def test_mask_pixels_lie_on_their_line() -> None:
 
 def test_box_lines_lie_on_box_geometry() -> None:
     mask = lm.line_mask(H_IMG2PITCH, SIZE)
-    p = _pitch_of(mask, lm.CLS_BOX_LINE)
-    x_m, y_m = p[:, 0] * WIDTH_M, p[:, 1] * LENGTH_M
-    bl = 0.187 * LENGTH_M
-    cx_l, cx_r = (0.5 - 0.720 / 2) * WIDTH_M, (0.5 + 0.720 / 2) * WIDTH_M
-    d_front = np.minimum(np.abs(y_m - bl), np.abs(y_m - (LENGTH_M - bl)))
-    d_sides = np.minimum(np.abs(x_m - cx_l), np.abs(x_m - cx_r))
-    assert float(np.max(np.minimum(d_front, d_sides))) < PAINT * 2.5
+    d = _dist_m(lm.CLS_BOX_LINE, _pitch_of(mask, lm.CLS_BOX_LINE))
+    assert float(np.max(d)) < PAINT * 2.5
 
 
-def test_sky_pose_draws_no_unphysical_pixels() -> None:
-    """Corrupt the pose so part of the field flips behind the camera: every pixel the
-    mask still draws must map with w > 0 (clipping worked); wrapped/mirrored line
-    pixels are the failure mode this guards."""
-    bad = H_IMG2PITCH.copy()
-    bad[2, :] = np.array([bad[2, 0] * 0.9, bad[2, 1] - 300.0 / (H * bad[2, 2]), bad[2, 2]])
-    mask = lm.line_mask(bad, SIZE)
+def _assert_survivors_physical_and_on_geometry(
+    mask: NDArray[np.uint8], bad: NDArray[np.float64]
+) -> int:
+    """Every surviving pixel must map with w > 0 AND lie near its class geometry
+    under the corrupted map; returns the survivor count (0 = fully clipped)."""
     ys, xs = np.nonzero(mask)
     if len(xs) == 0:
-        return  # fully clipped is acceptable
+        return 0
     pts = np.column_stack([xs, ys, np.ones(len(xs))]).astype(np.float64)
     q = (bad @ pts.T).T
     assert np.all(q[:, 2] > 1e-9)
+    p = np.asarray(q[:, :2] / q[:, 2:3], np.float64)
+    labels = mask[ys, xs]
+    for cls in np.unique(labels):
+        d = _dist_m(int(cls), p[labels == cls])
+        assert float(np.max(d)) < PAINT * 2.5, f"class {cls}: {np.max(d):.3f} m off"
+    return len(xs)
+
+
+def test_sky_pose_draws_no_unphysical_pixels() -> None:
+    """Corrupt the pose so part of the field flips behind the camera. line_mask's
+    composed guarantee (clipped_polyline endpoint clipping + the _MIN_PAINT_PX
+    scale-collapse gate + the final w-erase) is: every pixel still drawn maps with
+    w > 0 AND lies near its class geometry under the corrupted map. w > 0 alone
+    would miss wrapped/smeared strokes that land in front of the camera but
+    kilometres off geometry — that is what the paint-width gate exists for.
+
+    Scenario A (harsh): collapses the whole field into a sub-pixel image band just
+    in front of the horizon; pre-gate pixels there kept w > 0 while mapping up to
+    1979.7 m off their line (measured), so the gate must leave a (near-)empty mask
+    and whatever survives must satisfy both invariants.
+
+    Scenario B (h21 negated, h22 = 0.12; tuned empirically): flips the entire far
+    touchline side behind the camera (w = -5.06 at pitch (1, 0/0.5/1)) while the
+    near side keeps sane scale (w = +11.5) — survivors are REQUIRED here, so the
+    geometry invariant is exercised non-vacuously (~37k px, max 0.063 m today)."""
+    bad_a = H_IMG2PITCH.copy()
+    bad_a[2, :] = np.array(
+        [bad_a[2, 0] * 0.9, bad_a[2, 1] - 300.0 / (H * bad_a[2, 2]), bad_a[2, 2]]
+    )
+    _assert_survivors_physical_and_on_geometry(lm.line_mask(bad_a, SIZE), bad_a)
+
+    bad_b = H_IMG2PITCH.copy()
+    bad_b[2, 1] = -bad_b[2, 1]
+    bad_b[2, 2] = 0.12
+    p_inv = np.linalg.inv(bad_b)
+    w_far = [float((p_inv @ np.array([1.0, sy, 1.0]))[2]) for sy in (0.0, 0.5, 1.0)]
+    assert max(w_far) < 0, "corruption premise lost: far side no longer flips"
+    n = _assert_survivors_physical_and_on_geometry(lm.line_mask(bad_b, SIZE), bad_b)
+    assert n > 0, "mild corruption must leave sane-scale survivors"
 
 
 def test_thickness_scales_with_depth() -> None:
@@ -88,12 +128,11 @@ def test_thickness_scales_with_depth() -> None:
     mask = lm.line_mask(H_IMG2PITCH, SIZE)
     rows = np.nonzero((mask == lm.CLS_MIDLINE).any(axis=1))[0]
     assert len(rows) > 50
-    lo, hi = rows[5], rows[-6]
-    t_lo = int((mask[lo] == lm.CLS_MIDLINE).sum())
-    t_hi = int((mask[hi] == lm.CLS_MIDLINE).sum())
-    near, far = max(t_lo, t_hi), min(t_lo, t_hi)
-    assert near >= far
-    assert 2 <= far and near <= 9  # clamps honored (7 max + raster slack)
+    top, bottom = rows[5], rows[-6]  # far-field end (small row) vs near-field end
+    t_top = int((mask[top] == lm.CLS_MIDLINE).sum())
+    t_bottom = int((mask[bottom] == lm.CLS_MIDLINE).sum())
+    assert t_bottom > t_top  # near-field STRICTLY thicker (7 vs 3 px today)
+    assert 2 <= t_top and t_bottom <= 9  # clamps honored (7 max + raster slack)
 
 
 def test_overlay_shapes() -> None:

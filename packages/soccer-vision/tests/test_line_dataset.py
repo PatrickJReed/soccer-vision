@@ -4,6 +4,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pandas as pd
+import pytest
 from soccer_vision import line_dataset as ld
 from soccer_vision.pipeline import homographies_to_parquet
 from soccer_vision.pitch.propagation import HomographyEntry
@@ -34,14 +35,16 @@ def _session(tmp_path: Path, frames: list[int], *, source: str = "registered",
 
 def test_select_frames_gates_and_strides() -> None:
     entries = {f: HomographyEntry(_H_IMG2PITCH, "registered", 0.9) for f in range(90)}
-    entries[10] = HomographyEntry(_H_IMG2PITCH, "registered", 0.3)   # below gate
-    entries[20] = HomographyEntry(_H_IMG2PITCH, "none", 0.9)         # bad source
+    # Gated entries sit ON stride multiples so the gate is load-bearing (a deleted
+    # gate changes the output), not shadowed by the stride.
+    entries[30] = HomographyEntry(_H_IMG2PITCH, "registered", 0.3)   # below gate
+    entries[60] = HomographyEntry(_H_IMG2PITCH, "none", 0.9)         # bad source
     sel = ld.select_frames(entries, fps=30.0, stride_s=1.0, per_view_cap=120,
                            min_confidence=0.6, view_of=None)
-    assert sel == [0, 30, 60]  # 1 fps stride from frame 0
+    assert sel == [0]  # 30 gated by confidence, 60 gated by source
     sel2 = ld.select_frames(entries, fps=30.0, stride_s=0.5, per_view_cap=120,
                             min_confidence=0.6, view_of=None)
-    assert 15 in sel2 and 10 not in sel2 and 20 not in sel2
+    assert sel2 == [0, 15, 45, 75]  # stride 15, minus the gated 30 and 60
 
 
 def test_select_frames_per_view_cap() -> None:
@@ -91,6 +94,13 @@ def test_rerun_is_idempotent_per_game(tmp_path: Path) -> None:
     man = pd.read_parquet(out / "manifest.parquet")
     assert len(man) == 6 and set(man["game_id"]) == {"g1", "g2"}
     assert other.n_written == 3
+
+
+def test_unopenable_video_raises(tmp_path: Path) -> None:
+    session = _session(tmp_path, [0, 30])
+    with pytest.raises(ValueError, match="cannot open video"):
+        ld.build_game(tmp_path / "missing.mp4", session / "homographies.parquet",
+                      tmp_path / "dataset", game_id="g1", field_id="fieldA")
 
 
 def test_undecodable_frames_are_dropped_and_counted(tmp_path: Path) -> None:

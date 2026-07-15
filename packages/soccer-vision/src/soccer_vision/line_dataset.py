@@ -4,14 +4,16 @@ engine for the per-frame line-segmentation model.
 
 Sampling discipline: confidence-gated (>= min_confidence, accepted sources only),
 strided to ~stride_s seconds, capped per view (near-duplicate control). Frames decode in
-ONE ascending sequential pass (never per-frame seek); undecodable frames are dropped and
-counted, never silently written. Masks are lossless PNG. Re-running a game REPLACES its
-manifest rows (idempotent per game).
+ONE ascending sequential pass, streamed one frame at a time (never per-frame seek, never
+a full-selection buffer); a decode failure drops that frame AND every selected frame
+after it (EOF semantics, not per-frame skip), all counted undecodable, never silently
+written. Masks are lossless PNG. Re-running a game REPLACES its manifest rows
+(idempotent per game).
 Spec: docs/superpowers/specs/2026-07-14-line-mask-autolabel-design.md
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,6 +42,11 @@ class GameStats:
     class_pixel_frac: dict[str, float]
 
 
+def _trusted(e: HomographyEntry, min_confidence: float) -> bool:
+    """The trust gate: accepted provenance AND confidence at/above the floor."""
+    return e.source in ACCEPTED_SOURCES and e.confidence >= min_confidence
+
+
 def select_frames(
     entries: Mapping[int, HomographyEntry],
     *,
@@ -49,9 +56,14 @@ def select_frames(
     min_confidence: float,
     view_of: Mapping[int, int] | None,
 ) -> list[int]:
-    """Trust-gate, stride to ~stride_s seconds, cap per view. Deterministic."""
-    trusted = sorted(f for f, e in entries.items()
-                     if e.source in ACCEPTED_SOURCES and e.confidence >= min_confidence)
+    """Trust-gate, stride to ~stride_s seconds, cap per view. Deterministic.
+
+    Stride anchoring (f % stride == 0) assumes DENSE frame coverage (registered/
+    propagated parquets); a sparse-anchor parquet (e.g. a handful of manual reps at
+    arbitrary frames) will select ~nothing — the CLI warns when n_selected == 0
+    while n_candidates > 0.
+    """
+    trusted = sorted(f for f, e in entries.items() if _trusted(e, min_confidence))
     stride = max(1, round(fps * stride_s))
     strided = [f for f in trusted if f % stride == 0]
     if view_of is None:
@@ -68,26 +80,30 @@ def select_frames(
 
 def _decode_selected(
     video_path: Path, frames: list[int]
-) -> tuple[dict[int, NDArray[np.uint8]], int]:
-    """One ascending sequential pass; returns {frame: image} + undecodable count."""
+) -> Iterator[tuple[int, NDArray[np.uint8]]]:
+    """Stream (frame, image) pairs in ONE ascending sequential pass.
+
+    One frame in memory at a time — a full game's selection materialized would be
+    tens of GB. Stops at the first grab/read failure (EOF semantics): that frame
+    and every later one are dropped; the caller counts undecodables as
+    len(selected) - pairs consumed.
+    """
     want = sorted(frames)
-    got: dict[int, NDArray[np.uint8]] = {}
     cap = cv2.VideoCapture(str(video_path))
     pos = 0
     try:
         for f in want:
             while pos < f:
                 if not cap.grab():
-                    return got, len(want) - len(got)
+                    return
                 pos += 1
             ok, img = cap.read()
             if not ok:
-                return got, len(want) - len(got)
+                return
             pos += 1
-            got[f] = img  # type: ignore[assignment]  # cv2 MatLike -> uint8 image
+            yield f, img  # type: ignore[misc]  # cv2 MatLike -> uint8 image
     finally:
         cap.release()
-    return got, len(want) - len(got)
 
 
 def _merge_manifest(out_dir: Path, game_id: str, rows: list[dict[str, object]]) -> None:
@@ -119,36 +135,38 @@ def build_game(
     video_path, out_dir = Path(video_path), Path(out_dir)
     entries = homographies_from_parquet(Path(homographies_path))
     cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        cap.release()
+        raise ValueError(f"cannot open video: {video_path}")
     fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
     size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
             int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
     cap.release()
-    trusted = [f for f, e in entries.items()
-               if e.source in ACCEPTED_SOURCES and e.confidence >= min_confidence]
+    trusted = [f for f, e in entries.items() if _trusted(e, min_confidence)]
     selected = select_frames(entries, fps=fps, stride_s=stride_s,
                              per_view_cap=per_view_cap, min_confidence=min_confidence,
                              view_of=view_of)
-    images, n_undec = _decode_selected(video_path, selected)
 
     (out_dir / "images").mkdir(parents=True, exist_ok=True)
     (out_dir / "masks").mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, object]] = []
     pix_counts = dict.fromkeys(LINE_CLASSES.values(), 0)
     total_px = 0
-    written = sorted(images)
-    # contact sheet: sample evenly across the WHOLE written range, not the first 16
-    if written:
-        idx = np.linspace(0, len(written) - 1, min(16, len(written))).astype(int)
-        sheet_frames = {written[i] for i in idx}
+    # Contact-sheet frames are picked evenly across the SELECTION (streaming decode:
+    # the written set isn't known up front); this drifts from even-across-written
+    # only when tail frames are undecodable — acceptable.
+    if selected:
+        idx = np.linspace(0, len(selected) - 1, min(16, len(selected))).astype(int)
+        sheet_frames = {selected[i] for i in idx}
     else:
         sheet_frames = set()
     overlays: list[NDArray[np.uint8]] = []
-    for f in written:
+    for f, img in _decode_selected(video_path, selected):
         e = entries[f]
         mask = line_mask(e.H, size, spec=spec)
         img_rel = f"images/{game_id}_{f:06d}.jpg"
         msk_rel = f"masks/{game_id}_{f:06d}.png"
-        cv2.imwrite(str(out_dir / img_rel), images[f],
+        cv2.imwrite(str(out_dir / img_rel), img,
                     [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
         cv2.imwrite(str(out_dir / msk_rel), mask)
         for cls, name in LINE_CLASSES.items():
@@ -161,8 +179,9 @@ def build_game(
                      "image": img_rel, "mask": msk_rel})
         if contact_sheet and f in sheet_frames:
             tile: NDArray[np.uint8] = cv2.resize(  # type: ignore[assignment]
-                mask_overlay(images[f], mask), (0, 0), fx=0.25, fy=0.25)
+                mask_overlay(img, mask), (0, 0), fx=0.25, fy=0.25)
             overlays.append(tile)
+    n_undec = len(selected) - len(rows)
     _merge_manifest(out_dir, game_id, rows)
     if contact_sheet and overlays:
         cols = 4

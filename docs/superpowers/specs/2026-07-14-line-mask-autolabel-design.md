@@ -28,11 +28,21 @@ Per game, a session directory containing:
   `frame → view_id` for per-view sampling caps and later view-held-out splits. Absent →
   `view_id = -1` and the per-view cap is skipped (a warning notes weaker dedup).
 
-Plus one registry file the user maintains at the dataset root, `games.yaml`:
-```yaml
-oceanside_2026_06:   { field: oceanside,  video: /path/to/oceanside_clip.mp4 }
-riverside_2026_05a:  { field: riverside,  video: ... }
+Plus one registry file the user maintains at the dataset root, `games.toml`:
+```toml
+[oceanside_2026_06]
+field = "oceanside"
+video = "oceanside_clip.mp4"
+session = "oceanside_session"
+
+[riverside_2026_05a]
+field = "riverside"
+video = "riverside_clip.mp4"
+session = "riverside_session"
 ```
+TOML via stdlib tomllib (no new dependency); each entry carries `session` = the dir
+holding homographies.parquet (+ optional view_manifest.parquet); paths are relative to
+the registry file.
 `game_id` (the key) and `field_id` flow into every manifest row — they are what make
 game-held-out and **field-held-out** evaluation possible later. The generator never
 assigns splits; it records identifiers so the Colab loader can re-split freely.
@@ -51,7 +61,7 @@ so unphysical projections can never poison a label):
 | 2 | goal_line | y=0 and y=1 edges (0–1, 2–3) |
 | 3 | midline | y=0.5 (landmarks 5–4) |
 | 4 | box_line | own box 11→9→10→12 and opp box 15→13→14→16 polylines |
-| 5 | center_circle | centre (0.5, 0.5); pitch-frame ellipse with y-radius r=0.087 and x-radius r·(LENGTH_M/WIDTH_M), sampled as a 72-segment polyline |
+| 5 | center_circle | centre (0.5, 0.5); pitch-frame ellipse with y-radius r = spec.center_circle_radius_frac (0.106 for standard_9v9) and x-radius r·(LENGTH_M/WIDTH_M), sampled as a 72-segment polyline |
 
 Rationale for merged left/right classes: the model's job is dense correspondence
 geometry, not side identity — the downstream geometric fit disambiguates side from
@@ -97,7 +107,7 @@ per_view_cap=120, min_confidence=0.6, jpeg_quality=90)`:
    views/time — for Patrick's visual assessment of label quality (Claude renders, Patrick
    assesses; the generator never self-certifies).
 
-CLI: `python -m soccer_vision.line_dataset --games games.yaml --out <dir>
+CLI: `python -m soccer_vision.line_dataset --games games.toml --out <dir>
 [--game <id> ...] [--stride-s 1.0] [--per-view-cap 120] [--min-confidence 0.6]`
 (`--game` limits to named entries; default = all entries whose inputs exist).
 

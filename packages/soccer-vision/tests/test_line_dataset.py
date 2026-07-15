@@ -1,4 +1,5 @@
 """Tests for line_dataset.py — selection, generation, manifest idempotency."""
+import json
 from pathlib import Path
 
 import cv2
@@ -112,3 +113,46 @@ def test_undecodable_frames_are_dropped_and_counted(tmp_path: Path) -> None:
     assert stats.n_written == 2 and stats.n_undecodable == 1
     man = pd.read_parquet(out / "manifest.parquet")
     assert sorted(man["frame"]) == [0, 30]
+
+
+def test_load_games_registry(tmp_path: Path) -> None:
+    reg = tmp_path / "games.toml"
+    reg.write_text(
+        '[g1]\nfield = "fieldA"\nvideo = "v1.mp4"\nsession = "s1"\n'
+        '[g2]\nfield = "fieldB"\nvideo = "v2.mp4"\nsession = "s2"\n')
+    games = ld.load_games(reg)
+    assert set(games) == {"g1", "g2"}
+    assert games["g1"].field == "fieldA"
+    assert games["g1"].video == (tmp_path / "v1.mp4")     # relative to the registry
+    assert games["g2"].session == (tmp_path / "s2")
+
+
+def test_cli_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    _video(tmp_path / "game.mp4")
+    session = _session(tmp_path, list(range(90)))
+    (tmp_path / "games.toml").write_text(
+        f'[g1]\nfield = "fieldA"\nvideo = "game.mp4"\nsession = "{session.name}"\n'
+        '[missing]\nfield = "fieldB"\nvideo = "nope.mp4"\nsession = "nope"\n')
+    out = tmp_path / "dataset"
+    ld.main(["--games", str(tmp_path / "games.toml"), "--out", str(out)])
+    text = capsys.readouterr().out
+    assert "g1" in text and "SKIP" in text            # missing inputs skipped loudly
+    stats = out / "dataset_stats.json"
+    assert stats.exists()
+    payload = json.loads(stats.read_text())
+    assert "g1" in payload["games"] and payload["config"]["stride_s"] == 1.0
+    man = pd.read_parquet(out / "manifest.parquet")
+    assert set(man["game_id"]) == {"g1"}
+
+
+def test_cli_game_filter_and_sparse_warning(tmp_path: Path,
+                                            capsys: pytest.CaptureFixture[str]) -> None:
+    _video(tmp_path / "game.mp4")
+    # sparse-anchor session: trusted frames all OFF stride multiples -> n_selected == 0
+    session = _session(tmp_path, [7, 41, 73])
+    (tmp_path / "games.toml").write_text(
+        f'[g1]\nfield = "fieldA"\nvideo = "game.mp4"\nsession = "{session.name}"\n')
+    out = tmp_path / "dataset"
+    ld.main(["--games", str(tmp_path / "games.toml"), "--out", str(out), "--game", "g1"])
+    text = capsys.readouterr().out
+    assert "WARNING" in text and "sparse" in text.lower()

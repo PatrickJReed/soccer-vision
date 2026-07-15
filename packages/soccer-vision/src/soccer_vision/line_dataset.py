@@ -13,8 +13,11 @@ Spec: docs/superpowers/specs/2026-07-14-line-mask-autolabel-design.md
 """
 from __future__ import annotations
 
+import argparse
+import json
+import tomllib
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import cv2
@@ -194,3 +197,81 @@ def build_game(
         cv2.imwrite(str(out_dir / f"contact_{game_id}.jpg"), sheet)
     frac = {k: (v / total_px if total_px else 0.0) for k, v in pix_counts.items()}
     return GameStats(game_id, len(trusted), len(selected), len(rows), n_undec, frac)
+
+
+@dataclass(frozen=True)
+class GameEntry:
+    field: str
+    video: Path
+    session: Path   # dir containing homographies.parquet (+ optional view_manifest.parquet)
+
+
+def load_games(path: str | Path) -> dict[str, GameEntry]:
+    """games.toml: [game_id] tables with field/video/session; paths relative to the file."""
+    path = Path(path)
+    with path.open("rb") as fh:
+        raw = tomllib.load(fh)
+    base = path.parent
+    return {gid: GameEntry(field=str(entry["field"]),
+                           video=base / str(entry["video"]),
+                           session=base / str(entry["session"]))
+            for gid, entry in raw.items()}
+
+
+def _view_of_from_manifest(session: Path) -> dict[int, int] | None:
+    p = session / "view_manifest.parquet"
+    if not p.exists():
+        return None
+    df = pd.read_parquet(p)
+    return {int(f): int(v) for f, v in zip(df["frame"], df["view_id"], strict=True)}
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(description="Line-mask auto-label dataset builder")
+    ap.add_argument("--games", required=True, type=Path, help="games.toml registry")
+    ap.add_argument("--out", required=True, type=Path, help="dataset output dir")
+    ap.add_argument("--game", action="append", default=None,
+                    help="limit to these game ids (repeatable; default: all)")
+    ap.add_argument("--stride-s", type=float, default=1.0)
+    ap.add_argument("--per-view-cap", type=int, default=120)
+    ap.add_argument("--min-confidence", type=float, default=0.6)
+    args = ap.parse_args(argv)
+
+    games = load_games(args.games)
+    wanted = args.game or sorted(games)
+    all_stats: dict[str, dict[str, object]] = {}
+    for gid in wanted:
+        g = games[gid]
+        hpath = g.session / "homographies.parquet"
+        if not g.video.exists() or not hpath.exists():
+            print(f"{gid}: SKIP (missing {'video' if not g.video.exists() else 'homographies'})")
+            continue
+        view_of = _view_of_from_manifest(g.session)
+        if view_of is None:
+            print(f"{gid}: no view_manifest.parquet — per-view cap inactive (weaker dedup)")
+        stats = build_game(g.video, hpath, args.out, game_id=gid, field_id=g.field,
+                           view_of=view_of, stride_s=args.stride_s,
+                           per_view_cap=args.per_view_cap,
+                           min_confidence=args.min_confidence)
+        all_stats[gid] = {**asdict(stats), "field_id": g.field}
+        if stats.n_selected == 0 and stats.n_candidates > 0:
+            print(f"{gid}: WARNING — {stats.n_candidates} trusted frames but 0 selected: "
+                  f"sparse-anchor session? (stride anchor needs dense coverage; "
+                  f"try the view-rep route or a different --stride-s)")
+        elif stats.n_written == 0:
+            print(f"{gid}: WARNING — 0 pairs written (check the video/homographies)")
+        print(f"{gid}: {stats.n_written} pairs written "
+              f"({stats.n_candidates} trusted, {stats.n_selected} selected, "
+              f"{stats.n_undecodable} undecodable) -> {args.out}")
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "dataset_stats.json").write_text(json.dumps({
+        "note": "consumers must read pairs via manifest.parquet — shrinking re-runs "
+                "can leave orphan image/mask files on disk",
+        "config": {"stride_s": args.stride_s, "per_view_cap": args.per_view_cap,
+                   "min_confidence": args.min_confidence},
+        "games": all_stats,
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()

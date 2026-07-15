@@ -93,6 +93,15 @@ def line_mask(
     """(H, W) uint8 class mask for a frame with FULL-PIXEL image->pitch homography."""
     w, h = size
     hm = np.asarray(h_img_to_pitch, np.float64)
+    # Global-sign normalization: H and -H are projectively identical, but every w>0
+    # test below reads the sign. The image CENTRE is in front of the camera for any
+    # sane pose, so flip H if it maps the centre with w < 0. Real-world need:
+    # findHomography-normalized H's (h22 = +1 — the bracket-propagation path) carry
+    # the opposite global sign from pose-derived labeler anchors (h22 < 0); without
+    # this, one family rasterizes fully-clipped EMPTY masks (oceanside v0: 64/70).
+    # (-H)^-1 = -(H^-1), so p and the final w-erase inherit the fixed sign together.
+    if float(hm[2, 0] * (w / 2.0) + hm[2, 1] * (h / 2.0) + hm[2, 2]) < 0.0:
+        hm = -hm
     p = np.linalg.inv(hm)                                       # pitch -> pixel
     mask = np.zeros((h, w), np.uint8)
     for cls, poly in _pitch_polylines(spec or PitchSpec.standard_9v9()):

@@ -26,10 +26,11 @@ def _video(path: Path, n_frames: int = 90) -> Path:
 
 
 def _session(tmp_path: Path, frames: list[int], *, source: str = "registered",
-             conf: float = 0.9) -> Path:
+             conf: float = 0.9, h: np.ndarray | None = None) -> Path:
     session = tmp_path / "session"
     session.mkdir(exist_ok=True)
-    entries = {f: HomographyEntry(_H_IMG2PITCH, source, conf) for f in frames}
+    hom = _H_IMG2PITCH if h is None else h
+    entries = {f: HomographyEntry(hom, source, conf) for f in frames}
     homographies_to_parquet(entries, session / "homographies.parquet")
     return session
 
@@ -66,6 +67,7 @@ def test_build_writes_pairs_manifest_and_stats(tmp_path: Path) -> None:
     stats = ld.build_game(video, session / "homographies.parquet", out,
                           game_id="g1", field_id="fieldA", stride_s=1.0)
     assert stats.n_written == 3 and stats.n_undecodable == 0
+    assert stats.n_empty_masks == 0    # every written mask must carry line pixels
     man = pd.read_parquet(out / "manifest.parquet")
     assert len(man) == 3
     assert set(man.columns) >= {"game_id", "field_id", "view_id", "frame", "source",
@@ -80,6 +82,25 @@ def test_build_writes_pairs_manifest_and_stats(tmp_path: Path) -> None:
     # PNG losslessness: reloaded mask equals the in-memory rasterization exactly
     from soccer_vision.pitch.line_masks import line_mask
     assert np.array_equal(msk, line_mask(_H_IMG2PITCH, (_W, _H)))
+
+
+def test_negated_homography_sign_yields_nonempty_masks(tmp_path: Path) -> None:
+    """build_game-level guard for the oceanside v0 field failure (64/70 empty masks):
+    -H is projectively identical to H, but findHomography-normalized parquets carry
+    the opposite global sign from pose-derived anchors; masks must come out identical
+    and non-empty either way, and n_empty_masks must expose any regression."""
+    video = _video(tmp_path / "game.mp4")
+    session = _session(tmp_path, list(range(90)), h=-_H_IMG2PITCH)
+    out = tmp_path / "dataset"
+    stats = ld.build_game(video, session / "homographies.parquet", out,
+                          game_id="g1", field_id="fieldA", stride_s=1.0)
+    assert stats.n_written == 3
+    assert stats.n_empty_masks == 0
+    row = pd.read_parquet(out / "manifest.parquet").iloc[0]
+    msk = cv2.imread(str(out / row["mask"]), cv2.IMREAD_GRAYSCALE)
+    assert msk is not None and (msk > 0).sum() > 0
+    from soccer_vision.pitch.line_masks import line_mask
+    assert np.array_equal(msk, line_mask(_H_IMG2PITCH, (_W, _H)))  # sign-invariant
 
 
 def test_rerun_is_idempotent_per_game(tmp_path: Path) -> None:

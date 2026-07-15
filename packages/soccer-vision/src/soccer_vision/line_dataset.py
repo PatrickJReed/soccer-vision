@@ -42,6 +42,9 @@ class GameStats:
     n_selected: int        # after stride + per-view cap
     n_written: int
     n_undecodable: int
+    n_empty_masks: int     # written masks with ZERO line pixels — a red flag
+                           # (homography sign/coverage); aggregate class fractions
+                           # can look sane while most masks are empty
     class_pixel_frac: dict[str, float]
 
 
@@ -155,6 +158,7 @@ def build_game(
     rows: list[dict[str, object]] = []
     pix_counts = dict.fromkeys(LINE_CLASSES.values(), 0)
     total_px = 0
+    n_empty = 0
     # Contact-sheet frames are picked evenly across the SELECTION (streaming decode:
     # the written set isn't known up front); this drifts from even-across-written
     # only when tail frames are undecodable — acceptable.
@@ -175,6 +179,8 @@ def build_game(
         for cls, name in LINE_CLASSES.items():
             pix_counts[name] += int((mask == cls).sum())
         total_px += mask.size
+        if not mask.any():
+            n_empty += 1
         rows.append({"game_id": game_id, "field_id": field_id,
                      "view_id": int(view_of.get(f, -1)) if view_of else -1,
                      "frame": int(f), "source": e.source,
@@ -196,7 +202,8 @@ def build_game(
             sheet[r * th:(r + 1) * th, c * tw:(c + 1) * tw] = o
         cv2.imwrite(str(out_dir / f"contact_{game_id}.jpg"), sheet)
     frac = {k: (v / total_px if total_px else 0.0) for k, v in pix_counts.items()}
-    return GameStats(game_id, len(trusted), len(selected), len(rows), n_undec, frac)
+    return GameStats(game_id, len(trusted), len(selected), len(rows), n_undec,
+                     n_empty, frac)
 
 
 @dataclass(frozen=True)
@@ -260,9 +267,13 @@ def main(argv: list[str] | None = None) -> None:
                   f"try the view-rep route or a different --stride-s)")
         elif stats.n_written == 0:
             print(f"{gid}: WARNING — 0 pairs written (check the video/homographies)")
+        if stats.n_empty_masks > 0:
+            print(f"{gid}: WARNING — {stats.n_empty_masks}/{stats.n_written} masks "
+                  f"are EMPTY (check homography signs/coverage)")
         print(f"{gid}: {stats.n_written} pairs written "
               f"({stats.n_candidates} trusted, {stats.n_selected} selected, "
-              f"{stats.n_undecodable} undecodable) -> {args.out}")
+              f"{stats.n_undecodable} undecodable, {stats.n_empty_masks} empty masks) "
+              f"-> {args.out}")
     args.out.mkdir(parents=True, exist_ok=True)
     stats_path = args.out / "dataset_stats.json"
     # Per-game merge, parallel to the manifest: a --game re-run must not discard other

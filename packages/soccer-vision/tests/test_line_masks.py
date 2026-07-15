@@ -135,6 +135,17 @@ def test_thickness_scales_with_depth() -> None:
     assert 2 <= t_top and t_bottom <= 9  # clamps honored (7 max + raster slack)
 
 
+def test_global_sign_invariance() -> None:
+    """H and -H are projectively identical; line_mask must not read the global sign.
+    Field bug (oceanside v0): labeler ANCHOR frames export with h22 < 0 while
+    bracket-PROPAGATED frames pass through findHomography (h22 = +1 convention) —
+    the opposite global sign — so w>0 clipping emptied 64/70 masks."""
+    a = lm.line_mask(H_IMG2PITCH, SIZE)
+    b = lm.line_mask(-H_IMG2PITCH, SIZE)
+    assert int((a > 0).sum()) > 0
+    assert np.array_equal(a, b)
+
+
 def test_overlay_shapes() -> None:
     frame = np.zeros((H, W, 3), np.uint8)
     mask = lm.line_mask(H_IMG2PITCH, SIZE)

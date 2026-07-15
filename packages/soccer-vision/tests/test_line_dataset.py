@@ -145,6 +145,21 @@ def test_cli_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
     assert set(man["game_id"]) == {"g1"}
 
 
+def test_stats_file_merges_across_reruns(tmp_path: Path) -> None:
+    _video(tmp_path / "game.mp4")
+    session = _session(tmp_path, list(range(90)))
+    (tmp_path / "games.toml").write_text(
+        f'[g1]\nfield = "fieldA"\nvideo = "game.mp4"\nsession = "{session.name}"\n'
+        f'[g2]\nfield = "fieldB"\nvideo = "game.mp4"\nsession = "{session.name}"\n')
+    out = tmp_path / "dataset"
+    ld.main(["--games", str(tmp_path / "games.toml"), "--out", str(out)])
+    ld.main(["--games", str(tmp_path / "games.toml"), "--out", str(out), "--game", "g1"])
+    payload = json.loads((out / "dataset_stats.json").read_text())
+    # g1-only re-run must not discard g2's stats (parallel to per-game manifest merge)
+    assert set(payload["games"]) == {"g1", "g2"}
+    assert payload["games"]["g2"]["field_id"] == "fieldB"
+
+
 def test_cli_game_filter_and_sparse_warning(tmp_path: Path,
                                             capsys: pytest.CaptureFixture[str]) -> None:
     _video(tmp_path / "game.mp4")

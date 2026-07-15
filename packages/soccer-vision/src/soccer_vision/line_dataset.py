@@ -264,12 +264,20 @@ def main(argv: list[str] | None = None) -> None:
               f"({stats.n_candidates} trusted, {stats.n_selected} selected, "
               f"{stats.n_undecodable} undecodable) -> {args.out}")
     args.out.mkdir(parents=True, exist_ok=True)
-    (args.out / "dataset_stats.json").write_text(json.dumps({
+    stats_path = args.out / "dataset_stats.json"
+    # Per-game merge, parallel to the manifest: a --game re-run must not discard other
+    # games' stats. "config" reflects only the LATEST run — approximate under
+    # mixed-config re-runs (per-game config would need per-game records; not v1).
+    games_out: dict[str, object] = {}
+    if stats_path.exists():
+        games_out.update(json.loads(stats_path.read_text()).get("games", {}))
+    games_out.update(all_stats)
+    stats_path.write_text(json.dumps({
         "note": "consumers must read pairs via manifest.parquet — shrinking re-runs "
                 "can leave orphan image/mask files on disk",
         "config": {"stride_s": args.stride_s, "per_view_cap": args.per_view_cap,
                    "min_confidence": args.min_confidence},
-        "games": all_stats,
+        "games": games_out,
     }, indent=2))
 
 

@@ -18,11 +18,14 @@ unlisted family video. Mind Drive space: each game adds ~0.3–0.7 GB of dataset
 
 Open `scripts/colab_game_prep.ipynb` in Colab (CPU runtime is fine). In the CONFIG
 cell set per game: `PLAYLIST_LINE`, `GAME_NUMBER` (1-based playlist index),
-`GAME_ID` (e.g. `riverside_2026_07a`), `FIELD_ID`. For a full game also raise
-`DIGEST_STRIDE` (the digest cell warns and suggests a value — the ORB similarity
-matrix is O(samples²)). Then Runtime → Run all: the Stage B cells self-skip until the
-rep export exists, and Stage A self-skips once its rep pack is on Drive
-(`FORCE_STAGE_A = True` to redo).
+`GAME_ID` (e.g. `riverside_2026_07a`), `FIELD_ID`. On a full game the digest cell
+AUTO-BUMPS the sampling stride to keep ~900 samples (the ORB similarity matrix is
+O(samples²)) and prints what it did; to force denser sampling set `DIGEST_STRIDE`
+explicitly and `FORCE_DIGEST_STRIDE = True`. Then Runtime → Run all: the Stage B
+cells self-skip until the rep export exists, and Stage A self-skips once its rep
+pack is on Drive (`FORCE_STAGE_A = True` to redo — rebuilding the pack renames any
+existing `rep_export/` to `rep_export_stale_<timestamp>/`, because clicks against an
+old pack's tiny indices would mis-anchor views; re-click the new `rep_video.mp4`).
 
 Check inline: the playlist listing (is `GAME_NUMBER` the right game?) and the view
 montage (each tile = one distinct camera view; expect ~13–25 on a full game). Output:

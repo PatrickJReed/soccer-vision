@@ -24,10 +24,12 @@
 
 # %%
 # ---- CONFIG -----------------------------------------------------------------
+import hashlib
 import json
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -60,8 +62,10 @@ FIELD_ID = "riverside"              # FIELD id — powers field-held-out evaluat
 # ---- Knobs ---------------------------------------------------------------------
 DIGEST_STRIDE = 25       # view-digest sampling stride. The ORB similarity matrix is
 #                          O(samples^2): a full 90-min game at stride 25 is ~6500
-#                          samples (hours) — the digest cell warns and suggests a
-#                          stride that keeps it near ~900 samples.
+#                          samples (hours) — the digest cell AUTO-BUMPS the stride
+#                          to keep ~900 samples and says so loudly. To force denser
+#                          sampling anyway, set FORCE_DIGEST_STRIDE = True.
+FORCE_DIGEST_STRIDE = False   # True: use DIGEST_STRIDE as-is, no auto-adjust
 DIGEST_DIST_THRESHOLD = 0.5
 REGISTER_STRIDE = 5      # frame stride for view registration. Keep it a divisor of
 #                          round(fps) (30 for Trace) so the generator's 1-second
@@ -112,17 +116,26 @@ def _read_frames_at(video_path, indices):
     return out
 
 
+def _pack_hash(rep_map):
+    """Content stamp for a rep pack: sha1 over the sorted (tiny, frame, view)
+    triples. Written into rep_map.json as "_pack_hash"; load_rep_map verifies it."""
+    triples = sorted((int(t), int(m["frame"]), int(m["view"]))
+                     for t, m in rep_map.items())
+    return hashlib.sha1(json.dumps(triples).encode()).hexdigest()[:16]
+
+
 def build_rep_pack(video_path, representatives, out_dir, *, fps=2.0):
     """Write the few-MB rep pack: rep_video.mp4 + rep_map.json; return the map.
 
     rep_video.mp4 holds ONE original-resolution frame per view, ordered by
     ORIGINAL frame index (chronological — scrubs naturally in the labeler),
-    written via cv2.VideoWriter mp4v (keyframe cadence is codec-default, but a
-    ~13-25-frame video scrubs instantly in the labeler regardless).
+    written via cv2.VideoWriter mp4v then re-encoded truly ALL-INTRA (ffmpeg
+    -g 1) so the labeler's frame-exact seeking assumption holds literally.
     rep_map.json maps the tiny video's frame index to
-    {"frame": original_frame, "view": view_id}; Stage B's remap inverts it.
-    Raises on any undecodable rep frame (a missing rep silently drops its whole
-    view) and re-decodes the written video to verify the frame count.
+    {"frame": original_frame, "view": view_id} (+ a "_pack_hash" stamp); Stage
+    B's remap inverts it. Raises on any undecodable rep frame (a missing rep
+    silently drops its whole view) and re-decodes the FINAL written video to
+    verify the frame count.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -134,10 +147,11 @@ def build_rep_pack(video_path, representatives, out_dir, *, fps=2.0):
                          f"a missing rep drops its whole view; check the video")
     h, w = frames[rep_items[0][0]].shape[:2]
     video_out = out_dir / "rep_video.mp4"
-    writer = cv2.VideoWriter(str(video_out), cv2.VideoWriter_fourcc(*"mp4v"),
+    tmp_out = out_dir / "rep_video_mp4v.mp4"  # cv2 write target; replaced below
+    writer = cv2.VideoWriter(str(tmp_out), cv2.VideoWriter_fourcc(*"mp4v"),
                              fps, (w, h))
     if not writer.isOpened():
-        raise ValueError(f"cv2.VideoWriter failed to open {video_out} (mp4v)")
+        raise ValueError(f"cv2.VideoWriter failed to open {tmp_out} (mp4v)")
     rep_map = {}
     for tiny, (orig, view) in enumerate(rep_items):
         img = frames[orig]
@@ -147,22 +161,45 @@ def build_rep_pack(video_path, representatives, out_dir, *, fps=2.0):
         writer.write(img)
         rep_map[tiny] = {"frame": orig, "view": view}
     writer.release()
-    n_out = 0  # verify by decoding: a silent codec failure would waste a click round
-    cap = cv2.VideoCapture(str(video_out))
+    # True all-intra re-encode: mp4v's keyframe cadence is codec-default, so force
+    # -g 1 via ffmpeg (preinstalled on Colab). If ffmpeg is absent (bare local
+    # run), keep the mp4v file with a warning — a ~13-25-frame video still scrubs.
+    if shutil.which("ffmpeg"):
+        subprocess.check_call(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(tmp_out), "-c:v", "libx264",
+             "-g", "1", "-keyint_min", "1", "-x264-params", "scenecut=0",
+             "-crf", "18", "-pix_fmt", "yuv420p", str(video_out)])
+        tmp_out.unlink()
+    else:
+        print("WARNING: ffmpeg not found — keeping the mp4v encode (not strictly "
+              "all-intra; fine for a tiny rep video)")
+        tmp_out.replace(video_out)
+    n_out = 0  # verify the FINAL file by decoding (after the remux): a silent
+    cap = cv2.VideoCapture(str(video_out))  # codec failure would waste a click round
     while cap.read()[0]:
         n_out += 1
     cap.release()
     if n_out != len(rep_items):
         raise ValueError(f"rep_video decodes {n_out} frames, expected {len(rep_items)}")
-    (out_dir / "rep_map.json").write_text(json.dumps(rep_map, indent=2))
+    (out_dir / "rep_map.json").write_text(
+        json.dumps({**rep_map, "_pack_hash": _pack_hash(rep_map)}, indent=2))
     return rep_map
 
 
 def load_rep_map(path):
-    """rep_map.json -> {tiny_index (int): {"frame": int, "view": int}}."""
+    """rep_map.json -> {tiny_index (int): {"frame": int, "view": int}}.
+
+    Verifies the "_pack_hash" stamp when present — a corrupted or hand-edited
+    map must never silently mis-anchor views.
+    """
     raw = json.loads(Path(path).read_text())
-    return {int(k): {"frame": int(v["frame"]), "view": int(v["view"])}
-            for k, v in raw.items()}
+    out = {int(k): {"frame": int(v["frame"]), "view": int(v["view"])}
+           for k, v in raw.items() if not k.startswith("_")}
+    stamp = raw.get("_pack_hash")
+    if stamp is not None and stamp != _pack_hash(out):
+        raise ValueError(f"{path}: _pack_hash mismatch — rep_map.json does not "
+                         f"match its stamp (corrupted or hand-edited)")
+    return out
 
 
 def remap_rep_homographies(tiny_parquet, rep_map, out_path=None):
@@ -221,6 +258,25 @@ def probe_video(path):
     return n, fps, w, h
 
 
+def _run_url_safe(cmd, url):
+    """Run a command whose argv contains the unlisted URL without ever echoing it.
+
+    pull_trace_clip has no quiet flag and yt-dlp prints lines like
+    'Extracting URL: https://...', so output is captured and re-printed with
+    http-bearing lines dropped; failures re-raise a clean RuntimeError with the
+    URL redacted from argv (never a raw CalledProcessError carrying the URL).
+    This keeps the unlisted family-playlist URL out of saved cell output.
+    """
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    for stream in (proc.stdout, proc.stderr):
+        for ln in (stream or "").splitlines():
+            if "http" not in ln.lower():
+                print(ln)
+    if proc.returncode != 0:
+        redacted = [("<playlist-url>" if a == url else a) for a in cmd]
+        raise RuntimeError(f"pull step failed (exit {proc.returncode}): {redacted}")
+
+
 def ensure_game_video():
     """Pull game GAME_NUMBER onto the EPHEMERAL disk unless already there.
 
@@ -229,7 +285,13 @@ def ensure_game_video():
     cell; Colab preinstalls ffmpeg). The video lands on /content ONLY: never on
     Drive, never local. Prints the playlist titles (not URLs) for an eyeball
     check that GAME_NUMBER is the right game.
+
+    Re-pull determinism: YouTube serves a stable 1080p encode, so frame indices
+    are stable across pulls — a Stage B re-pull anchors to the same frames the
+    rep pack was built from.
     """
+    # >50 MB is a heuristic completeness check only: yt-dlp downloads to .part
+    # files and renames on completion, so a partial at the final path is unlikely.
     if VIDEO_PATH.exists() and VIDEO_PATH.stat().st_size > 50 * 2**20:
         print(f"video already on ephemeral disk: {VIDEO_PATH} "
               f"({VIDEO_PATH.stat().st_size / 2**30:.2f} GB) — skipping pull")
@@ -237,9 +299,9 @@ def ensure_game_video():
     url = read_playlist_url()
     script = REPO_DIR / "examples" / "pull_trace_clip.py"
     print(f"playlist entries (game {GAME_NUMBER} will be pulled):")
-    subprocess.check_call([sys.executable, str(script), url, "--list"])
-    subprocess.check_call([sys.executable, str(script), url,
-                           "--game", str(GAME_NUMBER), "--out", str(VIDEO_PATH)])
+    _run_url_safe([sys.executable, str(script), url, "--list"], url)
+    _run_url_safe([sys.executable, str(script), url,
+                   "--game", str(GAME_NUMBER), "--out", str(VIDEO_PATH)], url)
     n, fps, w, h = probe_video(VIDEO_PATH)
     print(f"pulled {VIDEO_PATH.name}: {n} frames @ {fps:.4g} fps, {w}x{h}, "
           f"{VIDEO_PATH.stat().st_size / 2**30:.2f} GB (ephemeral disk)")
@@ -301,14 +363,23 @@ if RUN_CELLS and (FORCE_STAGE_A or not stage_a_done()):
     from soccer_vision.labeler.view_digest import compute_view_digest, render_digest
 
     n_frames, fps, _w, _h = probe_video(VIDEO_PATH)
-    n_samples = len(range(0, max(n_frames, 1), DIGEST_STRIDE))
-    if n_samples > 1200:
-        print(f"WARNING: {n_samples} digest samples at stride {DIGEST_STRIDE} — the "
-              f"ORB similarity matrix is O(n^2) and will take hours. Consider "
-              f"DIGEST_STRIDE = {max(DIGEST_STRIDE, -(-n_frames // 900))} "
-              f"(~900 samples).")
+    digest_stride = DIGEST_STRIDE
+    n_samples = len(range(0, max(n_frames, 1), digest_stride))
+    if n_samples > 1200 and not FORCE_DIGEST_STRIDE:
+        # The ORB similarity matrix is O(samples^2): ~6500 samples (a full game at
+        # stride 25) means HOURS on Colab CPU. Auto-adjust keeps Run-all usable.
+        digest_stride = max(DIGEST_STRIDE, -(-n_frames // 900))
+        n_samples = len(range(0, max(n_frames, 1), digest_stride))
+        print(f"AUTO-ADJUST: DIGEST_STRIDE {DIGEST_STRIDE} -> {digest_stride} "
+              f"({n_samples} samples; O(samples^2) similarity would take hours at "
+              f"the configured stride). To force denser sampling set DIGEST_STRIDE "
+              f"explicitly AND FORCE_DIGEST_STRIDE = True.")
+    elif n_samples > 1200:
+        print(f"WARNING: FORCE_DIGEST_STRIDE=True keeps {n_samples} samples at "
+              f"stride {digest_stride} — the O(n^2) similarity matrix will take "
+              f"hours on Colab CPU")
     digest = compute_view_digest(
-        VIDEO_PATH, stride=DIGEST_STRIDE, dist_threshold=DIGEST_DIST_THRESHOLD,
+        VIDEO_PATH, stride=digest_stride, dist_threshold=DIGEST_DIST_THRESHOLD,
         cache_dir=WORK_DIR / "cache")
     digest_dir = WORK_DIR / "digest"
     render_digest(digest, VIDEO_PATH, digest_dir)
@@ -324,6 +395,16 @@ if RUN_CELLS and (FORCE_STAGE_A or not stage_a_done()):
 # %%
 # ---- Stage A: build the rep pack -> Drive ----------------------------------------
 if RUN_CELLS and (FORCE_STAGE_A or not stage_a_done()):
+    if REP_EXPORT_DIR.exists():
+        # Any export that predates the pack being (re)built was clicked against a
+        # DIFFERENT rep_video: its tiny indices would silently mis-anchor views.
+        stale = REP_EXPORT_DIR.with_name(
+            f"rep_export_stale_{datetime.now():%Y%m%d_%H%M%S}")
+        REP_EXPORT_DIR.rename(stale)
+        print(f"STALE EXPORT MOVED: {REP_EXPORT_DIR.name} predates this rep-pack "
+              f"build -> {stale.name}. Re-click the NEW rep_video.mp4 and upload a "
+              f"fresh rep_export/ (Stage B cannot detect overlap-but-different "
+              f"maps on its own — this move is what prevents mis-anchoring).")
     rep_map = build_rep_pack(VIDEO_PATH, digest.representatives, REP_PACK_DIR)
     for name in ("view_digest.json", "views_montage.png"):
         shutil.copy2(WORK_DIR / "digest" / name, REP_PACK_DIR / name)
@@ -376,6 +457,11 @@ if RUN_CELLS and stage_b_ready():
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
     rep_map = load_rep_map(REP_PACK_DIR / "rep_map.json")
     remapped_path = SESSION_DIR / "rep_homographies.parquet"
+    # Stale-export guards: remap raises unless the export's tiny indices are a
+    # SUBSET of the current rep_map, and Stage A renames any pre-existing
+    # rep_export/ to rep_export_stale_* whenever it rebuilds the pack. An export
+    # whose indices overlap a DIFFERENT map (rebuilt pack, similar size) is NOT
+    # auto-detectable here — the Stage A stale-move is what prevents that case.
     remap_rep_homographies(
         REP_EXPORT_DIR / "homographies.parquet", rep_map, out_path=remapped_path)
     digest = _digest_from_json(REP_PACK_DIR / "view_digest.json")
@@ -387,14 +473,21 @@ if RUN_CELLS and stage_b_ready():
               f"frames can only register to OTHER views (or gap). Re-click those "
               f"frames locally and re-upload rep_export/.")
     n_frames, fps, _w, _h = probe_video(VIDEO_PATH)
+    assert round(fps) % REGISTER_STRIDE == 0, (
+        f"REGISTER_STRIDE={REGISTER_STRIDE} must divide round(fps)={round(fps)} "
+        f"or the generator's 1s anchor (frame % {round(fps)} == 0) misses every "
+        f"registered frame")
     frames = sorted(set(range(0, max(n_frames, 1), REGISTER_STRIDE))
                     | {digest.representatives[v] for v in rep_h
                        if digest.representatives[v] < n_frames})
     calib = register_clip(VIDEO_PATH, digest, rep_h, frames=frames)
     write_homographies(calib, SESSION_DIR / "homographies.parquet")
     s = calib.stats
+    # 0.6 = the generator's default --min-confidence trust gate (line_dataset)
+    usable = sum(1 for e in calib.homographies.values() if e.confidence >= 0.6)
     print(f"registered {s['n_registered']} + {s['n_rep']} rep of {s['n_frames']} "
-          f"frames (stride {REGISTER_STRIDE}); coverage {s['coverage']:.1%}, "
+          f"frames (stride {REGISTER_STRIDE}); coverage {s['coverage']:.1%} "
+          f"(generator-usable @ conf>=0.6: {usable / max(s['n_frames'], 1):.1%}), "
           f"median inliers {s['median_inliers']:.0f}")
     if s["coverage"] < COVERAGE_WARN:
         print(f"WARNING: coverage {s['coverage']:.1%} < {COVERAGE_WARN:.0%} — some "
@@ -423,8 +516,17 @@ if RUN_CELLS and stage_b_ready():
 # %%
 # ---- Stage B: register the game in DRIVE_ROOT/games.toml (idempotent upsert) ----
 def _toml_value(v):
-    """TOML literal for a scalar (JSON string escaping is valid TOML basic-string)."""
-    return json.dumps(v) if isinstance(v, str) else repr(v)
+    """TOML literal for a scalar (JSON string escaping is valid TOML basic-string).
+
+    Only str/int/float are supported — anything else (incl. bool, whose repr is
+    not valid TOML) raises rather than silently writing a broken registry.
+    """
+    if isinstance(v, str):
+        return json.dumps(v)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise TypeError(f"unsupported games.toml value type "
+                        f"{type(v).__name__}: {v!r}")
+    return repr(v)
 
 
 def upsert_games_toml(toml_path, game_id, entry):

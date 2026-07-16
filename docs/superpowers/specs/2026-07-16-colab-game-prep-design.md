@@ -46,6 +46,11 @@ that natively (shared focal from ≥3 diverse rep frames; per-frame anchors; no 
 
 ## Constraints & notes
 
+- YouTube bot-checks Colab's datacenter IPs (hit live 2026-07-16): pulls need
+  logged-in cookies. `DRIVE_ROOT/youtube_cookies.txt` (Netscape export, throwaway
+  account recommended) is wired into yt-dlp's default config by the setup cell when
+  present; the pull-output filter redacts links (`<link>`) instead of dropping whole
+  lines so yt-dlp ERROR text stays visible without ever echoing the unlisted URLs.
 - Colab disk holds the full video (ephemeral, fine at ~80 GB); Drive receives only:
   rep pack (MBs), session parquets (KBs–MBs), and the dataset pairs (~0.3–0.7 GB/game —
   note Drive-space in the notebook).

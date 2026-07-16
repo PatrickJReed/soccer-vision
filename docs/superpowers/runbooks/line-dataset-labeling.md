@@ -14,6 +14,16 @@ Create `MyDrive/soccer-vision/` on Drive and put the unlisted Trace playlist URL
 intentionally **never** in the repo or notebook — the repo is public, the playlist is
 unlisted family video. Mind Drive space: each game adds ~0.3–0.7 GB of dataset pairs.
 
+Also add `MyDrive/soccer-vision/youtube_cookies.txt`: YouTube bot-checks Colab's
+datacenter IPs (`Sign in to confirm you're not a bot`), so the pull needs logged-in
+cookies. Use a **throwaway Google account** (unlisted videos are viewable by any
+signed-in account, and accounts whose cookies are used from datacenter IPs risk
+flags): in an incognito window, sign into youtube.com, export youtube.com cookies in
+Netscape format (e.g. the "Get cookies.txt LOCALLY" extension), close the incognito
+window WITHOUT logging out, upload the file to Drive. Treat it like a password — it
+lives only on your private Drive. The setup cell wires it into yt-dlp automatically
+when present.
+
 ## 1. Stage A — Colab: pull → digest → rep pack
 
 Open `scripts/colab_game_prep.ipynb` in Colab (CPU runtime is fine). In the CONFIG

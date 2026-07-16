@@ -26,6 +26,7 @@
 # ---- CONFIG -----------------------------------------------------------------
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -54,6 +55,11 @@ DRIVE_ROOT = Path("/content/drive/MyDrive/soccer-vision")
 # committed notebook. Put the URL(s) in this text file on your Drive, one per
 # line; PLAYLIST_LINE picks the line (1-based).
 PLAYLIST_FILE = DRIVE_ROOT / "trace_playlist_url.txt"
+# YouTube bot-checks datacenter IPs (Colab): downloads need logged-in cookies.
+# Export youtube.com cookies (Netscape format; a throwaway account is fine —
+# the videos are unlisted, any signed-in account passes) and put them here.
+# The setup cell wires them into yt-dlp's default config when the file exists.
+COOKIES_FILE = DRIVE_ROOT / "youtube_cookies.txt"
 PLAYLIST_LINE = 1
 GAME_NUMBER = 1                     # 1-based game index in the playlist (--list order)
 GAME_ID = "riverside_2026_07a"      # dataset game id (bare TOML key: [A-Za-z0-9_-])
@@ -258,20 +264,30 @@ def probe_video(path):
     return n, fps, w, h
 
 
+_LINK_RE = re.compile(r"https?://\S+")
+
+
 def _run_url_safe(cmd, url):
     """Run a command whose argv contains the unlisted URL without ever echoing it.
 
     pull_trace_clip has no quiet flag and yt-dlp prints lines like
     'Extracting URL: https://...', so output is captured and re-printed with
-    http-bearing lines dropped; failures re-raise a clean RuntimeError with the
-    URL redacted from argv (never a raw CalledProcessError carrying the URL).
-    This keeps the unlisted family-playlist URL out of saved cell output.
+    every link redacted to '<link>' (dropping whole http-bearing lines hid the
+    real yt-dlp ERROR text — the 2026-07-16 bot-check failure was invisible);
+    any line still carrying the playlist id after redaction is dropped outright.
+    Failures re-raise a clean RuntimeError with the URL redacted from argv
+    (never a raw CalledProcessError carrying the URL). This keeps the unlisted
+    family-playlist URL out of saved cell output.
     """
+    list_id = url.split("list=")[-1].split("&")[0] if "list=" in url else url
     proc = subprocess.run(cmd, capture_output=True, text=True)
     for stream in (proc.stdout, proc.stderr):
         for ln in (stream or "").splitlines():
-            if "http" not in ln.lower():
-                print(ln)
+            ln = ln.replace(url, "<playlist-url>")
+            ln = _LINK_RE.sub("<link>", ln)
+            if list_id in ln:
+                continue
+            print(ln)
     if proc.returncode != 0:
         redacted = [("<playlist-url>" if a == url else a) for a in cmd]
         raise RuntimeError(f"pull step failed (exit {proc.returncode}): {redacted}")
@@ -341,6 +357,19 @@ if RUN_CELLS:
         drive.mount("/content/drive")
     for d in (DRIVE_ROOT, GAME_DIR, WORK_DIR):
         d.mkdir(parents=True, exist_ok=True)
+    # Wire Drive cookies into yt-dlp's default config (read by every yt-dlp
+    # invocation, incl. pull_trace_clip's) — Colab's datacenter IPs hit
+    # YouTube's "Sign in to confirm you're not a bot" without them.
+    if COOKIES_FILE.exists():
+        _ytdlp_cfg = Path.home() / ".config" / "yt-dlp"
+        _ytdlp_cfg.mkdir(parents=True, exist_ok=True)
+        (_ytdlp_cfg / "config").write_text(f"--cookies {COOKIES_FILE}\n")
+        print(f"yt-dlp cookies wired from {COOKIES_FILE}")
+    else:
+        print(f"NOTE: no {COOKIES_FILE.name} on Drive — if the pull fails with "
+              f"'Sign in to confirm you're not a bot', export youtube.com "
+              f"cookies (Netscape format; throwaway account fine) to "
+              f"{COOKIES_FILE} and re-run this cell (see the runbook)")
     print(f"repo @ {GIT_REF[:12]} | drive root: {DRIVE_ROOT} | game: {GAME_ID}")
 
 # %% [markdown]

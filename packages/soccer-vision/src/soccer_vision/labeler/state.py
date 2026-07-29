@@ -484,6 +484,23 @@ class LabelerState:
                     for k, (med, p90, n) in rep.prop_by_end.items()},
                 "passed_numeric": rep.passed_numeric,
             }, indent=2))
+        elif self._engine == "physical":
+            with self._lock:
+                calib = self._last_calib
+            if calib is not None and calib.focal_of:
+                vals = sorted(calib.focal_of.values())
+                spread = (float(np.percentile(vals, 90) / np.percentile(vals, 10))
+                          if len(vals) > 1 else 1.0)
+                (out / "calib_gate.json").write_text(json.dumps({
+                    "engine": "physical",
+                    # Focal transparency (spec 2026-07-28 §5): which frames run on a
+                    # fitted vs fallback focal, and how wide the session's zoom range is.
+                    "focal": {
+                        "per_frame": {str(f): v for f, v in sorted(calib.focal_of.items())},
+                        "source": {str(f): s for f, s in sorted(calib.focal_source.items())},
+                        "spread_p90_p10": spread,
+                    },
+                }, indent=2))
         if self.line_clicks:
             pd.DataFrame(
                 [{"frame": lc.frame, "line_id": lc.line_id, "x_px": lc.x * w, "y_px": lc.y * h}

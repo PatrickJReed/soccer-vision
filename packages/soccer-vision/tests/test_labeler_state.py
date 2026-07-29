@@ -422,3 +422,26 @@ def test_bulk_add_clicks_keeps_lists_in_lockstep_with_worker_live() -> None:
         assert len(st._seq) == len(st.clicks) + len(st.line_clicks)
     finally:
         st.stop_worker()
+
+
+def test_export_physical_gate_json_has_focal_block(tmp_path: Path) -> None:
+    import json
+
+    interframe, poses, clicks = _pan_session(9)
+    anchors = _spread_anchors(9)
+    st = LabelerState(interframe, 9, size=SIZE)
+    try:
+        st.add_clicks(clicks)
+        st.add_line_clicks(_near_tl_clicks(poses, anchors))
+        st.wait_idle(timeout=10)
+        st.export(tmp_path)
+        gate = json.loads((tmp_path / "calib_gate.json").read_text())
+        assert gate["engine"] == "physical"
+        focal = gate["focal"]
+        assert set(focal) == {"per_frame", "source", "spread_p90_p10"}
+        assert set(focal["per_frame"]) == set(focal["source"])
+        assert len(focal["per_frame"]) >= 3  # the session's anchors
+        assert all(s in ("fit", "median", "shared") for s in focal["source"].values())
+        assert focal["spread_p90_p10"] >= 1.0
+    finally:
+        st.stop_worker()

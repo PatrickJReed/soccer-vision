@@ -243,6 +243,17 @@ def main() -> None:
               f"  p90={report.prop_p90_ft:6.2f}  n={report.prop_n}")
         print(f"  NUMERIC (fg med<=5 & p90<=12, prop med<=5): "
               f"{'PASS' if report.passed_numeric else 'FAIL'}")
+        # Focal transparency (spec 2026-07-28 §5): the SESSION solve's per-anchor focals
+        # (not the crop calib) — how many frames run on a fitted vs fallback focal.
+        calib = solve_session(points, lines, size, transforms, segment_of=segment_of)
+        if calib.focal_source:
+            srcs = list(calib.focal_source.values())
+            vals = sorted(calib.focal_of.values())
+            spread = (float(np.percentile(vals, 90) / np.percentile(vals, 10))
+                      if len(vals) > 1 else 1.0)
+            print(f"  focal: {srcs.count('fit')} fit / {srcs.count('median')} median / "
+                  f"{srcs.count('shared')} shared | {min(vals):.0f}-{max(vals):.0f}px | "
+                  f"spread p90/p10 {spread:.3f}")
 
     if args.engine in ("crop", "both"):
         print_crop_report(points, lines, size, transforms, segment_of)

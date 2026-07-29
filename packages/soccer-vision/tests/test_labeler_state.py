@@ -442,11 +442,15 @@ def test_delete_click_removes_all_for_landmark_and_keeps_seq() -> None:
         assert len(st.clicks) == n_before - 2
         assert not any(c.frame == f0 and c.kp_idx == kp0 for c in st.clicks)
         assert len(st._seq) == len(st.clicks) + len(st.line_clicks)  # lockstep
+        assert st._seq.count("pt") == len(st.clicks)                 # kind lockstep
+        assert st._seq.count("ln") == len(st.line_clicks)
         # undo after a targeted delete pops the correct (surviving) last click
         last = st.clicks[-1]
         st.remove_last()
         assert not any(c is last for c in st.clicks)
         assert len(st._seq) == len(st.clicks) + len(st.line_clicks)
+        assert st._seq.count("pt") == len(st.clicks)
+        assert st._seq.count("ln") == len(st.line_clicks)
     finally:
         st.stop_worker()
 
@@ -480,9 +484,69 @@ def test_delete_line_click_nearest_within_eps() -> None:
         assert st.delete_line_click(target.frame, target.line_id, target.x, target.y)
         assert len(st.line_clicks) == n - 1
         assert len(st._seq) == len(st.clicks) + len(st.line_clicks)
+        assert st._seq.count("pt") == len(st.clicks)                 # kind lockstep
+        assert st._seq.count("ln") == len(st.line_clicks)
         # far-away coords: nothing within eps
         assert not st.delete_line_click(target.frame, target.line_id, 0.0, 0.0)
         assert len(st.line_clicks) == n - 1
+    finally:
+        st.stop_worker()
+
+
+def test_delete_click_interleaved_keeps_seq_kind_positions() -> None:
+    # _seq kind/position mapping under an interleaved pt/ln/pt tail: length checks alone
+    # cannot catch a wrong-position deletion (same length, wrong kind), so this asserts
+    # kind counts AND that undo pops the right KINDS afterwards.
+    interframe, _poses, clicks = _pan_session(9)
+    st = LabelerState(interframe, 9, size=SIZE)
+    try:
+        st.add_clicks(clicks)                       # booted session (all "pt" so far)
+        st.add_click(1, 3, 0.3, 0.3)                # A  -> _seq tail ["pt",
+        st.add_line_click(1, "midline", 0.5, 0.5)   # L  ->             "ln",
+        st.add_click(1, 7, 0.6, 0.6)                # B  ->             "pt"]
+        st.wait_idle(timeout=10)
+        assert st.delete_click(1, 7) == 1           # delete B only (kp distinct from A)
+        assert st._seq.count("pt") == len(st.clicks)
+        assert st._seq.count("ln") == len(st.line_clicks)
+        n_pts, n_lns = len(st.clicks), len(st.line_clicks)
+        st.remove_last()                            # must pop L (a LINE), not a point
+        assert len(st.line_clicks) == n_lns - 1
+        assert len(st.clicks) == n_pts
+        st.remove_last()                            # must pop A (a POINT)
+        assert len(st.clicks) == n_pts - 1
+        assert len(st.line_clicks) == n_lns - 1
+        assert not any(c.frame == 1 and c.kp_idx == 3 for c in st.clicks)
+        assert st._seq.count("pt") == len(st.clicks)
+        assert st._seq.count("ln") == len(st.line_clicks)
+    finally:
+        st.stop_worker()
+
+
+def test_delete_line_click_interleaved_keeps_seq_kind_positions() -> None:
+    # Same interleaved pt/ln/pt tail, but deleting L via delete_line_click: the deleted
+    # _seq position must be L's "ln" slot, not the line-list index reused as a _seq
+    # index (which would silently eat a bootstrap "pt" at the same length).
+    interframe, _poses, clicks = _pan_session(9)
+    st = LabelerState(interframe, 9, size=SIZE)
+    try:
+        st.add_clicks(clicks)                       # booted session (all "pt" so far)
+        st.add_click(1, 3, 0.3, 0.3)                # A
+        st.add_line_click(1, "midline", 0.5, 0.5)   # L
+        st.add_click(1, 7, 0.6, 0.6)                # B
+        st.wait_idle(timeout=10)
+        assert st.delete_line_click(1, "midline", 0.5, 0.5)   # delete L only
+        assert st._seq.count("pt") == len(st.clicks)
+        assert st._seq.count("ln") == len(st.line_clicks)
+        n_pts, n_lns = len(st.clicks), len(st.line_clicks)
+        st.remove_last()                            # must pop B (a POINT)
+        assert len(st.clicks) == n_pts - 1
+        assert len(st.line_clicks) == n_lns
+        assert not any(c.frame == 1 and c.kp_idx == 7 for c in st.clicks)
+        st.remove_last()                            # must pop A (a POINT)
+        assert len(st.clicks) == n_pts - 2
+        assert not any(c.frame == 1 and c.kp_idx == 3 for c in st.clicks)
+        assert st._seq.count("pt") == len(st.clicks)
+        assert st._seq.count("ln") == len(st.line_clicks)
     finally:
         st.stop_worker()
 

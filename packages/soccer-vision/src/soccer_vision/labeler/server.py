@@ -158,8 +158,14 @@ def make_handler(
                 else:
                     self._json({"error": "no click at frame/kp_idx"}, code=404)
             elif self.path == "/api/delete_line_click":
+                from soccer_vision.calib.field_model import FIELD_LINES
+                line_id = str(payload["line_id"])
+                if line_id not in FIELD_LINES:  # same guard as /api/line_click, so the
+                    # 404 below always means a REAL miss, never a typoed line name
+                    self._json({"error": f"unknown line_id {line_id!r}"}, code=400)
+                    return
                 found = state.delete_line_click(
-                    int(payload["frame"]), str(payload["line_id"]),
+                    int(payload["frame"]), line_id,
                     float(payload["x"]), float(payload["y"]))
                 if found:
                     self._json(self._state_payload())

@@ -113,7 +113,11 @@ class LabelerState:
         self._transforms = cumulative_transforms(interframe, self._segment_of)
         self.clicks: list[Click] = []
         self.line_clicks: list[LineClick] = []
-        self._seq: list[str] = []  # insertion order across clicks ("pt") + line_clicks ("ln")
+        # _seq invariant: insertion order across clicks ("pt") + line_clicks ("ln");
+        # positionally, the i-th "pt" entry corresponds to clicks[i] and the i-th "ln"
+        # to line_clicks[i]. All three writer families (add_*, remove_last,
+        # delete_click/delete_line_click) maintain this under _lock.
+        self._seq: list[str] = []
         self._fits: dict[int, CalibFrame] = {}
         # warm-start seed for the next physical solve (the crop engine takes no seed
         # and never writes this)
@@ -359,8 +363,9 @@ class LabelerState:
         (add_click appends, so stacked mislabels are possible and must clear in one
         gesture). _seq lockstep: the i-th "pt" entry of _seq corresponds to
         self.clicks[i], so the matching _seq positions are dropped in the same locked
-        block. Rebinding (not in-place mutation) keeps any lock-free iterator over the
-        old list consistent."""
+        block. Cross-thread readers snapshot under _lock and same-thread readers
+        serialize on the single-threaded HTTP server; there is no lock-free-iterator
+        guarantee here (the line-click path mutates in place)."""
         with self._lock:
             keep = [i for i, c in enumerate(self.clicks)
                     if not (c.frame == frame and c.kp_idx == kp_idx)]

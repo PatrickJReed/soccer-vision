@@ -355,6 +355,15 @@ def test_delete_line_click_endpoint_roundtrip() -> None:
             assert "error" in json.loads(e.read())
         else:
             raise AssertionError("expected HTTP 404")
+        # unknown line_id is a 400 (same guard as /api/line_click), never a lying 404
+        try:
+            _post(f"{base}/api/delete_line_click",
+                  {"frame": 0, "line_id": "not_a_line", "x": 0.4, "y": 0.6})
+        except HTTPError as e:
+            assert e.code == 400
+            assert "unknown line_id" in json.loads(e.read())["error"]
+        else:
+            raise AssertionError("expected HTTP 400")
     finally:
         httpd.shutdown()
 

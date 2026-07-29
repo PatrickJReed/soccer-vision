@@ -183,6 +183,9 @@ function canvasNorm(e){
 }
 
 canvas.onmousedown = (e) => {
+  if (e.button !== 0) return;   // right/middle button must never arm drag-nudge:
+  // on macOS contextmenu fires at mousedown, so a right-click delete would otherwise
+  // grab the marker, jitter would set didDrag, and mouseup would nudge a deleted click
   const [x, y] = canvasNorm(e);
   dragging = null;
   for (let i = clicks.length - 1; i >= 0; i--) {
@@ -273,6 +276,7 @@ document.getElementById("timeline").onclick=(e)=>{   // click a colour band -> j
   if(nFrames>1) loadFrame(Math.round(frac*(nFrames-1)));
 };
 document.getElementById("undo").onclick=async()=>{
+  hoverDelete=null;   // the ringed marker may be the click being undone
   applyState(await postJSON("/api/undo",{}));
   const cl=await api("/api/clicks"); clicks=cl.clicks; lineClicks=cl.line_clicks||[];
   placed=new Set(clicks.map(c=>c.kp_idx));

@@ -5,7 +5,7 @@ earlier free-homography bundle. Pure: no I/O."""
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -24,6 +24,12 @@ from soccer_vision.calib.field_model import (
 )
 from soccer_vision.calib.validate import fold_count
 from soccer_vision.pitch.calib_anchor import flag_outlier_clicks, frame_homography
+from soccer_vision.pitch.focal import (
+    MIN_ACCEPTED_FITS,
+    FocalFit,
+    fit_frame_focal,
+    session_focal,
+)
 from soccer_vision.pitch.homography import HomographyError, fit_homography
 from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 from soccer_vision.pitch.manual_anchor import Click, LineClick
@@ -177,6 +183,32 @@ def _grade(
     return "yellow"
 
 
+def _frame_err_at(
+    po: list[tuple[int, float, float]],
+    lo: list[tuple[str, float, float]],
+    size: tuple[int, int],
+) -> Callable[[float], float | None]:
+    """Median in-sample residual (ft) of one frame's clicks as a function of focal —
+    the same residuals _grade uses. None where no pose solves. This is the closure
+    fed to focal.fit_frame_focal (focal.py never imports this module)."""
+    w, h = size
+    diag = np.diag([float(w), float(h), 1.0])
+
+    def err_at(f: float) -> float | None:
+        k = np.array([[f, 0.0, w / 2.0], [0.0, f, h / 2.0], [0.0, 0.0, 1.0]])
+        pose = _anchor_pose(k, po, lo, None)
+        if pose is None:
+            return None
+        h_norm = np.asarray(frame_homography(k, *pose), dtype=np.float64) @ diag
+        errs = [_point_feet(_apply(h_norm, np.array([[x / w, y / h]]))[0], kp)
+                for kp, x, y in po]
+        errs += [_line_perp_feet(_apply(h_norm, np.array([[x / w, y / h]]))[0], lid)
+                 for lid, x, y in lo]
+        return float(np.median(errs)) if errs else None
+
+    return err_at
+
+
 def _grid(n: int) -> NDArray[np.float64]:
     xs = np.linspace(0.0, 1.0, n)
     gx, gy = np.meshgrid(xs, xs)
@@ -216,6 +248,18 @@ class PhysicalCalib:
     # segment start, so propagation may only compose anchors WITHIN a frame's own segment.
     # Empty == treat the whole clip as one segment (frames/anchors all in segment 0).
     segment_of: dict[int, int] = field(default_factory=dict)
+    # Per-anchor focal (spec 2026-07-28): frame -> focal px and its source
+    # ("fit" | "median" | "shared"). Empty for the pre-focal empty-calib path.
+    focal_of: dict[int, float] = field(default_factory=dict)
+    focal_source: dict[int, str] = field(default_factory=dict)
+
+    def frame_K(self, frame: int) -> NDArray[np.float64]:
+        """This frame's intrinsics (per-anchor focal); nominal K for unknown frames."""
+        f = self.focal_of.get(frame)
+        if f is None:
+            return self.K
+        w, h = self.size
+        return np.array([[f, 0.0, w / 2.0], [0.0, f, h / 2.0], [0.0, 0.0, 1.0]])
 
     def is_anchor(self, frame: int) -> bool:
         return frame in self.anchor_h
@@ -302,7 +346,7 @@ def solve_session(
         for f, cs in by_pt.items()
     }
     try:
-        K = calibrate_camera(obs, size, min_points=6).K
+        k0 = calibrate_camera(obs, size, min_points=6).K
     except CalibError:
         # A physical calibration needs a shared focal from >= 3 diverse views. With fewer,
         # there is no physical solution yet -> return an empty calib (no anchors); the
@@ -310,31 +354,62 @@ def solve_session(
         # fall back to a free per-frame homography -- that is exactly the model this engine
         # replaces (it is non-physical and folds the field into the sky).
         return PhysicalCalib(np.eye(3), {}, {}, {}, tf, size, gap_guard, seg_of)
-    clean, _flagged = flag_outlier_clicks(points, K, size)
+    # Two-pass outlier flagging (spec §1.2): K0 only seeds pass 1; K1 is refit on the
+    # pass-1 clean set and re-flags the ORIGINAL clicks, so a click that fails the
+    # final flagging never touches any focal used for poses.
+    clean1, _ = flag_outlier_clicks(points, k0, size)
+    obs1 = {f: [(int(c.kp_idx), float(c.x * w), float(c.y * h)) for c in cs]
+            for f, cs in _group(clean1).items()}
+    try:
+        k1 = calibrate_camera(obs1, size, min_points=6).K
+    except CalibError:
+        k1 = k0
+    clean, _flagged = flag_outlier_clicks(points, k1, size)
     by_clean = _group(clean)
+    f1 = float(k1[0, 0])
     diag = np.diag([float(w), float(h), 1.0])
+    # Per-frame observations for every frame that will get a pose
+    frame_obs: dict[int, tuple[list[tuple[int, float, float]],
+                               list[tuple[str, float, float]]]] = {}
+    for f in sorted(by_clean):
+        pcs = by_clean[f]
+        if len({c.kp_idx for c in pcs}) < min_points:
+            continue
+        frame_obs[f] = (
+            [(int(c.kp_idx), float(c.x * w), float(c.y * h)) for c in pcs],
+            [(str(lc.line_id), float(lc.x * w), float(lc.y * h))
+             for lc in by_ln.get(f, [])],
+        )
+    # Per-anchor focal (spec §1.3): >= 6 unique ids buys a frame its own 1-D search
+    fits: dict[int, FocalFit | None] = {
+        f: (fit_frame_focal(_frame_err_at(po, lo, size), f1)
+            if len({kp for kp, _, _ in po}) >= 6 else None)
+        for f, (po, lo) in frame_obs.items()
+    }
+    focal = session_focal(fits, f1)
     poses: dict[int, tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
     anchor_h: dict[int, NDArray[np.float64]] = {}
     grade: dict[int, str] = {}
-    for f in sorted(by_clean):
-        pcs = by_clean[f]
-        lcs = by_ln.get(f, [])
-        if len({c.kp_idx for c in pcs}) < min_points:
-            continue
-        po: list[tuple[int, float, float]] = [
-            (int(c.kp_idx), float(c.x * w), float(c.y * h)) for c in pcs
-        ]
-        lo: list[tuple[str, float, float]] = [
-            (str(lc.line_id), float(lc.x * w), float(lc.y * h)) for lc in lcs
-        ]
-        pose = _anchor_pose(K, po, lo, seed.poses.get(f) if seed else None)
+    for f, (po, lo) in frame_obs.items():
+        f_px, _src = focal[f]
+        k_f = np.array([[f_px, 0.0, w / 2.0], [0.0, f_px, h / 2.0], [0.0, 0.0, 1.0]])
+        pose = _anchor_pose(k_f, po, lo, seed.poses.get(f) if seed else None)
         if pose is None:
             continue
         rv, tv = pose
         poses[f] = (rv, tv)
-        anchor_h[f] = np.asarray(frame_homography(K, rv, tv), dtype=np.float64) @ diag
-        grade[f] = _grade(K, rv, tv, po, lcs, size)
-    return PhysicalCalib(K, poses, anchor_h, grade, tf, size, gap_guard, seg_of)
+        anchor_h[f] = np.asarray(frame_homography(k_f, rv, tv), dtype=np.float64) @ diag
+        grade[f] = _grade(k_f, rv, tv, po, by_ln.get(f, []), size)
+    # Nominal K (spec §3): the session-consensus focal — median of accepted fits when
+    # the ladder is active, else f1 (identical to the pre-change shared K).
+    accepted = [v[0] for f, v in focal.items() if v[1] == "fit"]
+    f_nom = float(np.median(accepted)) if len(accepted) >= MIN_ACCEPTED_FITS else f1
+    k_nom = np.array([[f_nom, 0.0, w / 2.0], [0.0, f_nom, h / 2.0], [0.0, 0.0, 1.0]])
+    return PhysicalCalib(
+        k_nom, poses, anchor_h, grade, tf, size, gap_guard, seg_of,
+        focal_of={f: v[0] for f, v in focal.items() if f in poses},
+        focal_source={f: v[1] for f, v in focal.items() if f in poses},
+    )
 
 
 @dataclass(frozen=True)

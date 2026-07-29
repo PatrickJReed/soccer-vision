@@ -1,8 +1,11 @@
+from typing import Any
+
 import cv2
 import numpy as np
 from numpy.typing import NDArray
 from soccer_vision.calib.field_model import LENGTH_M, field_points_3d
 from soccer_vision.pitch.calib_anchor import frame_homography
+from soccer_vision.pitch.focal import FocalFit
 from soccer_vision.pitch.landmarks import PITCH_LANDMARKS
 from soccer_vision.pitch.manual_anchor import Click, LineClick
 from soccer_vision.pitch.physical_calib import (
@@ -269,3 +272,136 @@ def test_grade_yellow_when_near_touchline_is_wrong() -> None:
     assert calib.coverage_grade[bad_frame] == "yellow"          # wrong near-TL -> not green
     other = next(f for f in GATE_POSES if f != bad_frame)
     assert calib.coverage_grade[other] == "green"               # honest anchors still green
+
+
+# ---- per-frame focal (spec 2026-07-28) ----
+# Four views at four true focals: with only three, stripping one frame below 6 ids
+# (test_few_point_frame_gets_median_focal) leaves < 3 calibratable views for the shared
+# bootstrap, and a single legitimately-unconstrained frame would drop the accepted-fit
+# count below MIN_ACCEPTED_FITS and collapse the ladder to all-"shared".
+FOCALS_MZ = {0: 1330.0, 1: 1450.0, 2: 1580.0, 3: 1720.0}
+
+
+def _look_at(
+    eye: Any,
+    target: Any,
+    up: tuple[float, float, float] = (0.0, 0.0, 1.0),
+) -> tuple[Any, NDArray[np.float64]]:
+    e, t, u = np.asarray(eye, float), np.asarray(target, float), np.asarray(up, float)
+    f = t - e
+    f /= np.linalg.norm(f)
+    r = np.cross(f, u)
+    r /= np.linalg.norm(r)
+    d = np.cross(f, r)
+    rvec, _ = cv2.Rodrigues(np.vstack([r, d, f]))
+    return rvec, (-np.vstack([r, d, f]) @ e).reshape(3, 1)
+
+
+def _mz_k(focal: float) -> NDArray[np.float64]:
+    return np.array([[focal, 0, SIZE[0] / 2], [0, focal, SIZE[1] / 2], [0, 0, 1.0]])
+
+
+def _mz_clicks(frame: int, focal: float, rvec: NDArray[np.float64],
+               tvec: NDArray[np.float64]) -> list[Click]:
+    fp = field_points_3d()
+    px = cv2.projectPoints(fp, rvec, tvec, _mz_k(focal), np.zeros(5))[0].reshape(-1, 2)
+    return [Click(frame, j, float(px[j, 0]) / SIZE[0], float(px[j, 1]) / SIZE[1])
+            for j in range(21)
+            if j != 5 and 0 < px[j, 0] < SIZE[0] and 0 < px[j, 1] < SIZE[1]]
+
+
+def _mz_lines(frame: int, focal: float, rvec: NDArray[np.float64],
+              tvec: NDArray[np.float64], n: int = 3) -> list[LineClick]:
+    # No in-frame filter (same as test_labeler_state._near_tl_clicks): with this camera the
+    # near touchline sits just below the frame bottom, and the residual math is happy with
+    # normalized coords outside [0, 1]. Filtering would delete every line click.
+    obj = np.array([[0.0, y, 0.0] for y in np.linspace(5.0, LENGTH_M - 5.0, n)])
+    px = cv2.projectPoints(obj, rvec, tvec, _mz_k(focal), np.zeros(5))[0].reshape(-1, 2)
+    return [LineClick(frame, "near_touchline", float(x) / SIZE[0], float(y) / SIZE[1])
+            for x, y in px]
+
+
+def _mz_session() -> tuple[list[Click], list[LineClick]]:
+    """Four distinct poses, each rendered at a DIFFERENT true focal."""
+    clicks: list[Click] = []
+    lines: list[LineClick] = []
+    pans = [(-6.0, -8.0), (0.0, 0.0), (6.0, 8.0), (12.0, 16.0)]
+    for f, (eye_dy, look_dy) in enumerate(pans):
+        rvec, tvec = _look_at((-8.0, 34.0 + eye_dy, 9.0), (22.85, 34.0 + look_dy, 0.0))
+        clicks += _mz_clicks(f, FOCALS_MZ[f], rvec, tvec)
+        lines += _mz_lines(f, FOCALS_MZ[f], rvec, tvec)
+    return clicks, lines
+
+
+def test_per_frame_focal_recovery_multizoom() -> None:
+    clicks, lines = _mz_session()
+    calib = solve_session(clicks, lines, SIZE, {})
+    assert set(calib.focal_of) == set(FOCALS_MZ)
+    n_fit = sum(1 for s in calib.focal_source.values() if s == "fit")
+    assert n_fit >= 2  # the middle frame may legitimately match the shared estimate
+    for f, src in calib.focal_source.items():
+        if src == "fit":
+            assert abs(calib.focal_of[f] - FOCALS_MZ[f]) / FOCALS_MZ[f] < 0.02
+    assert all(g == "green" for g in calib.coverage_grade.values())
+
+
+def test_frame_k_accessor() -> None:
+    clicks, lines = _mz_session()
+    calib = solve_session(clicks, lines, SIZE, {})
+    k0 = calib.frame_K(0)
+    assert k0[0, 0] == calib.focal_of[0] and k0[0, 2] == SIZE[0] / 2
+    assert np.array_equal(calib.frame_K(999), calib.K)  # unknown frame -> nominal
+
+
+def _poison(clicks: list[Click]) -> list[Click]:
+    """Click corner_own_left (id 0) of frame 0 at the pixel where corner_own_right
+    (id 1) actually is — a catastrophic identity swap, hundreds of px wrong (id 0's
+    true projection is far outside frame 0's view; id 3 isn't visible in frame 0)."""
+    src = next(c for c in clicks if c.frame == 0 and c.kp_idx == 1)
+    return [*clicks, Click(0, 0, src.x, src.y)]
+
+
+def test_poison_click_does_not_move_other_frames() -> None:
+    clicks, lines = _mz_session()
+    clicks = [c for c in clicks if not (c.frame == 0 and c.kp_idx == 0)]
+    clean_calib = solve_session(clicks, lines, SIZE, {})
+    poisoned_calib = solve_session(_poison(clicks), lines, SIZE, {})
+    for f in (1, 2):
+        rel = abs(poisoned_calib.focal_of[f] - clean_calib.focal_of[f]) / clean_calib.focal_of[f]
+        assert rel < 0.01
+        assert poisoned_calib.coverage_grade[f] == clean_calib.coverage_grade[f]
+
+
+def test_ordering_fix_poisoned_k_equals_clean_k() -> None:
+    clicks, lines = _mz_session()
+    clicks = [c for c in clicks if not (c.frame == 0 and c.kp_idx == 0)]
+    k_clean = solve_session(clicks, lines, SIZE, {}).K[0, 0]
+    k_poisoned = solve_session(_poison(clicks), lines, SIZE, {}).K[0, 0]
+    assert abs(k_poisoned - k_clean) <= 1.0  # spec §6(c): within 1 px
+
+
+def test_fallback_ladder_wiring(monkeypatch: Any) -> None:
+    # Force every sweep unconstrained -> ladder must yield all-"shared" at f1 exactly
+    # (pre-change behavior). Patch at the physical_calib import site.
+    import soccer_vision.pitch.physical_calib as pc_mod
+
+    def unconstrained(err_at: Any, f_init: float) -> FocalFit:
+        return FocalFit(f=f_init * 1.11, constrained=False, err_ft=1.0)
+
+    monkeypatch.setattr(pc_mod, "fit_frame_focal", unconstrained)
+    clicks, lines = _mz_session()
+    calib = solve_session(clicks, lines, SIZE, {})
+    assert set(calib.focal_source.values()) == {"shared"}
+    assert len(set(calib.focal_of.values())) == 1
+    assert calib.K[0, 0] == next(iter(calib.focal_of.values()))  # nominal == f1
+
+
+def test_few_point_frame_gets_median_focal() -> None:
+    clicks, lines = _mz_session()
+    # Strip frame 1 down to 5 unique ids (below the 6-id focal threshold, above
+    # min_points=4 so it still gets a pose).
+    keep_ids = sorted({c.kp_idx for c in clicks if c.frame == 1})[:5]
+    clicks = [c for c in clicks if c.frame != 1 or c.kp_idx in keep_ids]
+    calib = solve_session(clicks, lines, SIZE, {})
+    assert 1 in calib.anchor_h
+    assert calib.focal_source[1] in ("median", "shared")

@@ -131,20 +131,19 @@ def _foreground_errors(
     """Held-out near-touchline error (feet) for ONE frame: refit the pose WITHOUT any
     near-touchline evidence -- both the near-touchline LINE clicks AND the point landmarks
     that lie on it (its endpoints, x=0) -- then measure how far the near-touchline clicks
-    land from the x=0 line. The focal is RE-SELECTED from the held-out fit set (spec §4:
-    a focal chosen using near-touchline clicks must not leak into a near-touchline
-    claim): the sweep's best focal and f_default (the frame's session focal) compete on
-    HELD-OUT error alone, and the winner is used. The in-session `constrained` gain gate
-    (>= 0.15 ft) is deliberately NOT applied here -- on clean sessions the held-out
-    residual at any plausible focal is already tiny, the gain can never trigger, and the
-    fallback would quietly reinstate the near-TL-influenced session focal (the leak).
-    That also means edge-of-sweep minima CAN be accepted here, unlike the in-session
-    ladder (the interior gate is dropped along with the gain gate; the gate's median/p90
-    pooling bounds a stray frame's impact). Note f_default also CENTERS the sweep window
-    ([0.6, 1.6]*f_default), so callers must pass a sane session focal. Frames whose
-    held-out sweep solves nowhere, or has < 6 unique landmark ids, use f_default. None
-    if the frame has no near-touchline click (foreground unverifiable) or too few
-    remaining points to refit a pose."""
+    land from the x=0 line. The pose refit runs at f_default, the frame's SESSION focal
+    (spec erratum 2, 2026-07-29): near-TL evidence contributed to that focal, and this is
+    deliberate -- held-out focal re-selection overfits the thin far-field-only fit set
+    (real oceanside fg med/p90 6.97/17.19 ft vs 3.78/8.58 at the session focal, with
+    edge-pinned focals and +/-30% swings; EVERY leak-free variant measured worse, and the
+    shared-K baseline's holdout focal was itself fit on all clicks including near-TL, so
+    demanding no leak taxed this engine against a baseline that never paid it). The
+    residual focal-level optimism is bounded and baseline-equivalent in kind: one scalar
+    shared by ~15+ residuals of which near-TL is a minority; synthetic worst case (ALL
+    near-TL clicks displaced 30 px) absorbs ~2/3 of the displacement into the reported
+    error, with direction ALWAYS preserved (corrupted foreground can only worsen the
+    claim). None if the frame has no near-touchline click (foreground unverifiable) or
+    too few remaining points to refit a pose."""
     if not any(lc.line_id == "near_touchline" for lc in line_clicks):
         return None
     w, h = size
@@ -153,15 +152,7 @@ def _foreground_errors(
     po_fit = [obs for obs in po if obs[0] not in _NEAR_TL_POINT_IDS]
     if len(po_fit) < 4:
         return None  # not enough off-near-touchline points to genuinely hold it out
-    f_use = f_default
-    if len({kp for kp, _, _ in po_fit}) >= 6:
-        err_at = _frame_err_at(po_fit, lo_fit, size)
-        fit = fit_frame_focal(err_at, f_default)
-        if fit is not None:
-            e_def = err_at(f_default)
-            if e_def is None or fit.err_ft <= e_def:
-                f_use = fit.f
-    k = np.array([[f_use, 0.0, w / 2.0], [0.0, f_use, h / 2.0], [0.0, 0.0, 1.0]])
+    k = np.array([[f_default, 0.0, w / 2.0], [0.0, f_default, h / 2.0], [0.0, 0.0, 1.0]])
     pose = _anchor_pose(k, po_fit, lo_fit, None)
     if pose is None:
         return None

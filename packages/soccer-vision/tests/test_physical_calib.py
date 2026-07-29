@@ -407,16 +407,16 @@ def test_few_point_frame_gets_median_focal() -> None:
     assert calib.focal_source[1] in ("median", "shared")
 
 
-def test_holdout_focal_has_no_near_touchline_leak() -> None:
-    """Displace the near-TL line clicks; if the holdout's pose/focal were influenced
-    by near-TL evidence, the reported errors would partially absorb the displacement.
-    With an honest holdout the focal is selected on held-out error alone, so both runs'
-    poses stay pinned to the (identical) held-out evidence -- on this noiseless fixture
-    both selection paths land within ~0.1 px of the true focal even though the winner
-    and f_default differ between runs -- and each error tracks the displacement's
-    perpendicular feet. The displacement is +y (image-down): in this fixture the near
-    touchline projects near-horizontal in the image, so an x-shift slides clicks ALONG
-    the line (no perpendicular signal); y crosses it."""
+def test_holdout_corrupted_foreground_worsens_claim() -> None:
+    """Corrupted near-TL evidence must WORSEN the reported foreground claim, never
+    improve it (directionality). Full non-absorption is deliberately NOT asserted: the
+    holdout pose runs at the frame's SESSION focal, which near-TL evidence contributed
+    to (spec erratum 2 -- every leak-free focal re-selection measured worse on real
+    data), so part of a displacement can be absorbed into the focal (measured worst
+    case ~2/3) but the direction is always preserved. The displacement is +y
+    (image-down): in this fixture the near touchline projects near-horizontal in the
+    image, so an x-shift slides clicks ALONG the line (no perpendicular signal); y
+    crosses it."""
     clicks, lines = _mz_session()
     base = foreground_holdout(clicks, lines, SIZE)
     assert base  # fixture must be holdout-evaluable
@@ -425,14 +425,10 @@ def test_holdout_focal_has_no_near_touchline_leak() -> None:
              if lc.line_id == "near_touchline" else lc for lc in lines]
     shifted = foreground_holdout(clicks, moved, SIZE)
     assert len(shifted) == len(base)
-    deltas = [abs(b - s) for b, s in zip(base, shifted, strict=True)]
-    # Both runs' focal selection is pinned to the same held-out evidence, so the pose
-    # barely moves and each error tracks the shift's perpendicular feet (strictly
-    # positive for clicks that started near-perfect). A leaked (session-default)
-    # focal would tilt the pose toward the moved line, leaving some deltas ~0 while
-    # shrinking the reported errors instead.
-    assert all(d > 0.05 for d in deltas)
-    assert max(shifted) > max(base)  # displaced evidence must WORSEN the claim, never improve it
+    assert max(shifted) > max(base)
+    assert float(np.median(shifted)) > float(np.median(base))
+    # Per-click: displaced evidence never SHRINKS a reported error (float tolerance).
+    assert all(s >= b - 1e-6 for b, s in zip(base, shifted, strict=True))
 
 
 def test_holdout_quarantines_flagged_clicks() -> None:

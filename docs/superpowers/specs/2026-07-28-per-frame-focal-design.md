@@ -102,6 +102,26 @@ any solver at all.
   fit-set error is strictly better (the constrained case is a strict subset). The
   session focal remains a candidate (that much is unavoidable — it seeds the sweep)
   but can only win on held-out evidence.
+  **ERRATUM 2 (2026-07-29, found by the §6b evidence gate — SUPERSEDES the rule
+  above):** held-out focal re-selection is an over-correction, refuted on real data.
+  On the oceanside session the re-sweep runs on thin far-field-only fit sets and
+  OVERFITS (fg holdout 6.97/17.19 ft vs baseline 4.18/9.72; one frame pinned at the
+  1.6× sweep edge, ±30% focal swings). Every leak-free variant measured worse
+  (constrained-gate 5.29/15.29, interior-only 6.03/15.29, near-TL-blind ladder
+  5.09/15.29, single median focal 3.96/13.79) because near-TL evidence contributes
+  REAL depth diversity that constrains the focal — removing it removes constraint,
+  not just leak. Meanwhile the shared-K BASELINE's holdout focal was itself fit on
+  all clicks including near-TL, so the no-leak demand taxed the new engine against a
+  baseline that never paid it. Final rule: **the holdout refits the pose without
+  near-touchline evidence at the frame's SESSION focal (no re-sweep)** — measured
+  fg 3.78/8.58, better than baseline on both. The residual focal-level optimism is
+  bounded (one scalar shared by ~15+ residuals of which near-TL is a minority;
+  synthetic worst-case with ALL near-TL clicks displaced 30 px absorbs ~2/3 of the
+  displacement into reported error, direction always preserved) and is identical in
+  kind to the baseline gate's. The leak regression test asserts DIRECTIONALITY
+  (corrupted near-TL evidence must worsen the reported claim, never improve it)
+  rather than full non-absorption. Diagnostic: scratchpad `fg_policy_diag.py`,
+  numbers in `docs/superpowers/2026-07-29-per-frame-focal-evidence.md`.
 - `propagation_holdout` calls `solve_session` on the remaining clicks and inherits
   the new pipeline automatically; no separate change beyond passing through.
 

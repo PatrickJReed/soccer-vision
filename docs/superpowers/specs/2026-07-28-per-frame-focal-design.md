@@ -91,9 +91,17 @@ any solver at all.
   ordering bug) and refits poses without near-touchline evidence. New behavior: run
   the §1 pipeline (two-pass flag + per-frame focal), and for each held-out frame
   **re-select the focal from the held-out fit set** (the po/lo WITHOUT near-touchline
-  evidence, same `fit_frame_focal` procedure, fallback to the frame's session focal
-  when unconstrained). A focal chosen using near-touchline clicks must not leak into
-  a near-touchline prediction claim.
+  evidence, same `fit_frame_focal` sweep). A focal chosen using near-touchline clicks
+  must not leak into a near-touchline prediction claim.
+  **ERRATUM (2026-07-29, found by the Task 3 leak test):** the originally spec'd
+  fallback — "use the frame's session focal when the sweep is unconstrained" — is
+  itself a leak on clean sessions: `constrained` requires ≥ MIN_FOCAL_GAIN_FT of
+  gain, which near-zero held-out residuals cannot produce, so clean frames always
+  fell back to the (near-TL-contaminated) session focal. Actual rule: **held-out
+  model selection** — accept the swept focal unless the session focal's held-out
+  fit-set error is strictly better (the constrained case is a strict subset). The
+  session focal remains a candidate (that much is unavoidable — it seeds the sweep)
+  but can only win on held-out evidence.
 - `propagation_holdout` calls `solve_session` on the remaining clicks and inherits
   the new pipeline automatically; no separate change beyond passing through.
 

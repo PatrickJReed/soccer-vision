@@ -405,3 +405,27 @@ def test_few_point_frame_gets_median_focal() -> None:
     calib = solve_session(clicks, lines, SIZE, {})
     assert 1 in calib.anchor_h
     assert calib.focal_source[1] in ("median", "shared")
+
+
+def test_holdout_focal_has_no_near_touchline_leak() -> None:
+    """Displace the near-TL line clicks; if the holdout's pose/focal were influenced
+    by near-TL evidence, the per-click error deltas would not track the displacement.
+    With an honest holdout the fit is IDENTICAL in both runs, so each error moves by
+    exactly the displacement's perpendicular feet. The displacement is +y (image-down):
+    in this fixture the near touchline projects near-horizontal in the image, so an
+    x-shift slides clicks ALONG the line (no perpendicular signal); y crosses it."""
+    clicks, lines = _mz_session()
+    base = foreground_holdout(clicks, lines, SIZE)
+    assert base  # fixture must be holdout-evaluable
+    dy_px = 30.0
+    moved = [LineClick(lc.frame, lc.line_id, lc.x, lc.y + dy_px / SIZE[1])
+             if lc.line_id == "near_touchline" else lc for lc in lines]
+    shifted = foreground_holdout(clicks, moved, SIZE)
+    assert len(shifted) == len(base)
+    deltas = [abs(b - s) for b, s in zip(base, shifted, strict=True)]
+    # Every click moved by the same +y pixel shift; under an UNCHANGED fit the error
+    # change per click is bounded by the projected shift (a few ft) and is strictly
+    # positive for clicks that started near-perfect. A leaked (refit) focal would
+    # leave some deltas ~0 while shrinking the reported errors instead.
+    assert all(d > 0.05 for d in deltas)
+    assert max(shifted) > max(base)  # displaced evidence must WORSEN the claim, never improve it

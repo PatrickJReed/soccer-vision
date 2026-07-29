@@ -123,7 +123,7 @@ def _anchor_pose(
 
 
 def _foreground_errors(
-    k: NDArray[np.floating[Any]],
+    f_default: float,
     po: list[tuple[int, float, float]],
     line_clicks: Sequence[LineClick],
     size: tuple[int, int],
@@ -131,16 +131,33 @@ def _foreground_errors(
     """Held-out near-touchline error (feet) for ONE frame: refit the pose WITHOUT any
     near-touchline evidence -- both the near-touchline LINE clicks AND the point landmarks
     that lie on it (its endpoints, x=0) -- then measure how far the near-touchline clicks
-    land from the x=0 line. None if the frame has no near-touchline click (foreground
-    unverifiable) or too few remaining points to refit a pose."""
+    land from the x=0 line. The focal is RE-SELECTED from the held-out fit set (spec §4:
+    a focal chosen using near-touchline clicks must not leak into a near-touchline
+    claim): the sweep's best focal and f_default (the frame's session focal) compete on
+    HELD-OUT error alone, and the winner is used. The in-session `constrained` gain gate
+    (>= 0.15 ft) is deliberately NOT applied here -- on clean sessions the held-out
+    residual at any plausible focal is already tiny, the gain can never trigger, and the
+    fallback would quietly reinstate the near-TL-influenced session focal (the leak).
+    Frames whose held-out sweep solves nowhere, or has < 6 unique landmark ids, use
+    f_default. None if the frame has no near-touchline click (foreground unverifiable)
+    or too few remaining points to refit a pose."""
     if not any(lc.line_id == "near_touchline" for lc in line_clicks):
         return None
     w, h = size
-    lo_fit = [(lc.line_id, lc.x * w, lc.y * h)
+    lo_fit = [(str(lc.line_id), lc.x * w, lc.y * h)
               for lc in line_clicks if lc.line_id != "near_touchline"]
     po_fit = [obs for obs in po if obs[0] not in _NEAR_TL_POINT_IDS]
     if len(po_fit) < 4:
         return None  # not enough off-near-touchline points to genuinely hold it out
+    f_use = f_default
+    if len({kp for kp, _, _ in po_fit}) >= 6:
+        err_at = _frame_err_at(po_fit, lo_fit, size)
+        fit = fit_frame_focal(err_at, f_default)
+        if fit is not None:
+            e_def = err_at(f_default)
+            if e_def is None or fit.err_ft <= e_def:
+                f_use = fit.f
+    k = np.array([[f_use, 0.0, w / 2.0], [0.0, f_use, h / 2.0], [0.0, 0.0, 1.0]])
     pose = _anchor_pose(k, po_fit, lo_fit, None)
     if pose is None:
         return None
@@ -433,22 +450,20 @@ def foreground_holdout(
     min_points: int = 4,
 ) -> list[float]:
     """Per-anchor held-out near-touchline error (feet), pooled across all anchors that have
-    a near-touchline click. Empty if the session can't calibrate a shared focal."""
+    a near-touchline click. Empty if the session can't calibrate a shared focal. Runs the
+    same two-pass-flagging + per-frame-focal pipeline as solve_session; each frame's
+    holdout re-selects its focal from held-out evidence only (spec §4)."""
+    calib = solve_session(points, lines, size, {}, min_points=min_points)
+    if not calib.anchor_h:
+        return []
     w, h = size
     by_pt = _group(points)
     by_ln = _group(lines)
-    obs = {f: [(int(c.kp_idx), float(c.x * w), float(c.y * h)) for c in cs]
-           for f, cs in by_pt.items()}
-    try:
-        k = calibrate_camera(obs, size, min_points=6).K
-    except CalibError:
-        return []
     errs: list[float] = []
-    for f, pcs in by_pt.items():
-        if len({c.kp_idx for c in pcs}) < min_points:
-            continue
-        po = [(int(c.kp_idx), float(c.x * w), float(c.y * h)) for c in pcs]
-        fe = _foreground_errors(k, po, by_ln.get(f, []), size)
+    for f in sorted(calib.anchor_h):
+        po = [(int(c.kp_idx), float(c.x * w), float(c.y * h)) for c in by_pt.get(f, [])]
+        fe = _foreground_errors(calib.focal_of.get(f, float(calib.K[0, 0])),
+                                po, by_ln.get(f, []), size)
         if fe:
             errs.extend(fe)
     return errs

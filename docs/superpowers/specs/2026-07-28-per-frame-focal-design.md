@@ -64,7 +64,8 @@ def fit_frame_focal(
 
 def session_focal(
     fits: Mapping[int, FocalFit | None], f_shared: float,
-) -> dict[int, float]   # fallback ladder of §1.4; a focal for EVERY input frame
+) -> dict[int, tuple[float, str]]   # fallback ladder of §1.4; EVERY input frame gets
+                                    # (focal, source) with source "fit"|"median"|"shared"
 ```
 
 `physical_calib` builds `err_at` per frame from its existing residual helpers
@@ -75,8 +76,9 @@ any solver at all.
 
 ## 3. `PhysicalCalib` surface
 
-- New field `focal_of: dict[int, float]` (every anchor frame present; empty dict for
-  the pre-focal empty-calib path) and accessor `frame_K(frame: int) -> NDArray`
+- New fields `focal_of: dict[int, float]` and `focal_source: dict[int, str]`
+  (every anchor frame present; empty dicts for the pre-focal empty-calib path) and
+  accessor `frame_K(frame: int) -> NDArray`
   returning that frame's K (falls back to the nominal `K` for unknown frames).
 - Existing `K` field KEPT as the session-nominal K (K₁; or f_med-based when ≥ 3
   accepted fits — pick ONE: nominal K uses **f_med when available, else f₁** so the

@@ -138,9 +138,13 @@ def _foreground_errors(
     (>= 0.15 ft) is deliberately NOT applied here -- on clean sessions the held-out
     residual at any plausible focal is already tiny, the gain can never trigger, and the
     fallback would quietly reinstate the near-TL-influenced session focal (the leak).
-    Frames whose held-out sweep solves nowhere, or has < 6 unique landmark ids, use
-    f_default. None if the frame has no near-touchline click (foreground unverifiable)
-    or too few remaining points to refit a pose."""
+    That also means edge-of-sweep minima CAN be accepted here, unlike the in-session
+    ladder (the interior gate is dropped along with the gain gate; the gate's median/p90
+    pooling bounds a stray frame's impact). Note f_default also CENTERS the sweep window
+    ([0.6, 1.6]*f_default), so callers must pass a sane session focal. Frames whose
+    held-out sweep solves nowhere, or has < 6 unique landmark ids, use f_default. None
+    if the frame has no near-touchline click (foreground unverifiable) or too few
+    remaining points to refit a pose."""
     if not any(lc.line_id == "near_touchline" for lc in line_clicks):
         return None
     w, h = size
@@ -450,14 +454,19 @@ def foreground_holdout(
     min_points: int = 4,
 ) -> list[float]:
     """Per-anchor held-out near-touchline error (feet), pooled across all anchors that have
-    a near-touchline click. Empty if the session can't calibrate a shared focal. Runs the
-    same two-pass-flagging + per-frame-focal pipeline as solve_session; each frame's
-    holdout re-selects its focal from held-out evidence only (spec §4)."""
+    a near-touchline click. Empty if the session can't calibrate a shared focal. Anchors
+    and per-frame session focals come from solve_session's pipeline; the clicks are then
+    re-flagged with the session's NOMINAL K so the holdout evaluates (approximately) the
+    same evidence the shipped calibration used -- nominal K differs slightly from the
+    pipeline's internal k1, but the 40 px flag threshold makes catastrophic outliers
+    robust to that difference. Each frame's holdout re-selects its focal from held-out
+    evidence only (spec §4)."""
     calib = solve_session(points, lines, size, {}, min_points=min_points)
     if not calib.anchor_h:
         return []
     w, h = size
-    by_pt = _group(points)
+    clean, _ = flag_outlier_clicks(points, calib.K, size)
+    by_pt = _group(clean)
     by_ln = _group(lines)
     errs: list[float] = []
     for f in sorted(calib.anchor_h):

@@ -8,6 +8,7 @@ import math
 import statistics
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from typing import Literal
 
 SWEEP_LO_FRAC = 0.6
 SWEEP_HI_FRAC = 1.6
@@ -17,6 +18,8 @@ MIN_FOCAL_GAIN_FT = 0.15
 MIN_ACCEPTED_FITS = 3
 
 _INV_PHI = (math.sqrt(5.0) - 1.0) / 2.0
+
+FocalSource = Literal["fit", "median", "shared"]
 
 
 @dataclass(frozen=True)
@@ -60,7 +63,10 @@ def fit_frame_focal(
     """Coarse log sweep over [SWEEP_LO_FRAC, SWEEP_HI_FRAC]*f_init then golden-section
     refine. Accepted (`constrained=True`) only for an interior coarse minimum whose
     improvement over err_at(f_init) is >= MIN_FOCAL_GAIN_FT (spec §1.3). None if
-    err_at solves nowhere on the sweep."""
+    err_at solves nowhere on the sweep. If err_at(f_init) is None (the shared focal's
+    pose doesn't solve at all for this frame), the gain is treated as infinite so any
+    interior minimum is accepted outright — a frame the shared focal can't solve is
+    itself evidence the frame needs its own focal."""
     lo, hi = SWEEP_LO_FRAC * f_init, SWEEP_HI_FRAC * f_init
     cands = [lo * (hi / lo) ** (i / (N_COARSE - 1)) for i in range(N_COARSE)]
     errs = [err_at(f) for f in cands]
@@ -74,21 +80,23 @@ def fit_frame_focal(
         f_star, e_star = _golden(err_at, cands[i_best - 1], cands[i_best + 1], REFINE_TOL_PX)
         if e_star <= best_e:
             best_f, best_e = f_star, e_star
-    e_init = err_at(f_init)
-    gain = (math.inf if e_init is None else e_init) - best_e
+        e_init = err_at(f_init)
+        gain = (math.inf if e_init is None else e_init) - best_e
+    else:
+        gain = -math.inf
     return FocalFit(f=best_f, constrained=interior and gain >= MIN_FOCAL_GAIN_FT,
                     err_ft=best_e)
 
 
 def session_focal(
     fits: Mapping[int, FocalFit | None], f_shared: float
-) -> dict[int, tuple[float, str]]:
+) -> dict[int, tuple[float, FocalSource]]:
     """Fallback ladder (spec §1.4): constrained fits keep their focal ("fit"); the
     rest use the median of accepted fits ("median"); with < MIN_ACCEPTED_FITS
     accepted, EVERY frame uses f_shared ("shared") — exact pre-change behavior."""
     accepted = [ft.f for ft in fits.values() if ft is not None and ft.constrained]
     if len(accepted) < MIN_ACCEPTED_FITS:
-        return {f: (f_shared, "shared") for f in fits}
+        return {frame: (f_shared, "shared") for frame in fits}
     f_med = float(statistics.median(accepted))
-    return {f: ((ft.f, "fit") if ft is not None and ft.constrained else (f_med, "median"))
-            for f, ft in fits.items()}
+    return {frame: ((ft.f, "fit") if ft is not None and ft.constrained else (f_med, "median"))
+            for frame, ft in fits.items()}

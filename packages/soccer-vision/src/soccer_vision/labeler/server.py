@@ -151,6 +151,20 @@ def make_handler(
                     self._json(self._state_payload())
                 else:
                     self._json({"error": "no click at frame/kp_idx"}, code=404)
+            elif self.path == "/api/delete_click":
+                n = state.delete_click(int(payload["frame"]), int(payload["kp_idx"]))
+                if n:
+                    self._json(self._state_payload())
+                else:
+                    self._json({"error": "no click at frame/kp_idx"}, code=404)
+            elif self.path == "/api/delete_line_click":
+                found = state.delete_line_click(
+                    int(payload["frame"]), str(payload["line_id"]),
+                    float(payload["x"]), float(payload["y"]))
+                if found:
+                    self._json(self._state_payload())
+                else:
+                    self._json({"error": "no line click at x/y"}, code=404)
             elif self.path == "/api/recalibrate":
                 ok = state.recalibrate()
                 self._json({"recalibrated": ok, **self._state_payload()})

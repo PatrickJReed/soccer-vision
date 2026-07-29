@@ -314,6 +314,51 @@ def test_clicks_endpoint_returns_both_point_and_line_clicks() -> None:
         httpd.shutdown()
 
 
+# ---- targeted deletion endpoints (right-click delete, spec 2026-07-29) ----
+def test_delete_click_endpoint_roundtrip() -> None:
+    httpd, state = _serve()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        _post(f"{base}/api/click", {"frame": 0, "kp_idx": 2, "x": 0.5, "y": 0.5})
+        out = _post(f"{base}/api/delete_click", {"frame": 0, "kp_idx": 2})
+        assert "coverage" in out and "n_clicks" in out  # response is the state payload
+        assert out["n_clicks"] == 0
+        assert _get(f"{base}/api/clicks")["clicks"] == []  # the click is gone
+        assert state.clicks == []
+        try:
+            _post(f"{base}/api/delete_click", {"frame": 0, "kp_idx": 2})
+        except HTTPError as e:
+            assert e.code == 404
+            assert "error" in json.loads(e.read())
+        else:
+            raise AssertionError("expected HTTP 404")
+    finally:
+        httpd.shutdown()
+
+
+def test_delete_line_click_endpoint_roundtrip() -> None:
+    httpd, state = _serve()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        _post(f"{base}/api/line_click",
+              {"frame": 0, "line_id": "midline", "x": 0.4, "y": 0.6})
+        out = _post(f"{base}/api/delete_line_click",
+                    {"frame": 0, "line_id": "midline", "x": 0.4, "y": 0.6})
+        assert "line_names" in out  # response is the state payload
+        assert _get(f"{base}/api/clicks")["line_clicks"] == []  # the line click is gone
+        assert state.line_clicks == []
+        try:
+            _post(f"{base}/api/delete_line_click",
+                  {"frame": 0, "line_id": "midline", "x": 0.4, "y": 0.6})
+        except HTTPError as e:
+            assert e.code == 404
+            assert "error" in json.loads(e.read())
+        else:
+            raise AssertionError("expected HTTP 404")
+    finally:
+        httpd.shutdown()
+
+
 def test_restore_session_preserves_line_clicks(tmp_path: Path) -> None:
     # Regression guard for the restore-ordering data-loss bug: add_clicks autosaves, so if
     # lines are read AFTER add_clicks the sidecar is clobbered to line_clicks=[]. restore_session

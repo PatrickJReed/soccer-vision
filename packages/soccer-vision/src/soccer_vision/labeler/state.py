@@ -352,6 +352,58 @@ class LabelerState:
             self._worker.mark_dirty(affected)  # non-blocking
         self._autosave()
 
+    def delete_click(self, frame: int, kp_idx: int) -> int:
+        """Remove ALL point clicks for (frame, kp_idx); returns how many were removed.
+
+        Targeted deletion (spec 2026-07-29): duplicates for one landmark die together
+        (add_click appends, so stacked mislabels are possible and must clear in one
+        gesture). _seq lockstep: the i-th "pt" entry of _seq corresponds to
+        self.clicks[i], so the matching _seq positions are dropped in the same locked
+        block. Rebinding (not in-place mutation) keeps any lock-free iterator over the
+        old list consistent."""
+        with self._lock:
+            keep = [i for i, c in enumerate(self.clicks)
+                    if not (c.frame == frame and c.kp_idx == kp_idx)]
+            removed = len(self.clicks) - len(keep)
+            if not removed:
+                return 0
+            pt_pos = [j for j, k in enumerate(self._seq) if k == "pt"]
+            keep_set = set(keep)
+            drop = {pt_pos[i] for i in range(len(self.clicks)) if i not in keep_set}
+            self.clicks = [self.clicks[i] for i in keep]
+            self._seq = [k for j, k in enumerate(self._seq) if j not in drop]
+        if self._calibrated:
+            # same scoping as remove_last: a deleted POINT is segment-scoped in crop
+            # mode but re-estimates the shared K in physical mode (all frames dirty).
+            dirty = self._affected(frame) if self._engine == "crop" else range(self.n_frames)
+            self._worker.mark_dirty(dirty)
+        self._autosave()
+        return removed
+
+    def delete_line_click(self, frame: int, line_id: str, x: float, y: float,
+                          *, eps: float = 1e-6) -> bool:
+        """Remove the nearest line click of `line_id` on `frame` within `eps`
+        (normalized Euclidean). The UI sends the exact stored coordinates of the
+        marker it hit (float64 round-trips exactly through JSON), so eps is only
+        float paranoia; programmatic callers may pass a larger tolerance."""
+        with self._lock:
+            best_i, best_d = -1, eps
+            for i, lc in enumerate(self.line_clicks):
+                if lc.frame != frame or lc.line_id != line_id:
+                    continue
+                d = math.hypot(lc.x - x, lc.y - y)
+                if d <= best_d:
+                    best_i, best_d = i, d
+            if best_i < 0:
+                return False
+            ln_pos = [j for j, k in enumerate(self._seq) if k == "ln"]
+            del self.line_clicks[best_i]
+            del self._seq[ln_pos[best_i]]
+        if self._calibrated:
+            self._worker.mark_dirty(self._affected(frame))  # line edits: segment-scoped
+        self._autosave()
+        return True
+
     def nudge_click(self, frame: int, kp_idx: int, x: float, y: float) -> bool:
         with self._lock:  # scan + replace atomically (worker may be reading self.clicks)
             found = False

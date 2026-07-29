@@ -424,6 +424,85 @@ def test_bulk_add_clicks_keeps_lists_in_lockstep_with_worker_live() -> None:
         st.stop_worker()
 
 
+# ---- targeted deletion (right-click delete, spec 2026-07-29) ----
+def test_delete_click_removes_all_for_landmark_and_keeps_seq() -> None:
+    interframe, _poses, clicks = _pan_session(9)
+    st = LabelerState(interframe, 9, size=SIZE)
+    try:
+        st.add_clicks(clicks)
+        st.wait_idle(timeout=10)
+        f0 = clicks[0].frame
+        kp0 = clicks[0].kp_idx
+        # stack a duplicate mislabel on the same landmark
+        st.add_click(f0, kp0, 0.9, 0.9)
+        st.wait_idle(timeout=10)
+        n_before = len(st.clicks)
+        removed = st.delete_click(f0, kp0)
+        assert removed == 2  # original + duplicate die together
+        assert len(st.clicks) == n_before - 2
+        assert not any(c.frame == f0 and c.kp_idx == kp0 for c in st.clicks)
+        assert len(st._seq) == len(st.clicks) + len(st.line_clicks)  # lockstep
+        # undo after a targeted delete pops the correct (surviving) last click
+        last = st.clicks[-1]
+        st.remove_last()
+        assert not any(c is last for c in st.clicks)
+        assert len(st._seq) == len(st.clicks) + len(st.line_clicks)
+    finally:
+        st.stop_worker()
+
+
+def test_delete_click_missing_returns_zero() -> None:
+    interframe, _poses, clicks = _pan_session(9)
+    st = LabelerState(interframe, 9, size=SIZE)
+    try:
+        st.add_clicks(clicks)
+        st.wait_idle(timeout=10)
+        n = len(st.clicks)
+        absent_kp = next(k for k in range(21)
+                         if not any(c.frame == 0 and c.kp_idx == k for c in st.clicks))
+        assert st.delete_click(0, absent_kp) == 0
+        assert len(st.clicks) == n
+    finally:
+        st.stop_worker()
+
+
+def test_delete_line_click_nearest_within_eps() -> None:
+    interframe, poses, clicks = _pan_session(9)
+    anchors = _spread_anchors(9)
+    st = LabelerState(interframe, 9, size=SIZE)
+    try:
+        st.add_clicks(clicks)
+        st.add_line_clicks(_near_tl_clicks(poses, anchors))
+        st.wait_idle(timeout=10)
+        target = st.line_clicks[0]
+        n = len(st.line_clicks)
+        # exact stored coords (the UI path): removed
+        assert st.delete_line_click(target.frame, target.line_id, target.x, target.y)
+        assert len(st.line_clicks) == n - 1
+        assert len(st._seq) == len(st.clicks) + len(st.line_clicks)
+        # far-away coords: nothing within eps
+        assert not st.delete_line_click(target.frame, target.line_id, 0.0, 0.0)
+        assert len(st.line_clicks) == n - 1
+    finally:
+        st.stop_worker()
+
+
+def test_delete_persists_to_sidecar(tmp_path: Path) -> None:
+    import json
+
+    interframe, _poses, clicks = _pan_session(9)
+    st = LabelerState(interframe, 9, size=SIZE, autosave_path=tmp_path / "s.json")
+    try:
+        st.add_clicks(clicks)
+        st.wait_idle(timeout=10)
+        f0, kp0 = clicks[0].frame, clicks[0].kp_idx
+        st.delete_click(f0, kp0)
+        data = json.loads((tmp_path / "s.json").read_text())
+        assert not any(d["frame"] == f0 and d["kp_idx"] == kp0 for d in data["clicks"])
+    finally:
+        st.stop_worker()
+
+
 def test_export_physical_gate_json_has_focal_block(tmp_path: Path) -> None:
     import json
 

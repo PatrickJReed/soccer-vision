@@ -117,10 +117,17 @@ function drawFrame(){
     ctx.moveTo(cx,cy-r); ctx.lineTo(cx+r,cy); ctx.lineTo(cx,cy+r); ctx.lineTo(cx-r,cy);
     ctx.closePath(); ctx.fill();
   }
+  if(hoverDelete){   // right-click-delete cue: ring the marker that would be removed
+    ctx.strokeStyle="#e0524d"; ctx.lineWidth=2;
+    ctx.beginPath();
+    ctx.arc(hoverDelete.x*canvas.width, hoverDelete.y*canvas.height, 10, 0, 7);
+    ctx.stroke();
+  }
 }
 
 async function loadFrame(i){
-  cur=i; document.getElementById("frameNum").textContent=i;
+  cur=i; hoverDelete=null;   // the cue references the OLD frame's marker — drop it
+  document.getElementById("frameNum").textContent=i;
   const s=document.getElementById("scrub"); if(+s.value!==i) s.value=i;  // keep slider synced
   updateMarker();
   const fh=await api(`/api/frame_h/${i}`); curH=fh.h;
@@ -168,6 +175,7 @@ function maybePoll(pending){
 
 let dragging = null;  // {kp_idx, c} while dragging an existing same-frame dot
 let didDrag = false;
+let hoverDelete = null;  // nearest right-click-deletable marker under the cursor (ring cue)
 
 function canvasNorm(e){
   const r = canvas.getBoundingClientRect();
@@ -187,9 +195,18 @@ canvas.onmousedown = (e) => {
 };
 
 canvas.onmousemove = (e) => {
-  if (!dragging) return;
-  didDrag = true;
   const [x, y] = canvasNorm(e);
+  if (!dragging) {
+    // hover cue for right-click delete: redraw ONLY when the target changes
+    const t = nearestLabel(x, y);
+    const changed = (t === null) !== (hoverDelete === null) ||
+      (t !== null && hoverDelete !== null &&
+       (t.x !== hoverDelete.x || t.y !== hoverDelete.y || t.kind !== hoverDelete.kind));
+    hoverDelete = t;
+    if (changed) drawFrame();
+    return;
+  }
+  didDrag = true;
   dragging.c.x = x; dragging.c.y = y;   // live local preview
   drawFrame();
 };
@@ -215,6 +232,37 @@ canvas.onclick = async (e) => {
     clicks.push({ frame: cur, kp_idx: armed, x, y }); placed.add(armed);
     applyState(await postJSON("/api/click", { frame: cur, kp_idx: armed, x, y }));
   }
+  const fh = await api(`/api/frame_h/${cur}`); curH = fh.h; drawFrame();
+};
+
+function nearestLabel(nx, ny){   // nearest deletable marker on cur frame, canvas-px space
+  const R = 14;
+  let best = null, bestD = R;
+  for(const c of clicks) if(c.frame === cur){
+    const d = Math.hypot((c.x - nx) * canvas.width, (c.y - ny) * canvas.height);
+    if(d <= bestD){ bestD = d; best = {kind: "pt", kp_idx: c.kp_idx, x: c.x, y: c.y}; }
+  }
+  for(const lc of lineClicks) if(lc.frame === cur){
+    const d = Math.hypot((lc.x - nx) * canvas.width, (lc.y - ny) * canvas.height);
+    if(d <= bestD){ bestD = d; best = {kind: "ln", line_id: lc.line_id, x: lc.x, y: lc.y}; }
+  }
+  return best;
+}
+
+canvas.oncontextmenu = async (e) => {
+  e.preventDefault();               // suppress the browser context menu on the canvas only
+  const [nx, ny] = canvasNorm(e);
+  const t = nearestLabel(nx, ny);
+  if(!t) return;
+  const r = t.kind === "pt"
+    ? await postJSON("/api/delete_click", {frame: cur, kp_idx: t.kp_idx})
+    : await postJSON("/api/delete_line_click",
+                     {frame: cur, line_id: t.line_id, x: t.x, y: t.y});
+  if(r.error) return;               // 404: nothing matched server-side — leave UI alone
+  hoverDelete = null;               // the ringed marker no longer exists
+  applyState(r);                    // refresh exactly like the Undo handler
+  const cl = await api("/api/clicks"); clicks = cl.clicks; lineClicks = cl.line_clicks || [];
+  placed = new Set(clicks.map(c => c.kp_idx));
   const fh = await api(`/api/frame_h/${cur}`); curH = fh.h; drawFrame();
 };
 

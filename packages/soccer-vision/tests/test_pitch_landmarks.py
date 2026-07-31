@@ -62,7 +62,9 @@ def test_near_halfway_index_constant() -> None:
 def test_landmark_names_match_schema() -> None:
     assert len(LANDMARK_NAMES) == len(PITCH_LANDMARKS)
     assert LANDMARK_NAMES[0] == "corner_own_left"
-    assert "hidden" in LANDMARK_NAMES[NEAR_HALFWAY_IDX]  # idx 5 flagged never-visible
+    # idx 5 was "(hidden)" under the never-visible assumption; refuted 2026-07-31 —
+    # a far-back Trace placement (home_g4) shows the midline∩near-touchline point.
+    assert LANDMARK_NAMES[NEAR_HALFWAY_IDX] == "halfway_near"
     assert all(isinstance(n, str) and n for n in LANDMARK_NAMES)
 
 

@@ -40,7 +40,7 @@ function projW(m,x,y){ const w=m[6]*x+m[7]*y+m[8];
 function renderPalette(){
   const p=document.getElementById("palette");
   p.innerHTML="<h3 style='font-size:12px;color:#9aa4b2'>LANDMARK</h3>";
-  for(let i=0;i<N;i++){ if(i===5) continue;
+  for(let i=0;i<N;i++){
     const d=document.createElement("div");
     d.className="kp"+(i===armed?" armed":"")+(placed.has(i)?" placed":"");
     d.textContent=`${i} ${NAMES[i]||""}`+(placed.has(i)?" ✓":"");

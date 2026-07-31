@@ -44,7 +44,9 @@ LANDMARK_NAMES: Final[list[str]] = [
     "corner_opp_left",       # 2
     "corner_opp_right",      # 3
     "halfway_far",           # 4
-    "halfway_near (hidden)", # 5  under the camera, never visible
+    "halfway_near",          # 5  usually under the camera; VISIBLE when Trace is
+    #                             placed far back (home_g4 2025-26 recordings) —
+    #                             clickable since 2026-07-31, was palette-hidden
     "center_mark",           # 6
     "circle_far",            # 7  center-circle apex toward opp goal
     "circle_near",           # 8  center-circle apex toward own goal
